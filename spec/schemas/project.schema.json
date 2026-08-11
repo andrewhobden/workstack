@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://workstack.local/schemas/project.schema.json",
+  "title": "Workstack Project",
+  "type": "object",
+  "required": ["id", "name", "rootPath", "workItemPrefix"],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "default": "" },
+    "rootPath": { "type": "string", "minLength": 1 },
+    "workItemPrefix": { "type": "string", "pattern": "^[A-Z][A-Z0-9]*$" },
+    "defaultLeaseSeconds": { "type": "integer", "minimum": 60, "default": 1800 },
+    "heartbeatSeconds": { "type": "integer", "minimum": 30, "default": 300 },
+    "autoReleaseExpiredClaims": { "type": "boolean", "default": true },
+    "autoUpdateKnowledgeOnCompletion": { "type": "boolean", "default": true }
+  },
+  "additionalProperties": false
+}

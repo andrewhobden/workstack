@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "tools": [
+    "workstack_search_knowledge",
+    "workstack_list_backlog",
+    "workstack_search_completed",
+    "workstack_get_work_item",
+    "workstack_claim_work_item",
+    "workstack_heartbeat_work_item",
+    "workstack_release_work_item",
+    "workstack_block_work_item",
+    "workstack_complete_work_item"
+  ],
+  "invariants": {
+    "claimIsAtomic": true,
+    "claimUsesLease": true,
+    "claimTokenRequiredForOwnedMutations": true,
+    "claimTokenNeverReturnedByReadTools": true,
+    "completionDoesNotDependOnKnowledgeUpdateSuccess": true
+  }
+}

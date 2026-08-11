@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://workstack.local/schemas/work-item.schema.json",
+  "title": "Workstack Work Item",
+  "type": "object",
+  "required": ["id", "displayId", "type", "title", "status", "priority", "descriptionMarkdown", "createdAt", "updatedAt"],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "displayId": { "type": "string", "pattern": "^[A-Z][A-Z0-9]*-[0-9]+$" },
+    "type": { "enum": ["feature", "bug", "chore"] },
+    "title": { "type": "string", "minLength": 1 },
+    "descriptionMarkdown": { "type": "string" },
+    "acceptanceCriteriaMarkdown": { "type": "string", "default": "" },
+    "priority": { "enum": ["high", "normal", "low"] },
+    "status": { "enum": ["backlog", "in_progress", "completed"] },
+    "source": { "enum": ["manual", "ai_plan", "mcp"] },
+    "createdBy": { "type": ["string", "null"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": ["string", "null"], "format": "date-time" }
+  },
+  "additionalProperties": false
+}

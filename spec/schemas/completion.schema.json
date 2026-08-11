@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://workstack.local/schemas/completion.schema.json",
+  "title": "Workstack Completion Record",
+  "type": "object",
+  "required": ["summaryMarkdown"],
+  "properties": {
+    "summaryMarkdown": { "type": "string", "minLength": 1 },
+    "implementationNotesMarkdown": { "type": "string", "default": "" },
+    "validationMarkdown": { "type": "string", "default": "" },
+    "knownLimitationsMarkdown": { "type": "string", "default": "" },
+    "filesChanged": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "componentsChanged": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "commitSha": { "type": ["string", "null"] },
+    "branch": { "type": ["string", "null"] },
+    "prUrl": { "type": ["string", "null"], "format": "uri" }
+  },
+  "additionalProperties": false
+}
