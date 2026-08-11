@@ -1,0 +1,73 @@
+{
+  "name": "workstack",
+  "version": "0.1.0",
+  "description": "Local-first work coordination for humans and coding agents",
+  "private": true,
+  "main": "./out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "mcp:serve": "electron . --mcp",
+    "web:dev": "vite --config vite.renderer.config.ts",
+    "web:build": "vite build --config vite.renderer.config.ts",
+    "web:preview": "vite preview --config vite.renderer.config.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "vitest run --coverage",
+    "test:contract": "vitest run tests/contracts --passWithNoTests",
+    "test:integration": "vitest run tests/integration --passWithNoTests",
+    "test:e2e": "npm run web:build && PLAYWRIGHT_BROWSERS_PATH=0 playwright test --project=chromium",
+    "test:visual": "npm run web:build && PLAYWRIGHT_BROWSERS_PATH=0 playwright test --project=chromium --grep @visual",
+    "test:accessibility": "npm run web:build && PLAYWRIGHT_BROWSERS_PATH=0 playwright test --project=chromium --grep @a11y",
+    "test": "npm run lint && npm run typecheck && npm run test:unit && npm run test:contract && npm run test:integration && npm run test:e2e",
+    "package:mac": "npm run build && electron-builder --mac --dir"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.0",
+    "better-sqlite3": "^11.8.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.2",
+    "@electron/rebuild": "^3.7.1",
+    "@eslint/js": "^9.20.0",
+    "@playwright/test": "^1.51.1",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.13.4",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/coverage-v8": "^2.1.9",
+    "electron": "^31.7.7",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "eslint": "^9.20.1",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.18",
+    "globals": "^15.15.0",
+    "playwright": "^1.51.1",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.23.0",
+    "vite": "^5.4.14",
+    "vitest": "^2.1.9"
+  },
+  "build": {
+    "appId": "com.workstack.app",
+    "productName": "Workstack",
+    "asar": true,
+    "mac": {
+      "target": [
+        "dir"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ]
+  }
+}

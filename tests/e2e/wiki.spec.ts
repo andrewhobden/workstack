@@ -1,0 +1,25 @@
+import { expect, test } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
+
+test('creates, edits, and retains a maintained wiki article @a11y @visual', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '+ New Project' }).first().click()
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project name').fill('Wiki Project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project folder').fill('/tmp/wiki-project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByRole('button', { name: 'Create Project' }).click()
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
+  await page.getByRole('button', { name: 'New wiki article' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Wiki Article' })
+  await dialog.getByLabel('Article name').fill('architecture')
+  await dialog.getByLabel('Article content').fill('# Architecture\n\nSQLite is authoritative.')
+  await dialog.getByRole('button', { name: 'Save article' }).click()
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'architecture' })).toBeVisible()
+  await page.reload()
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'architecture' })).toBeVisible()
+  await page.getByLabel('Search knowledge').fill('authoritative')
+  await expect(page.getByText('Wiki: architecture', { exact: true })).toBeVisible()
+  await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+  await expect(page).toHaveScreenshot('maintained-wiki.png', { animations: 'disabled', maxDiffPixelRatio: 0.01 })
+})

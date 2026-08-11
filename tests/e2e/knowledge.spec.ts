@@ -1,0 +1,25 @@
+import { expect, test } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
+
+test('adds, searches, and retains a durable knowledge source @a11y @visual', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '+ New Project' }).first().click()
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project name').fill('Knowledge Project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project folder').fill('/tmp/knowledge-project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByRole('button', { name: 'Create Project' }).click()
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
+  await page.getByRole('button', { name: '+ Add Source' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Add Knowledge Source' })
+  await dialog.getByLabel('Source name').fill('Architecture notes')
+  await dialog.getByLabel('Source filename').fill('architecture.md')
+  await dialog.getByLabel('Source content').fill('Workstack uses SQLite WAL for atomic leases.')
+  await dialog.getByRole('button', { name: 'Add Source' }).click()
+  await expect(page.getByText('Architecture notes', { exact: true })).toBeVisible()
+  await page.getByLabel('Search knowledge').fill('atomic leases')
+  await expect(page.getByText(/SQLite WAL for atomic leases/)).toBeVisible()
+  await page.reload()
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
+  await expect(page.getByText('Architecture notes', { exact: true })).toBeVisible()
+  await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+  await expect(page).toHaveScreenshot('knowledge-sources.png', { animations: 'disabled', maxDiffPixelRatio: 0.01 })
+})
