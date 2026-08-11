@@ -1,4 +1,4 @@
-import { dialog, ipcMain, shell } from 'electron'
+import { BrowserWindow, dialog, ipcMain, shell, type OpenDialogOptions } from 'electron'
 import { z } from 'zod'
 import {
   binaryAttachmentInputSchema,
@@ -41,11 +41,15 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
     const parsed = deleteProjectInputSchema.parse(input)
     return projects.deleteProject(parsed.projectId)
   })
-  ipcMain.handle('projects:choose-folder', async () => {
-    const result = await dialog.showOpenDialog({
+  ipcMain.handle('projects:choose-folder', async (event) => {
+    const options: OpenDialogOptions = {
       title: 'Choose Project Folder',
       properties: ['openDirectory', 'createDirectory']
-    })
+    }
+    const parentWindow = BrowserWindow.fromWebContents(event.sender)
+    const result = parentWindow
+      ? await dialog.showOpenDialog(parentWindow, options)
+      : await dialog.showOpenDialog(options)
     return result.canceled ? undefined : result.filePaths[0]
   })
   ipcMain.handle('projects:open-folder', async (_event, projectId) => {

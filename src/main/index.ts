@@ -6,25 +6,13 @@ import { ProjectsService } from '../core/projects-service'
 import { runStdioServer } from '../mcp/server'
 import { registerIpcHandlers } from './ipc'
 import { OpenAiCompatibleProvider } from './ai-provider'
+import { createWindowOptions } from './window-options'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const mcpMode = process.argv.includes('--mcp')
 
 function createWindow(): BrowserWindow {
-  const window = new BrowserWindow({
-    width: 1440,
-    height: 1000,
-    minWidth: 1100,
-    minHeight: 720,
-    titleBarStyle: 'hiddenInset',
-    backgroundColor: '#F7F8FB',
-    webPreferences: {
-      preload: path.join(__dirname, '../preload/index.mjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true
-    }
-  })
+  const window = new BrowserWindow(createWindowOptions(path.join(__dirname, '../preload/index.mjs')))
 
   if (process.env.ELECTRON_RENDERER_URL) {
     void window.loadURL(process.env.ELECTRON_RENDERER_URL)
