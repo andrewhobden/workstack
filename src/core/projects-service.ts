@@ -91,6 +91,25 @@ export class ProjectsService {
     return summaries
   }
 
+  async resolveProjectReference(reference: string): Promise<string> {
+    const normalized = reference.trim()
+    if (!normalized) {
+      throw new WorkstackError('VALIDATION_ERROR', 'Provide a Workstack project name.')
+    }
+    const projectById = await this.registry.find(normalized)
+    if (projectById) {
+      return projectById.id
+    }
+    const projects = (await this.registry.list()).filter((project) => project.name.localeCompare(normalized, undefined, { sensitivity: 'accent' }) === 0)
+    if (projects.length === 1) {
+      return projects[0].id
+    }
+    if (projects.length > 1) {
+      throw new WorkstackError('VALIDATION_ERROR', `More than one project is named "${normalized}". Rename one project before using MCP by name.`)
+    }
+    throw new WorkstackError('PROJECT_NOT_FOUND', `No Workstack project is named "${normalized}".`)
+  }
+
   async getProject(id: string): Promise<ProjectMetadata> {
     return this.withStore(id, (store) => store.project)
   }

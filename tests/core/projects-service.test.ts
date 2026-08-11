@@ -46,6 +46,20 @@ describe('ProjectsService', () => {
     await expect(service.listProjects()).resolves.toEqual([])
   })
 
+  it('resolves an MCP project reference by visible name or legacy identifier without guessing duplicates', async () => {
+    const { service, directory } = await createService()
+    const named = await service.createProject({ rootPath: path.join(directory, 'named'), name: 'Roadmap' })
+    const firstDuplicate = await service.createProject({ rootPath: path.join(directory, 'duplicate-one'), name: 'Duplicate' })
+    await service.createProject({ rootPath: path.join(directory, 'duplicate-two'), name: 'Duplicate' })
+
+    await expect(service.resolveProjectReference(' roadmap ')).resolves.toBe(named.id)
+    await expect(service.resolveProjectReference(named.id)).resolves.toBe(named.id)
+    await expect(service.resolveProjectReference('Duplicate')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(service.resolveProjectReference('Missing')).rejects.toMatchObject({ code: 'PROJECT_NOT_FOUND' })
+    await expect(service.resolveProjectReference(' ')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    expect(firstDuplicate.name).toBe('Duplicate')
+  })
+
   it('backs up and removes only Workstack project data before deleting its registry record', async () => {
     const { service, directory } = await createService()
     const rootPath = path.join(directory, 'project')

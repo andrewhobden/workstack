@@ -1826,7 +1826,7 @@ function McpDiagnostics(): JSX.Element {
       <label className="field-label">Launch command<input aria-label="MCP launch command" readOnly value={command} /></label>
       <dl className="diagnostic-list">
         <dt>Transport</dt><dd>stdio</dd>
-        <dt>Tools</dt><dd>9 registered</dd>
+        <dt>Tools</dt><dd>13 registered</dd>
         <dt>Safety</dt><dd>Claim tokens are never stored in diagnostics.</dd>
       </dl>
     </section>
@@ -1880,6 +1880,18 @@ function ProjectSheet({
   const [description, setDescription] = useState('')
   const [rootPath, setRootPath] = useState('')
   const [prefix, setPrefix] = useState('')
+  const [folderPickerError, setFolderPickerError] = useState<string>()
+  const chooseFolder = async (): Promise<void> => {
+    try {
+      const folder = await api.projects.chooseFolder()
+      if (folder) {
+        setRootPath(folder)
+      }
+      setFolderPickerError(undefined)
+    } catch (reason) {
+      setFolderPickerError(messageFor(reason))
+    }
+  }
   return (
     <Modal title="New Project" onCancel={onCancel}>
       <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => {
@@ -1888,7 +1900,8 @@ function ProjectSheet({
       }}>
         <label className="field-label">Project name<input autoFocus required aria-label="Project name" value={name} onChange={(event) => setName(event.target.value)} /></label>
         <label className="field-label">Description<textarea aria-label="Project description" value={description} onChange={(event) => setDescription(event.target.value)} /></label>
-        <label className="field-label">Project folder<div className="folder-input"><input required aria-label="Project folder" value={rootPath} onChange={(event) => setRootPath(event.target.value)} /><button className="secondary-button" type="button" onClick={() => { void api.projects.chooseFolder().then((folder) => { if (folder) setRootPath(folder) }) }}>Choose...</button></div></label>
+        <label className="field-label">Project folder<div className="folder-input"><input required aria-label="Project folder" value={rootPath} onChange={(event) => setRootPath(event.target.value)} /><button className="secondary-button" type="button" onClick={() => void chooseFolder()}>Choose...</button></div></label>
+        {folderPickerError ? <p role="alert">{folderPickerError}</p> : null}
         <label className="field-label">Work item prefix<input aria-label="Work item prefix" maxLength={6} placeholder="Derived from name" value={prefix} onChange={(event) => setPrefix(event.target.value.toUpperCase())} /></label>
         <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button><button className="primary-button" type="submit">Create Project</button></div>
       </form>

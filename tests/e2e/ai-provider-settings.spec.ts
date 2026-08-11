@@ -10,7 +10,7 @@ test('configures a planning provider without exposing its API key @a11y @visual'
   await page.getByRole('button', { name: 'Project Settings', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'MCP server' })).toBeVisible()
   await expect(page.getByLabel('MCP launch command')).toHaveValue('npm run mcp:serve')
-  await expect(page.getByText('9 registered', { exact: true })).toBeVisible()
+  await expect(page.getByText('13 registered', { exact: true })).toBeVisible()
   await page.getByLabel('Provider URL').fill('https://example.test/v1')
   await page.getByLabel('AI model').fill('test-model')
   await page.getByLabel('AI API key').fill('super-secret-key')

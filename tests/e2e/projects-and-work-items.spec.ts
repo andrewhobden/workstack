@@ -1,6 +1,18 @@
 import { expect, test } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
 
+test('selects a project folder from the native picker flow @a11y', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '+ New Project' }).first().click()
+  const dialog = page.getByRole('dialog', { name: 'New Project' })
+
+  await dialog.getByRole('button', { name: 'Choose...' }).click()
+
+  await expect(dialog.getByLabel('Project folder')).toHaveValue('/tmp/workstack-project')
+  await expect(dialog.getByRole('alert')).toHaveCount(0)
+  await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+})
+
 test('creates, reopens, and safely detaches a project @a11y @visual', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: '+ New Project' }).first().click()

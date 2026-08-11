@@ -25,8 +25,12 @@ describe('Workstack MCP tools', () => {
     const tools = new WorkstackMcpTools(projects)
 
     expect(MCP_TOOL_NAMES).toEqual([
+      'workstack_list_projects',
       'workstack_search_knowledge',
       'workstack_list_backlog',
+      'workstack_create_work_item',
+      'workstack_create_feature',
+      'workstack_create_bug',
       'workstack_search_completed',
       'workstack_get_work_item',
       'workstack_claim_work_item',
@@ -35,6 +39,32 @@ describe('Workstack MCP tools', () => {
       'workstack_block_work_item',
       'workstack_complete_work_item'
     ])
+    await expect(tools.call('workstack_list_projects', {})).resolves.toEqual({
+      projects: [expect.objectContaining({ id: project.id, name: 'MCP Project' })]
+    })
+    await expect(tools.call('workstack_create_feature', {
+      project: project.name,
+      title: 'Create project discovery',
+      description_markdown: 'Agents can discover visible projects.',
+      priority: 'high',
+      created_by: 'copilot'
+    })).resolves.toMatchObject({
+      work_item: {
+        type: 'feature',
+        source: 'mcp',
+        createdBy: 'copilot',
+        title: 'Create project discovery'
+      }
+    })
+    await expect(tools.call('workstack_create_bug', {
+      project: project.name,
+      title: 'Report an agent issue'
+    })).resolves.toMatchObject({ work_item: { type: 'bug', source: 'mcp' } })
+    await expect(tools.call('workstack_create_work_item', {
+      project: project.name,
+      type: 'chore',
+      title: 'Maintain MCP tools'
+    })).resolves.toMatchObject({ work_item: { type: 'chore', source: 'mcp' } })
     await projects.addKnowledgeSource(project.id, {
       displayName: 'Architecture',
       filename: 'architecture.md',
@@ -57,8 +87,8 @@ describe('Workstack MCP tools', () => {
         })
       ]
     })
-    await expect(tools.call('workstack_list_backlog', { project_id: project.id })).resolves.toEqual({
-      work_items: [expect.objectContaining({ id: workItem.id, displayId: workItem.displayId })]
+    await expect(tools.call('workstack_list_backlog', { project: project.name })).resolves.toMatchObject({
+      work_items: expect.arrayContaining([expect.objectContaining({ id: workItem.id, displayId: workItem.displayId })])
     })
 
     const claimed = await tools.call('workstack_claim_work_item', {
