@@ -1,0 +1,15 @@
+# Workstack jobs to be done
+
+This ledger is updated with every major delivery phase. A job is not complete until its listed Playwright journey and visual assertion pass on macOS.
+
+| ID | Status | Job | Playwright evidence |
+| --- | --- | --- | --- |
+| JTBD-00 | In progress | Launch Workstack and understand the next action before any project exists. | `tests/e2e/app.spec.ts` covers the empty projects surface and its visual baseline. |
+| JTBD-01 | Implemented | Create, reopen, edit, inspect, and safely detach a local project without losing `.workstack` state. | `tests/core/project-store.test.ts`, `tests/core/projects-service.test.ts`, and `tests/e2e/projects-and-work-items.spec.ts` |
+| JTBD-02 | Implemented | Define, find, revise, and review implementation-ready work with low ceremony. | `tests/core/work-items.test.ts` and `tests/e2e/projects-and-work-items.spec.ts` |
+| JTBD-03 | Implemented | Give agents durable file and screenshot context without unsafe paths. | `tests/core/artifact-store.test.ts`, `tests/core/projects-service.test.ts`, `tests/contracts/desktop-contracts.test.ts`, and `tests/e2e/artifacts.spec.ts` |
+| JTBD-04 | Implemented | Observe active agents and safely intervene on stale work. | `tests/core/claims.test.ts`, `tests/integration/claim-concurrency.test.ts`, `tests/core/projects-service.test.ts`, `tests/contracts/desktop-contracts.test.ts`, and `tests/e2e/claims.spec.ts` |
+| JTBD-05 | Blocked | Let an agent safely claim, heartbeat, release, block, and complete one task. | `tests/core/claims.test.ts`, `tests/core/projects-service.test.ts`, `tests/contracts/mcp-tools.test.ts`, and `tests/e2e/completed-result.spec.ts` cover the complete contract and result evidence. Trusted direct Electron MCP validation is blocked: the packaged app is ad-hoc signed, Gatekeeper rejects it, and no valid Developer ID Application identity is installed. |
+| JTBD-06 | Implemented | Browse, edit, source, and search durable project knowledge. | `tests/core/knowledge.test.ts`, `tests/core/projects-service.test.ts`, `tests/contracts/mcp-tools.test.ts`, `tests/e2e/knowledge.spec.ts`, and `tests/e2e/wiki.spec.ts` cover durable sources, search, maintained wiki editing, reload persistence, accessibility, and visual presentation. |
+| JTBD-07 | In progress | Turn an idea into an editable, project-aware proposal without losing manual edits. | `tests/core/planning.test.ts` protects user-modified proposal fields and conversion; `tests/e2e/planning.spec.ts` covers proposal editing, explicit backlog conversion, reload persistence, accessibility, and the backlog visual baseline. Provider-backed planning, context inspection, and recovery remain pending. |
+| JTBD-08 | Implemented | Operate efficiently and accessibly with settings, keyboard navigation, recovery states, and system dark appearance. | `tests/core/project-store.test.ts`, `tests/contracts/desktop-contracts.test.ts`, and `tests/e2e/release-polish.spec.ts` cover durable project operational settings, Command-Return saves, documented navigation shortcuts, command-palette actions, Escape recovery, empty-state recovery actions, dark-mode WCAG checks, and the visual baseline. |
