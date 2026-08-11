@@ -8,7 +8,8 @@ const workstack: DesktopApi = {
   ai: {
     settings: () => ipcRenderer.invoke('ai:settings'),
     configure: (input) => ipcRenderer.invoke('ai:configure', input),
-    propose: (prompt) => ipcRenderer.invoke('ai:propose', prompt)
+    propose: (prompt) => ipcRenderer.invoke('ai:propose', prompt),
+    proposePlanning: (projectId, sessionId, prompt) => ipcRenderer.invoke('ai:propose-planning', projectId, sessionId, prompt)
   },
   projects: {
     list: () => ipcRenderer.invoke('projects:list'),
@@ -16,6 +17,7 @@ const workstack: DesktopApi = {
     get: (projectId) => ipcRenderer.invoke('projects:get', projectId),
     update: (projectId, updates) => ipcRenderer.invoke('projects:update', { projectId, ...updates }),
     detach: (projectId) => ipcRenderer.invoke('projects:detach', projectId),
+    delete: (projectId, input) => ipcRenderer.invoke('projects:delete', { projectId, ...input }),
     chooseFolder: () => ipcRenderer.invoke('projects:choose-folder'),
     openFolder: (projectId) => ipcRenderer.invoke('projects:open-folder', projectId)
   },
@@ -40,6 +42,7 @@ const workstack: DesktopApi = {
     listSources: (projectId) => ipcRenderer.invoke('knowledge:list-sources', projectId),
     addSource: (projectId, input) => ipcRenderer.invoke('knowledge:add-source', projectId, input),
     search: (projectId, query) => ipcRenderer.invoke('knowledge:search', projectId, query),
+    retrieve: (projectId, query, limit) => ipcRenderer.invoke('knowledge:retrieve', projectId, query, limit),
     processNext: (projectId) => ipcRenderer.invoke('knowledge:process-next', projectId),
     retryFailed: (projectId) => ipcRenderer.invoke('knowledge:retry-failed', projectId),
     listWiki: (projectId) => ipcRenderer.invoke('knowledge:list-wiki', projectId),
@@ -51,7 +54,15 @@ const workstack: DesktopApi = {
     update: (projectId, sessionId, patch) => ipcRenderer.invoke('planning:update', projectId, sessionId, patch),
     convert: (projectId, sessionId) => ipcRenderer.invoke('planning:convert', projectId, sessionId),
     listMessages: (projectId, sessionId) => ipcRenderer.invoke('planning:list-messages', projectId, sessionId),
-    addMessage: (projectId, sessionId, role, contentMarkdown) => ipcRenderer.invoke('planning:add-message', projectId, sessionId, role, contentMarkdown)
+    addMessage: (projectId, sessionId, role, contentMarkdown) => ipcRenderer.invoke('planning:add-message', projectId, sessionId, role, contentMarkdown),
+    context: (projectId, sessionId, query) => ipcRenderer.invoke('planning:context', projectId, sessionId, query),
+    listAttachments: (projectId, sessionId) => ipcRenderer.invoke('planning:list-attachments', projectId, sessionId),
+    attachBytes: (projectId, sessionId, input) => ipcRenderer.invoke('planning:attach-bytes', projectId, sessionId, input),
+    pasteImage: (projectId, sessionId, input) => ipcRenderer.invoke('planning:paste-image', projectId, sessionId, input),
+    removeAttachment: (projectId, sessionId, attachmentId) =>
+      ipcRenderer.invoke('planning:remove-attachment', projectId, sessionId, attachmentId),
+    previewAttachmentUrl: (projectId, sessionId, attachmentId) =>
+      ipcRenderer.invoke('planning:preview-attachment-url', projectId, sessionId, attachmentId)
   },
   attachments: {
     list: (projectId, workItemId) => ipcRenderer.invoke('attachments:list', projectId, workItemId),

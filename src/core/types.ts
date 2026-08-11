@@ -42,6 +42,10 @@ export interface ProjectSummary extends ProjectRegistryRecord {
   completedCount: number
 }
 
+export interface ProjectDeletionResult {
+  backupPath: string
+}
+
 export interface UpdateProjectInput {
   name?: string
   description?: string
@@ -205,7 +209,8 @@ export interface ActivityEvent {
 
 export interface Attachment {
   id: string
-  workItemId: string
+  workItemId: string | null
+  planningSessionId: string | null
   originalFilename: string
   storedRelativePath: string
   mimeType: string | null
@@ -230,6 +235,23 @@ export interface PastedImageInput {
   data: Buffer
   originalFilename?: string
   mimeType?: string
+}
+
+export interface PlanningContextEvidence {
+  kind: 'project' | 'knowledge' | 'completed_work' | 'backlog_overlap' | 'planning_attachment'
+  sourceId: string
+  title: string
+  excerpt: string
+  metadata?: Record<string, string | number | null>
+}
+
+export interface PlanningContext {
+  project: Pick<ProjectMetadata, 'id' | 'name' | 'description' | 'rootPath'>
+  proposal: PlanningProposal
+  knowledge: PlanningContextEvidence[]
+  completedWork: PlanningContextEvidence[]
+  backlogOverlap: PlanningContextEvidence[]
+  planningAttachments: PlanningContextEvidence[]
 }
 
 export interface WorkstackPaths {

@@ -1,6 +1,12 @@
 import type { BinaryAttachmentPayload, DesktopApi, CreateProjectInput } from '../../shared/desktop-api'
 import type { KnowledgeSearchResult, KnowledgeSourceInput } from '../../shared/desktop-api'
-import type { KnowledgeSource, WikiArticle } from '../../core/knowledge'
+import type {
+  KnowledgeRetrievalResult,
+  KnowledgeRetrievalSourceType,
+  KnowledgeSource,
+  ProjectKnowledgeRetrieval,
+  WikiArticle
+} from '../../core/knowledge'
 import type {
   Attachment,
   ActivityEvent,
@@ -15,7 +21,7 @@ import type {
   WorkItemFilters,
   WorkClaim
 } from '../../core/types'
-import type { PlanningMessage, PlanningProposal } from '../../core/types'
+import type { PlanningContext, PlanningMessage, PlanningProposal } from '../../core/types'
 
 interface BrowserState {
   projects: ProjectMetadata[]
@@ -26,6 +32,7 @@ interface BrowserState {
   planningMessagesBySession: Record<string, PlanningMessage[]>
   wikiByProject: Record<string, WikiArticle[]>
   attachmentsByWorkItem: Record<string, BrowserAttachment[]>
+  attachmentsByPlanningSession: Record<string, BrowserAttachment[]>
   completionsByWorkItem: Record<string, CompletionRecord>
   activityByProject: Record<string, ActivityEvent[]>
 }
@@ -51,7 +58,11 @@ const browserDesktopApi: DesktopApi = {
   ai: {
     settings: async () => ({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', configured: false }),
     configure: async (input) => ({ baseUrl: input.baseUrl, model: input.model, configured: Boolean(input.apiKey) }),
-    propose: async (prompt) => `Suggested planning notes for: ${prompt}`
+    propose: async (prompt) => `Suggested planning notes for: ${prompt}`,
+    proposePlanning: async (projectId, sessionId, prompt) => {
+      const context = await browserDesktopApi.planning.context(projectId, sessionId, prompt)
+      return `Suggested planning notes for: ${prompt}\n\nUsing ${context.knowledge.length + context.completedWork.length + context.backlogOverlap.length} relevant project records.`
+    }
   },
   projects: {
     list: async () => summaries(loadState()),
@@ -99,6 +110,23 @@ const browserDesktopApi: DesktopApi = {
       delete state.knowledgeByProject[projectId]
       delete state.planningByProject[projectId]
       saveState(state)
+    },
+    delete: async (projectId, input) => {
+      if (input.confirmed !== true) {
+        throw new Error('Project deletion requires explicit confirmation.')
+      }
+      const state = loadState()
+      const project = requireProject(state, projectId)
+      const index = state.projects.findIndex((candidate) => candidate.id === projectId)
+      state.projects.splice(index, 1)
+      for (const item of state.workItemsByProject[projectId] ?? []) {
+        delete state.claimsByWorkItem[item.id]
+      }
+      delete state.workItemsByProject[projectId]
+      delete state.knowledgeByProject[projectId]
+      delete state.planningByProject[projectId]
+      saveState(state)
+      return { backupPath: `/workstack-browser-backups/project-deletions/${project.id}/.workstack` }
     },
     chooseFolder: async () => '/tmp/workstack-project',
     openFolder: async (projectId) => {
@@ -235,6 +263,7 @@ const browserDesktopApi: DesktopApi = {
           score: 1 / (index + 1)
         }))
     },
+    retrieve: async (projectId, query, limit) => browserKnowledgeRetrieval(loadState(), projectId, query, limit),
     processNext: async (projectId) => {
       requireProject(loadState(), projectId)
       return undefined
@@ -314,6 +343,30 @@ const browserDesktopApi: DesktopApi = {
       state.planningMessagesBySession[sessionId].push(message)
       saveState(state)
       return clone(message)
+    },
+    context: async (projectId, sessionId, query) => browserPlanningContext(loadState(), projectId, sessionId, query),
+    listAttachments: async (projectId, sessionId) => {
+      const state = loadState()
+      requirePlanningProposal(state, projectId, sessionId)
+      return (state.attachmentsByPlanningSession[sessionId] ?? []).map(toAttachment)
+    },
+    attachBytes: async (projectId, sessionId, input) => createBrowserPlanningAttachment(projectId, sessionId, input),
+    pasteImage: async (projectId, sessionId, input) => createBrowserPlanningAttachment(projectId, sessionId, input),
+    removeAttachment: async (projectId, sessionId, attachmentId) => {
+      const state = loadState()
+      requirePlanningProposal(state, projectId, sessionId)
+      const attachments = state.attachmentsByPlanningSession[sessionId] ?? []
+      const index = attachments.findIndex((attachment) => attachment.id === attachmentId)
+      if (index === -1) throw new Error('Attachment not found.')
+      attachments.splice(index, 1)
+      saveState(state)
+    },
+    previewAttachmentUrl: async (projectId, sessionId, attachmentId) => {
+      const state = loadState()
+      requirePlanningProposal(state, projectId, sessionId)
+      const attachment = (state.attachmentsByPlanningSession[sessionId] ?? []).find((candidate) => candidate.id === attachmentId)
+      if (!attachment) throw new Error('Attachment not found.')
+      return attachment.previewUrl
     }
   },
   attachments: {
@@ -363,7 +416,7 @@ const browserDesktopApi: DesktopApi = {
 function loadState(): BrowserState {
   const stored = window.localStorage.getItem(browserStorageKey)
   if (!stored) {
-    return { projects: [], workItemsByProject: {}, claimsByWorkItem: {}, knowledgeByProject: {}, planningByProject: {}, planningMessagesBySession: {}, wikiByProject: {}, attachmentsByWorkItem: {}, completionsByWorkItem: {}, activityByProject: {} }
+    return { projects: [], workItemsByProject: {}, claimsByWorkItem: {}, knowledgeByProject: {}, planningByProject: {}, planningMessagesBySession: {}, wikiByProject: {}, attachmentsByWorkItem: {}, attachmentsByPlanningSession: {}, completionsByWorkItem: {}, activityByProject: {} }
   }
   const state = JSON.parse(stored) as BrowserState
   state.claimsByWorkItem ??= {}
@@ -372,6 +425,7 @@ function loadState(): BrowserState {
   state.planningMessagesBySession ??= {}
   state.wikiByProject ??= {}
   state.attachmentsByWorkItem ??= {}
+  state.attachmentsByPlanningSession ??= {}
   state.completionsByWorkItem ??= {}
   state.activityByProject ??= {}
   return state
@@ -440,6 +494,7 @@ async function createBrowserAttachment(
   const attachment: BrowserAttachment = {
     id,
     workItemId,
+    planningSessionId: null,
     originalFilename: input.originalFilename,
     storedRelativePath: `work-items/${workItemId}/attachments/${storedFilename}`,
     mimeType: input.mimeType ?? 'application/octet-stream',
@@ -506,6 +561,111 @@ function filterWorkItems(items: WorkItem[], filters: WorkItemFilters): WorkItem[
     .map(clone)
 }
 
+function browserKnowledgeRetrieval(state: BrowserState, projectId: string, query: string, limit = 40): ProjectKnowledgeRetrieval {
+  requireProject(state, projectId)
+  const normalized = query.trim()
+  const candidates: BrowserRetrievalCandidate[] = [
+    ...(state.wikiByProject[projectId] ?? []).map((article) => ({
+      sourceId: `wiki:${article.slug}`,
+      sourceType: 'wiki_article' as const,
+      title: article.content.match(/^#\s+(.+)$/m)?.[1]?.trim() ? `Wiki: ${article.content.match(/^#\s+(.+)$/m)?.[1]?.trim()}` : `Wiki: ${article.slug}`,
+      content: article.content,
+      location: `knowledge/wiki/${article.slug}.md`
+    })),
+    ...(state.knowledgeByProject[projectId] ?? [])
+      .filter((source) => source.kind !== 'work_completion')
+      .map((source) => ({
+        sourceId: `raw:${source.id}`,
+        sourceType: 'raw_source' as const,
+        title: source.displayName,
+        content: source.content,
+        location: source.relativeOrExternalLocation
+      })),
+    ...(state.workItemsByProject[projectId] ?? [])
+      .filter((item) => item.status === 'completed')
+      .map((item) => ({
+        sourceId: `completed:${item.id}`,
+        sourceType: 'completed_work' as const,
+        title: `${item.displayId} · ${item.title}`,
+        content: `${item.title}\n${item.descriptionMarkdown}\n${item.acceptanceCriteriaMarkdown}\n${state.completionsByWorkItem[item.id]?.summaryMarkdown ?? ''}\n${state.completionsByWorkItem[item.id]?.validationMarkdown ?? ''}`,
+        location: `work-items/${item.id}/completion.md`,
+        workItemId: item.id
+      })),
+    ...(state.workItemsByProject[projectId] ?? [])
+      .filter((item) => item.status === 'backlog')
+      .map((item) => ({
+        sourceId: `backlog:${item.id}`,
+        sourceType: 'backlog' as const,
+        title: `${item.displayId} · ${item.title}`,
+        content: `${item.title}\n${item.descriptionMarkdown}\n${item.acceptanceCriteriaMarkdown}`,
+        location: `work-items/${item.id}/work-item.md`,
+        workItemId: item.id
+      }))
+  ]
+  const results = candidates
+    .map(({ content, ...candidate }) => ({
+      ...candidate,
+      excerpt: browserExcerpt(content, normalized),
+      relevance: browserRelevance(`${candidate.title}\n${content}`, normalized)
+    }))
+    .filter((result) => result.relevance > 0)
+    .sort(browserCompareResults)
+    .slice(0, limit)
+  return { query: normalized, results, groups: browserRetrievalGroups(results) }
+}
+
+interface BrowserRetrievalCandidate extends Omit<KnowledgeRetrievalResult, 'excerpt' | 'relevance'> {
+  content: string
+}
+
+function browserExcerpt(content: string, query: string): string {
+  const index = content.toLowerCase().indexOf(query.toLowerCase().split(/\s+/)[0] ?? '')
+  return content.slice(index < 0 ? 0 : Math.max(0, index - 40), (index < 0 ? 0 : Math.max(0, index - 40)) + 220).trim()
+}
+
+function browserRelevance(content: string, query: string): number {
+  const normalizedContent = content.toLowerCase()
+  const normalizedQuery = query.toLowerCase()
+  const terms = [...new Set(normalizedQuery.match(/[a-z0-9_-]+/g) ?? [])]
+  if (!terms.some((term) => normalizedContent.includes(term))) return 0
+  const occurrences = (value: string): number => {
+    let count = 0
+    let start = 0
+    while (true) {
+      const index = normalizedContent.indexOf(value, start)
+      if (index === -1) return count
+      count += 1
+      start = index + value.length
+    }
+  }
+  const title = content.split('\n', 1)[0].toLowerCase()
+  const titleMatches = terms.reduce((total, term) => total + [...title.matchAll(new RegExp(term, 'g'))].length, 0)
+  return occurrences(normalizedQuery) * 100 + titleMatches * 20 + terms.reduce((total, term) => total + occurrences(term), 0)
+}
+
+function browserCompareResults(left: KnowledgeRetrievalResult, right: KnowledgeRetrievalResult): number {
+  if (right.relevance !== left.relevance) return right.relevance - left.relevance
+  const order: KnowledgeRetrievalSourceType[] = ['wiki_article', 'raw_source', 'completed_work', 'backlog']
+  const typeOrder = order.indexOf(left.sourceType) - order.indexOf(right.sourceType)
+  if (typeOrder !== 0) return typeOrder
+  if (left.title !== right.title) return left.title < right.title ? -1 : 1
+  return left.sourceId < right.sourceId ? -1 : left.sourceId > right.sourceId ? 1 : 0
+}
+
+function browserRetrievalGroups(results: KnowledgeRetrievalResult[]): ProjectKnowledgeRetrieval['groups'] {
+  const labels: Record<KnowledgeRetrievalSourceType, string> = {
+    wiki_article: 'Wiki articles',
+    raw_source: 'Raw sources',
+    completed_work: 'Completed work',
+    backlog: 'Backlog'
+  }
+  return (['wiki_article', 'raw_source', 'completed_work', 'backlog'] as const).map((sourceType) => ({
+    sourceType,
+    label: labels[sourceType],
+    results: results.filter((result) => result.sourceType === sourceType)
+  }))
+}
+
 function normalizeExpiredBrowserClaims(state: BrowserState, items: WorkItem[]): void {
   const now = Date.now()
   for (const item of items) {
@@ -546,6 +706,7 @@ function toAttachment(attachment: BrowserAttachment): Attachment {
   return clone({
     id: attachment.id,
     workItemId: attachment.workItemId,
+    planningSessionId: attachment.planningSessionId,
     originalFilename: attachment.originalFilename,
     storedRelativePath: attachment.storedRelativePath,
     mimeType: attachment.mimeType,
@@ -553,6 +714,78 @@ function toAttachment(attachment: BrowserAttachment): Attachment {
     sha256: attachment.sha256,
     createdAt: attachment.createdAt
   })
+}
+
+async function createBrowserPlanningAttachment(
+  projectId: string,
+  sessionId: string,
+  input: BinaryAttachmentPayload
+): Promise<Attachment> {
+  const state = loadState()
+  requirePlanningProposal(state, projectId, sessionId)
+  if (input.data.byteLength === 0) throw new Error('Attachment data cannot be empty.')
+  const id = crypto.randomUUID()
+  const storedFilename = `${id}-${safeFilename(input.originalFilename)}`
+  const attachment: BrowserAttachment = {
+    id,
+    workItemId: null,
+    planningSessionId: sessionId,
+    originalFilename: input.originalFilename,
+    storedRelativePath: `planning-sessions/${sessionId}/attachments/${storedFilename}`,
+    mimeType: input.mimeType ?? 'application/octet-stream',
+    sizeBytes: input.data.byteLength,
+    sha256: null,
+    createdAt: new Date().toISOString(),
+    previewUrl: `data:${input.mimeType ?? 'application/octet-stream'};base64,${toBase64(input.data)}`
+  }
+  const attachments = state.attachmentsByPlanningSession[sessionId] ?? []
+  attachments.push(attachment)
+  state.attachmentsByPlanningSession[sessionId] = attachments
+  saveState(state)
+  return toAttachment(attachment)
+}
+
+function browserPlanningContext(state: BrowserState, projectId: string, sessionId: string, query: string): PlanningContext {
+  const project = requireProject(state, projectId)
+  const proposal = requirePlanningProposal(state, projectId, sessionId)
+  const normalizedQuery = query.trim().toLowerCase()
+  const workQuery = normalizedQuery.split(/\s+/).find((term) => term.length > 2) ?? normalizedQuery
+  const matches = (value: string, useWorkQuery = false): boolean =>
+    Boolean(useWorkQuery ? workQuery : normalizedQuery) && value.toLowerCase().includes(useWorkQuery ? workQuery : normalizedQuery)
+  const workEvidence = (kind: 'completed_work' | 'backlog_overlap', item: WorkItem) => ({
+    kind,
+    sourceId: item.id,
+    title: `${item.displayId} · ${item.title}`,
+    excerpt: item.descriptionMarkdown || item.acceptanceCriteriaMarkdown || 'No written details.',
+    metadata: { status: item.status, priority: item.priority, type: item.type }
+  })
+  return {
+    project: { id: project.id, name: project.name, description: project.description, rootPath: project.rootPath },
+    proposal: clone(proposal),
+    knowledge: (state.knowledgeByProject[projectId] ?? [])
+      .filter((source) => matches(`${source.displayName} ${source.content}`))
+      .slice(0, 5)
+      .map((source, index) => ({
+        kind: 'knowledge' as const,
+        sourceId: source.id,
+        title: source.displayName,
+        excerpt: source.content.slice(0, 220),
+        metadata: { score: 1 / (index + 1) }
+      })),
+    completedWork: (state.workItemsByProject[projectId] ?? [])
+      .filter((item) => item.status === 'completed' && matches(`${item.title} ${item.descriptionMarkdown} ${item.acceptanceCriteriaMarkdown}`, true))
+      .slice(0, 5).map((item) => workEvidence('completed_work', item)),
+    backlogOverlap: (state.workItemsByProject[projectId] ?? [])
+      .filter((item) => item.status === 'backlog' && matches(`${item.title} ${item.descriptionMarkdown} ${item.acceptanceCriteriaMarkdown}`, true))
+      .slice(0, 5).map((item) => workEvidence('backlog_overlap', item)),
+    planningAttachments: (state.attachmentsByPlanningSession[sessionId] ?? []).map((attachment) => ({
+      kind: 'planning_attachment' as const,
+      sourceId: attachment.id,
+      title: attachment.originalFilename,
+      excerpt: 'Attached planning evidence. File contents are not included automatically.',
+      metadata: { mimeType: attachment.mimeType, sizeBytes: attachment.sizeBytes, sha256: attachment.sha256 }
+    }))
+  }
 }
 
 function safeFilename(filename: string): string {

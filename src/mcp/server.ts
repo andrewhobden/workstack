@@ -62,21 +62,39 @@ export class WorkstackMcpTools {
     }
   }
 
-  private async searchKnowledge(input: unknown): Promise<{ results: Array<{ source_type: string; source_id: string; title: string; excerpt: string; score: number }> }> {
+  private async searchKnowledge(input: unknown): Promise<{
+    results: Array<{ source_type: string; source_id: string; title: string; excerpt: string; location: string; relevance: number; score: number }>
+    groups: Array<{ source_type: string; label: string; results: Array<{ source_id: string; title: string; excerpt: string; location: string; relevance: number }> }>
+  }> {
     const parsed = z.object({
       project_id: projectIdSchema,
       query: z.string().trim().min(1),
       limit: z.number().int().min(1).max(100).default(10)
     }).parse(input)
-    const results = await this.projects.searchKnowledge(parsed.project_id, parsed.query)
+    const retrieval = await this.projects.retrieveKnowledge(parsed.project_id, parsed.query, parsed.limit)
     return {
-      results: results.slice(0, parsed.limit).map((result) => ({
-        source_type: 'knowledge',
+      results: retrieval.results.map((result) => ({
+        source_type: result.sourceType,
         source_id: result.sourceId,
         title: result.title,
         excerpt: result.excerpt,
-        score: result.score
-      }))
+        location: result.location,
+        relevance: result.relevance,
+        score: result.relevance
+      })),
+      groups: retrieval.groups
+        .filter((group) => group.results.length)
+        .map((group) => ({
+          source_type: group.sourceType,
+          label: group.label,
+          results: group.results.map((result) => ({
+            source_id: result.sourceId,
+            title: result.title,
+            excerpt: result.excerpt,
+            location: result.location,
+            relevance: result.relevance
+          }))
+        }))
     }
   }
 

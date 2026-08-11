@@ -42,7 +42,19 @@ describe('Workstack MCP tools', () => {
     })
     await expect(tools.call('workstack_search_knowledge', { project_id: project.id, query: 'durable state' })).resolves.toEqual({
       results: [
-        expect.objectContaining({ source_type: 'knowledge', title: 'Architecture' })
+        expect.objectContaining({
+          source_type: 'raw_source',
+          source_id: expect.stringMatching(/^raw:/),
+          title: 'Architecture',
+          location: expect.stringMatching(/^knowledge\/raw\//),
+          relevance: expect.any(Number)
+        })
+      ],
+      groups: [
+        expect.objectContaining({
+          source_type: 'raw_source',
+          results: [expect.objectContaining({ source_id: expect.stringMatching(/^raw:/) })]
+        })
       ]
     })
     await expect(tools.call('workstack_list_backlog', { project_id: project.id })).resolves.toEqual({

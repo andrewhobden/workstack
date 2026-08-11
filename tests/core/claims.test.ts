@@ -229,7 +229,7 @@ describe('ClaimsRepository', () => {
     store.close()
   })
 
-  it('completes only the active owner transactionally and queues durable knowledge maintenance', async () => {
+  it('completes only the active owner transactionally and automatically maintains knowledge', async () => {
     const { claims, store, workItems } = await createClaimsRepository()
     const workItem = workItems.create({ title: 'Complete agent work' })
     claims.claim(workItem.id, { agentId: 'codex', sessionId: 'session-42' })
@@ -265,9 +265,9 @@ describe('ClaimsRepository', () => {
     })
     expect(store.database.prepare('SELECT kind, status FROM knowledge_sources WHERE source_work_item_id = ?').get(workItem.id)).toEqual({
       kind: 'work_completion',
-      status: 'pending'
+      status: 'indexed'
     })
-    expect(store.database.prepare('SELECT status FROM knowledge_jobs').get()).toEqual({ status: 'pending' })
+    expect(store.database.prepare('SELECT status FROM knowledge_jobs').get()).toEqual({ status: 'completed' })
     expect(workItems.listActivity(workItem.id)).toContainEqual(
       expect.objectContaining({ eventType: 'work_item_completed', actorType: 'agent', actorId: 'codex' })
     )
@@ -278,6 +278,19 @@ describe('ClaimsRepository', () => {
       () => claims.complete(workItem.id, 'claim-token-one', { summaryMarkdown: 'Retry' }),
       'CLAIM_TOKEN_INVALID'
     )
+    store.close()
+  })
+
+  it('leaves completion knowledge queued when automatic maintenance is disabled', async () => {
+    const { claims, store, workItems } = await createClaimsRepository()
+    await store.updateMetadata({ settings: { autoUpdateKnowledgeOnCompletion: false } })
+    const workItem = workItems.create({ title: 'Queue knowledge manually' })
+    claims.claim(workItem.id, { agentId: 'codex' })
+
+    claims.complete(workItem.id, 'claim-token-one', { summaryMarkdown: 'Wait for manual processing.' })
+
+    expect(store.database.prepare('SELECT status FROM knowledge_sources WHERE source_work_item_id = ?').get(workItem.id)).toEqual({ status: 'pending' })
+    expect(store.database.prepare('SELECT status FROM knowledge_jobs').get()).toEqual({ status: 'pending' })
     store.close()
   })
 

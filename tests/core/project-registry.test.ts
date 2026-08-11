@@ -112,12 +112,12 @@ describe('ProjectRegistry', () => {
     })
   })
 
-  it('detaches without touching the project and reports absent records', async () => {
+  it('removes a registry record without touching the project and reports absent records', async () => {
     const { registry } = await createRegistry()
     await registry.register(project())
 
-    await expect(registry.detach('missing')).resolves.toBe(false)
-    await expect(registry.detach('5f03c679-76e8-4ea8-a8bc-9ec31f367a76')).resolves.toBe(true)
+    await expect(registry.remove('missing')).resolves.toBe(false)
+    await expect(registry.remove('5f03c679-76e8-4ea8-a8bc-9ec31f367a76')).resolves.toBe(true)
     await expect(registry.list()).resolves.toEqual([])
   })
 

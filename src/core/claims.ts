@@ -4,6 +4,7 @@ import path from 'node:path'
 import { z } from 'zod'
 import { systemClock, type Clock } from './clock'
 import { WorkstackError } from './errors'
+import { KnowledgeRepository } from './knowledge'
 import { ProjectStore } from './project-store'
 import type {
   BlockWorkItemInput,
@@ -273,7 +274,7 @@ export class ClaimsRepository {
   complete(workItemId: string, claimToken: string, input: CompletionInput): CompletionRecord {
     const parsed = completionInputSchema.parse(input)
     this.normalizeExpiredClaims()
-    return this.immediate(() => {
+    const completion = this.immediate(() => {
       const now = this.now()
       const claim = this.requireActiveClaimOwner(workItemId, claimToken)
       const completion: CompletionRecord = {
@@ -358,9 +359,13 @@ export class ClaimsRepository {
         knowledgeSourceId: sourceId
       })
       this.syncWorkItemMirror(workItemId)
-      this.writeCompletionMirror(completion)
       return completion
     })
+    this.writeCompletionMirror(completion)
+    if (this.store.project.settings.autoUpdateKnowledgeOnCompletion) {
+      new KnowledgeRepository(this.store, { clock: this.clock() }).processNextJob()
+    }
+    return completion
   }
 
   normalizeExpiredClaims(): WorkClaim[] {

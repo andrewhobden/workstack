@@ -23,6 +23,33 @@ test('creates, reopens, and safely detaches a project @a11y @visual', async ({ p
   })
 })
 
+test('requires confirmation, preserves cancellation, and reports the project-data backup after deletion @a11y @visual', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '+ New Project' }).first().click()
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project name').fill('Deletion Demo')
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project folder').fill('/tmp/deletion-demo')
+  await page.getByRole('dialog', { name: 'New Project' }).getByRole('button', { name: 'Create Project' }).click()
+  await page.getByRole('button', { name: 'Project Settings' }).click()
+  await page.getByRole('button', { name: 'Delete Project' }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'Delete Deletion Demo from Workstack?' })
+  await expect(dialog).toContainText('Your repository root and all non-Workstack files will remain exactly where they are.')
+  await expect(dialog.getByRole('button', { name: 'Back up and delete project' })).toBeDisabled()
+  await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+  await expect(page).toHaveScreenshot('project-deletion-confirmation.png', {
+    animations: 'disabled',
+    maxDiffPixelRatio: 0.001
+  })
+  await dialog.getByRole('button', { name: 'Cancel' }).click()
+  await expect(page.getByRole('heading', { name: 'Project Settings' })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Delete Project' }).click()
+  await dialog.getByRole('checkbox').check()
+  await dialog.getByRole('button', { name: 'Back up and delete project' }).click()
+  await expect(page.getByRole('heading', { name: 'Create your first project' })).toBeVisible()
+  await expect(page.getByRole('status')).toContainText('Your .workstack backup is available at /workstack-browser-backups/project-deletions/')
+})
+
 test('creates, finds, edits, and retains a work item after reload @a11y @visual', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: '+ New Project' }).first().click()

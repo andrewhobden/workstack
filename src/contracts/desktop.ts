@@ -29,6 +29,13 @@ export const updateProjectInputSchema = z
   })
   .strict()
 
+export const deleteProjectInputSchema = z
+  .object({
+    projectId: projectIdSchema,
+    confirmed: z.literal(true)
+  })
+  .strict()
+
 export const workItemFiltersSchema = z
   .object({
     status: z.enum(WORK_ITEM_STATUSES).optional(),
@@ -85,6 +92,14 @@ export const knowledgeSourceInputSchema = z
   })
   .strict()
 
+export const knowledgeRetrievalInputSchema = z
+  .object({
+    projectId: projectIdSchema,
+    query: z.string().trim().min(1).max(500),
+    limit: z.number().int().min(1).max(100).optional()
+  })
+  .strict()
+
 export const planningProposalInputSchema = z
   .object({
     projectId: projectIdSchema,
@@ -101,6 +116,21 @@ export const planningProposalInputSchema = z
   .strict()
 
 export const binaryAttachmentInputSchema = workItemReferenceSchema
+  .extend({
+    data: z.instanceof(Uint8Array),
+    originalFilename: z.string().trim().min(1),
+    mimeType: z.string().trim().min(1).optional()
+  })
+  .strict()
+
+export const planningSessionReferenceSchema = z
+  .object({
+    projectId: projectIdSchema,
+    sessionId: z.string().uuid()
+  })
+  .strict()
+
+export const planningAttachmentInputSchema = planningSessionReferenceSchema
   .extend({
     data: z.instanceof(Uint8Array),
     originalFilename: z.string().trim().min(1),

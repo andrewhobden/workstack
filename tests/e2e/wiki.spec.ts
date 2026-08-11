@@ -19,7 +19,7 @@ test('creates, edits, and retains a maintained wiki article @a11y @visual', asyn
   await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
   await expect(page.getByRole('button', { name: 'architecture' })).toBeVisible()
   await page.getByLabel('Search knowledge').fill('authoritative')
-  await expect(page.getByText('Wiki: architecture', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: /architecture/i })).toBeVisible()
   await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
   await expect(page).toHaveScreenshot('maintained-wiki.png', { animations: 'disabled', maxDiffPixelRatio: 0.01 })
 })

@@ -3,10 +3,14 @@ import { z } from 'zod'
 import {
   binaryAttachmentInputSchema,
   createProjectInputSchema,
+  deleteProjectInputSchema,
   createWorkItemInputSchema,
   forceReleaseWorkItemInputSchema,
+  knowledgeRetrievalInputSchema,
   knowledgeSourceInputSchema,
   planningProposalInputSchema,
+  planningAttachmentInputSchema,
+  planningSessionReferenceSchema,
   projectIdSchema,
   updateProjectInputSchema,
   updateWorkItemInputSchema,
@@ -32,6 +36,10 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
   })
   ipcMain.handle('projects:detach', async (_event, projectId) => {
     await projects.detachProject(projectIdSchema.parse(projectId))
+  })
+  ipcMain.handle('projects:delete', (_event, input) => {
+    const parsed = deleteProjectInputSchema.parse(input)
+    return projects.deleteProject(parsed.projectId)
   })
   ipcMain.handle('projects:choose-folder', async () => {
     const result = await dialog.showOpenDialog({
@@ -90,6 +98,10 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
   ipcMain.handle('knowledge:search', (_event, projectId, query) =>
     projects.searchKnowledge(projectIdSchema.parse(projectId), z.string().trim().min(1).parse(query))
   )
+  ipcMain.handle('knowledge:retrieve', (_event, projectId, query, limit) => {
+    const parsed = knowledgeRetrievalInputSchema.parse({ projectId, query, limit })
+    return projects.retrieveKnowledge(parsed.projectId, parsed.query, parsed.limit)
+  })
   ipcMain.handle('knowledge:process-next', (_event, projectId) =>
     projects.processKnowledgeJob(projectIdSchema.parse(projectId))
   )
@@ -117,6 +129,39 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
   ipcMain.handle('planning:add-message', (_event, projectId, sessionId, role, content) =>
     projects.addPlanningMessage(projectIdSchema.parse(projectId), z.string().uuid().parse(sessionId), z.enum(['user', 'assistant', 'system', 'tool']).parse(role), z.string().trim().min(1).parse(content))
   )
+  ipcMain.handle('planning:context', (_event, projectId, sessionId, query) => {
+    const parsed = planningSessionReferenceSchema.parse({ projectId, sessionId })
+    return projects.getPlanningContext(parsed.projectId, parsed.sessionId, z.string().trim().max(500).parse(query))
+  })
+  ipcMain.handle('planning:list-attachments', (_event, projectId, sessionId) => {
+    const parsed = planningSessionReferenceSchema.parse({ projectId, sessionId })
+    return projects.listPlanningAttachments(parsed.projectId, parsed.sessionId)
+  })
+  ipcMain.handle('planning:attach-bytes', (_event, projectId, sessionId, input) => {
+    const parsed = planningAttachmentInputSchema.parse({ projectId, sessionId, ...(input ?? {}) })
+    return projects.attachPlanningBytes(parsed.projectId, parsed.sessionId, {
+      data: Buffer.from(parsed.data),
+      originalFilename: parsed.originalFilename,
+      mimeType: parsed.mimeType
+    })
+  })
+  ipcMain.handle('planning:paste-image', (_event, projectId, sessionId, input) => {
+    const parsed = planningAttachmentInputSchema.parse({ projectId, sessionId, ...(input ?? {}) })
+    return projects.pastePlanningImage(parsed.projectId, parsed.sessionId, {
+      data: Buffer.from(parsed.data),
+      originalFilename: parsed.originalFilename,
+      mimeType: parsed.mimeType
+    })
+  })
+  ipcMain.handle('planning:remove-attachment', async (_event, projectId, sessionId, attachmentId) => {
+    const parsed = planningSessionReferenceSchema.extend({ attachmentId: z.string().uuid() }).parse({ projectId, sessionId, attachmentId })
+    await projects.removePlanningAttachment(parsed.projectId, parsed.sessionId, parsed.attachmentId)
+  })
+  ipcMain.handle('planning:preview-attachment-url', async (_event, projectId, sessionId, attachmentId) => {
+    const parsed = planningSessionReferenceSchema.extend({ attachmentId: z.string().uuid() }).parse({ projectId, sessionId, attachmentId })
+    const { attachment, data } = await projects.readPlanningAttachment(parsed.projectId, parsed.sessionId, parsed.attachmentId)
+    return `data:${attachment.mimeType ?? 'application/octet-stream'};base64,${data.toString('base64')}`
+  })
   ipcMain.handle('ai:settings', () => ai.settings())
   ipcMain.handle('ai:configure', (_event, input) => ai.configure(z.object({
     baseUrl: z.string().url(),
@@ -124,6 +169,11 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
     apiKey: z.string().trim().min(1).optional()
   }).strict().parse(input)))
   ipcMain.handle('ai:propose', (_event, prompt) => ai.propose(z.string().trim().min(1).parse(prompt)))
+  ipcMain.handle('ai:propose-planning', async (_event, projectId, sessionId, prompt) => {
+    const parsed = planningSessionReferenceSchema.parse({ projectId, sessionId })
+    const parsedPrompt = z.string().trim().min(1).parse(prompt)
+    return ai.proposePlanning(parsedPrompt, await projects.getPlanningContext(parsed.projectId, parsed.sessionId, parsedPrompt))
+  })
 
   ipcMain.handle('attachments:list', (_event, projectId, workItemId) => {
     const parsed = workItemReferenceSchema.parse({ projectId, workItemId })

@@ -26,6 +26,10 @@ export class ProjectRegistry {
     private readonly clock: Clock = systemClock
   ) {}
 
+  get deletionBackupDirectory(): string {
+    return path.join(path.dirname(this.filePath), 'backups', 'project-deletions')
+  }
+
   async list(): Promise<ProjectRegistryRecord[]> {
     const registry = await this.read()
     return [...registry.projects]
@@ -83,6 +87,10 @@ export class ProjectRegistry {
   }
 
   async detach(id: string): Promise<boolean> {
+    return this.remove(id)
+  }
+
+  async remove(id: string): Promise<boolean> {
     const registry = await this.read()
     const remainingProjects = registry.projects.filter((project) => project.id !== id)
     if (remainingProjects.length === registry.projects.length) {
