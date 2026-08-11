@@ -22,7 +22,8 @@
     "test:visual": "npm run web:build && PLAYWRIGHT_BROWSERS_PATH=0 playwright test --project=chromium --grep @visual",
     "test:accessibility": "npm run web:build && PLAYWRIGHT_BROWSERS_PATH=0 playwright test --project=chromium --grep @a11y",
     "test": "npm run lint && npm run typecheck && npm run test:unit && npm run test:contract && npm run test:integration && npm run test:e2e",
-    "package:mac": "npm run build && electron-builder --mac --dir"
+    "package:mac": "npm run build && electron-builder --mac --dir",
+    "package:mac:notarize": "npm run package:mac && bash scripts/notarize-mac.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.10.0",
