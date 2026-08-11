@@ -1,5 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { safeStorage } from 'electron'
+import { formatPlanningPrompt } from '../core/planning'
+import type { PlanningContext } from '../core/types'
 
 export interface AiProviderSettings {
   baseUrl: string
@@ -36,6 +38,14 @@ export class OpenAiCompatibleProvider {
   }
 
   async propose(prompt: string): Promise<string> {
+    return this.request(prompt)
+  }
+
+  async proposePlanning(prompt: string, context: PlanningContext): Promise<string> {
+    return this.request(formatPlanningPrompt(prompt, context))
+  }
+
+  private async request(prompt: string): Promise<string> {
     const settings = await this.read()
     if (!settings.encryptedApiKey && !isLoopback(settings.baseUrl)) throw new Error('Configure an AI provider before requesting a proposal.')
     const apiKey = settings.encryptedApiKey ? safeStorage.decryptString(Buffer.from(settings.encryptedApiKey, 'base64')) : undefined

@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { KnowledgeRepository } from '../../src/core/knowledge'
 import { ProjectStore } from '../../src/core/project-store'
+import { WorkItemRepository } from '../../src/core/work-items'
 
 const cleanupPaths: string[] = []
 afterEach(async () => Promise.all(cleanupPaths.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))))
@@ -80,6 +81,74 @@ describe('KnowledgeRepository', () => {
       expect.objectContaining({ slug: 'architecture', content: '# Architecture\n\nUser-authored design.' })
     ]))
     expect(knowledge.search('user-authored')).toMatchObject([{ sourceId: 'wiki:architecture', title: 'Wiki: architecture' }])
+    knowledge.saveWikiArticle('lease-design', '# Lease design\n\nAtomic lease recovery is documented here.')
+    const workItems = new WorkItemRepository(store)
+    const backlog = workItems.create({ title: 'Add atomic lease recovery', descriptionMarkdown: 'Backlog implementation notes.' })
+    const completed = workItems.create({ title: 'Verify atomic lease handoff', descriptionMarkdown: 'Completed implementation.' })
+    const withoutCompletion = workItems.create({ title: 'Null completion record' })
+    store.database.prepare("UPDATE work_items SET status = 'completed', completed_at = ? WHERE id = ?").run(now, completed.id)
+    store.database.prepare("UPDATE work_items SET status = 'completed', completed_at = ? WHERE id = ?").run(now, withoutCompletion.id)
+    store.database.prepare(
+      `INSERT INTO completion_records (
+        work_item_id, summary_markdown, implementation_notes_markdown, validation_markdown,
+        known_limitations_markdown, created_at
+      ) VALUES (?, ?, '', ?, '', ?)`
+    ).run(completed.id, 'Atomic lease handoff completed.', 'Validated handoff.', now)
+
+    const retrieval = knowledge.retrieve('atomic lease')
+    expect(retrieval.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sourceId: 'wiki:lease-design',
+        sourceType: 'wiki_article',
+        location: 'knowledge/wiki/lease-design.md'
+      }),
+      expect.objectContaining({
+        sourceId: `raw:${source.id}`,
+        sourceType: 'raw_source',
+        location: source.relativeOrExternalLocation
+      }),
+      expect.objectContaining({
+        sourceId: `completed:${completed.id}`,
+        sourceType: 'completed_work',
+        workItemId: completed.id,
+        location: `work-items/${completed.id}/completion.md`
+      }),
+      expect.objectContaining({
+        sourceId: `backlog:${backlog.id}`,
+        sourceType: 'backlog',
+        workItemId: backlog.id,
+        location: `work-items/${backlog.id}/work-item.md`
+      })
+    ]))
+    expect(retrieval.groups.map((group) => [group.sourceType, group.results.length])).toEqual([
+      ['wiki_article', expect.any(Number)],
+      ['raw_source', expect.any(Number)],
+      ['completed_work', expect.any(Number)],
+      ['backlog', expect.any(Number)]
+    ])
+    expect(knowledge.retrieve('atomic lease')).toEqual(retrieval)
+    expect(knowledge.retrieve('missing').results).toEqual([])
+    expect(knowledge.retrieve('null completion').results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceId: `completed:${withoutCompletion.id}` })
+    ]))
+    expect(knowledge.retrieve('   ')).toMatchObject({ query: '', results: [] })
+    knowledge.saveWikiArticle('plain', 'Plain fallback title.')
+    expect(knowledge.retrieve('plain').results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceId: 'wiki:plain', title: 'Wiki: plain' })
+    ]))
+    expect(knowledge.retrieve('!!!').results).toEqual([])
+    knowledge.addManualSource({ displayName: 'Equal', filename: 'equal.md', content: 'No matching raw body.' })
+    knowledge.saveWikiArticle('equal-a', '# Equal')
+    knowledge.saveWikiArticle('equal-b', '# Equal')
+    knowledge.saveWikiArticle('equal-z', '# Another Equal')
+    const equalResultIds = knowledge.retrieve('equal').results.map((result) => result.sourceId)
+    expect(equalResultIds).toEqual(expect.arrayContaining([
+      'wiki:equal-a',
+      'wiki:equal-b',
+      'wiki:equal-z',
+      expect.stringMatching(/^raw:/)
+    ]))
+    expect(equalResultIds.indexOf('wiki:equal-a')).toBeLessThan(equalResultIds.findIndex((id) => id.startsWith('raw:')))
     expect(() => knowledge.saveWikiArticle('../unsafe', 'no')).toThrow()
     store.close()
   })

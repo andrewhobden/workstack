@@ -9,12 +9,11 @@ import type {
   ProjectSummary,
   UpdateWorkItemInput,
   WorkItem,
-  WorkItemFilters,
   WorkClaim
 } from '../../core/types'
-import type { PlanningProposal } from '../../core/types'
+import type { PlanningContext, PlanningProposal } from '../../core/types'
 import type { KnowledgeSource } from '../../core/knowledge'
-import type { KnowledgeSearchResult } from '../../shared/desktop-api'
+import type { KnowledgeRetrievalResult, ProjectKnowledgeRetrieval } from '../../core/knowledge'
 
 type ProjectView = 'projects' | 'overview' | 'backlog' | 'in-progress' | 'completed' | 'knowledge' | 'activity' | 'settings'
 
@@ -39,10 +38,12 @@ export function App(): JSX.Element {
   const [planningProposal, setPlanningProposal] = useState<PlanningProposal>()
   const [view, setView] = useState<ProjectView>('projects')
   const [showProjectSheet, setShowProjectSheet] = useState(false)
+  const [showProjectDeletionSheet, setShowProjectDeletionSheet] = useState(false)
   const [showWorkItemSheet, setShowWorkItemSheet] = useState(false)
   const [showCommandPalette, setShowCommandPalette] = useState(false)
   const [selectedWorkItem, setSelectedWorkItem] = useState<WorkItem>()
   const [error, setError] = useState<string>()
+  const [notice, setNotice] = useState<string>()
   const [knowledgeSourceRequest, setKnowledgeSourceRequest] = useState(0)
 
   const startPlanning = useCallback(async (): Promise<void> => {
@@ -107,9 +108,9 @@ export function App(): JSX.Element {
   }, [api])
 
   const refreshWorkItems = useCallback(
-    async (projectId: string, filters?: WorkItemFilters) => {
+    async (projectId: string) => {
       try {
-        setWorkItems(await api.workItems.list(projectId, filters))
+        setWorkItems(await api.workItems.list(projectId))
       } catch (reason) {
         setError(messageFor(reason))
       }
@@ -285,6 +286,26 @@ export function App(): JSX.Element {
     }
   }
 
+  const deleteProject = async (): Promise<void> => {
+    if (!selectedProjectId) {
+      return
+    }
+
+    try {
+      const result = await api.projects.delete(selectedProjectId, { confirmed: true })
+      setProjects((currentProjects) => currentProjects.filter((project) => project.id !== selectedProjectId))
+      setSelectedProjectId(undefined)
+      setSelectedWorkItem(undefined)
+      setView('projects')
+      setShowProjectDeletionSheet(false)
+      setNotice(`Project removed. Your .workstack backup is available at ${result.backupPath}`)
+      await refreshProjects()
+    } catch (reason) {
+      setError(messageFor(reason))
+      throw reason
+    }
+  }
+
   const updateProject = async (input: Parameters<DesktopApi['projects']['update']>[1]): Promise<void> => {
     if (!selectedProjectId) {
       return
@@ -375,6 +396,14 @@ export function App(): JSX.Element {
             </button>
           </div>
         ) : null}
+        {notice ? (
+          <div className="success-banner" role="status">
+            <span>{notice}</span>
+            <button type="button" onClick={() => setNotice(undefined)}>
+              Dismiss
+            </button>
+          </div>
+        ) : null}
         {!activeProject || view === 'projects' ? (
           <ProjectsHome projects={projects} onCreateProject={openProjectSheet} onOpenProject={(projectId) => {
             setSelectedProjectId(projectId)
@@ -404,6 +433,7 @@ export function App(): JSX.Element {
             onCreateWorkItem={() => setShowWorkItemSheet(true)}
             onPlanWork={startPlanning}
             onDetachProject={detachProject}
+            onDeleteProject={() => setShowProjectDeletionSheet(true)}
             onOpenFolder={() => {
               void api.projects.openFolder(activeProject.id).catch((reason: unknown) => setError(messageFor(reason)))
             }}
@@ -412,7 +442,6 @@ export function App(): JSX.Element {
             knowledgeSourceRequest={knowledgeSourceRequest}
             onKnowledgeSourceRequestHandled={() => setKnowledgeSourceRequest(0)}
             onUpdateProject={updateProject}
-            onWorkItemFilter={(filters) => void refreshWorkItems(activeProject.id, filters)}
             view={view}
             workItems={workItems}
           />
@@ -420,6 +449,14 @@ export function App(): JSX.Element {
       </section>
       {showProjectSheet ? (
         <ProjectSheet api={api} onCancel={() => setShowProjectSheet(false)} onSubmit={createProject} />
+      ) : null}
+      {showProjectDeletionSheet && activeProject ? (
+        <ProjectDeletionSheet
+          name={activeProject.name}
+          rootPath={selectedProject?.rootPath ?? activeProject.rootPath}
+          onCancel={() => setShowProjectDeletionSheet(false)}
+          onConfirm={deleteProject}
+        />
       ) : null}
       {showWorkItemSheet ? (
         <WorkItemSheet onCancel={() => setShowWorkItemSheet(false)} onSubmit={createWorkItem} />
@@ -661,13 +698,13 @@ function ProjectViewContent({
   onCreateWorkItem,
   onPlanWork,
   onDetachProject,
+  onDeleteProject,
   onAddKnowledgeSource,
   onKnowledgeSourceRequestHandled,
   knowledgeSourceRequest,
   onOpenFolder,
   onOpenWorkItem,
   onUpdateProject,
-  onWorkItemFilter,
   view,
   workItems
 }: {
@@ -678,13 +715,13 @@ function ProjectViewContent({
   onCreateWorkItem(): void
   onPlanWork(): void
   onDetachProject(): void
+  onDeleteProject(): void
   onAddKnowledgeSource(input: { displayName: string; filename: string; content: string }): Promise<void>
   onKnowledgeSourceRequestHandled(): void
   knowledgeSourceRequest: number
   onOpenFolder(): void
   onOpenWorkItem(workItem: WorkItem): void
   onUpdateProject(input: Parameters<DesktopApi['projects']['update']>[1]): Promise<void>
-  onWorkItemFilter(filters: WorkItemFilters): void
   view: ProjectView
   workItems: WorkItem[]
 }): JSX.Element {
@@ -692,16 +729,16 @@ function ProjectViewContent({
     return <Overview claims={claims} project={activeProject} workItems={workItems} onOpenWorkItem={onOpenWorkItem} />
   }
   if (view === 'backlog') {
-    return <Backlog workItems={workItems} onCreateWorkItem={onCreateWorkItem} onPlanWork={onPlanWork} onFilter={onWorkItemFilter} onOpenWorkItem={onOpenWorkItem} />
+    return <Backlog api={getDesktopApi()} projectId={activeProject.id} workItems={workItems} onCreateWorkItem={onCreateWorkItem} onPlanWork={onPlanWork} onOpenWorkItem={onOpenWorkItem} />
   }
   if (view === 'completed') {
-    return <WorkItemHistory title="Completed" description="Nothing has been completed yet. Completed work becomes part of Workstack's long-term project memory." items={workItems.filter((item) => item.status === 'completed')} onOpenWorkItem={onOpenWorkItem} />
+    return <WorkItemHistory api={getDesktopApi()} projectId={activeProject.id} title="Completed" description="Nothing has been completed yet. Completed work becomes part of Workstack's long-term project memory." items={workItems.filter((item) => item.status === 'completed')} onOpenWorkItem={onOpenWorkItem} />
   }
   if (view === 'in-progress') {
-    return <ActiveWorkPage claims={claims} items={workItems} onOpenWorkItem={onOpenWorkItem} />
+    return <ActiveWorkPage api={getDesktopApi()} projectId={activeProject.id} claims={claims} items={workItems} onOpenWorkItem={onOpenWorkItem} />
   }
   if (view === 'knowledge') {
-    return <KnowledgePage api={getDesktopApi()} projectId={activeProject.id} sources={knowledgeSources} onAddSource={onAddKnowledgeSource} sourceSheetRequest={knowledgeSourceRequest} onSourceSheetRequestHandled={onKnowledgeSourceRequestHandled} />
+    return <KnowledgePage api={getDesktopApi()} projectId={activeProject.id} sources={knowledgeSources} workItems={workItems} onOpenWorkItem={onOpenWorkItem} onAddSource={onAddKnowledgeSource} sourceSheetRequest={knowledgeSourceRequest} onSourceSheetRequestHandled={onKnowledgeSourceRequestHandled} />
   }
   if (view === 'activity') {
     return <ActivityPage api={getDesktopApi()} projectId={activeProject.id} />
@@ -713,6 +750,7 @@ function ProjectViewContent({
       projectSettings={metadata?.settings}
       rootPath={metadata?.rootPath ?? activeProject.rootPath}
       onDetach={onDetachProject}
+      onDelete={onDeleteProject}
       onOpenFolder={onOpenFolder}
       onSave={onUpdateProject}
     />
@@ -721,12 +759,33 @@ function ProjectViewContent({
 
 function ActivityPage({ api, projectId }: { api: DesktopApi; projectId: string }): JSX.Element {
   const [events, setEvents] = useState<import('../../core/types').ActivityEvent[]>([])
+  const [filter, setFilter] = useState<'all' | 'human' | 'agents' | 'work-items' | 'knowledge'>('all')
   useEffect(() => { void api.activity.list(projectId).then(setEvents) }, [api, projectId])
+  const filteredEvents = events
+    .filter((event) => {
+      if (filter === 'human') return event.actorType === 'human'
+      if (filter === 'agents') return event.actorType === 'agent'
+      if (filter === 'work-items') return Boolean(event.workItemId) || event.eventType.startsWith('work_item_')
+      if (filter === 'knowledge') return event.eventType.includes('knowledge')
+      return true
+    })
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
   return (
     <section className="page-content" aria-labelledby="activity-heading">
       <p className="eyebrow">PROJECT MEMORY</p><h1 id="activity-heading">Activity</h1>
       <p className="page-intro">A durable record of human, agent, and knowledge milestones.</p>
-      {events.length ? <ol className="activity-list">{events.map((event) => <li key={event.id}><strong>{event.eventType.replaceAll('_', ' ')}</strong><span>{event.actorId ?? event.actorType} · {formatDate(event.createdAt)}</span></li>)}</ol> : <div className="inline-empty"><p>No project activity yet.</p></div>}
+      <div aria-label="Filter activity" className="segmented-control" role="tablist">
+        {([
+          ['all', 'All'],
+          ['human', 'Human'],
+          ['agents', 'Agents'],
+          ['work-items', 'Work Items'],
+          ['knowledge', 'Knowledge']
+        ] as const).map(([value, label]) => (
+          <button aria-selected={filter === value} key={value} role="tab" type="button" onClick={() => setFilter(value)}>{label}</button>
+        ))}
+      </div>
+      {filteredEvents.length ? <ol className="activity-list">{filteredEvents.map((event) => <li key={event.id}><strong>{event.eventType.replaceAll('_', ' ')}</strong><span>{event.actorId ?? event.actorType} · {formatDate(event.createdAt)}</span></li>)}</ol> : <div className="inline-empty"><p>No activity matches this filter.</p></div>}
     </section>
   )
 }
@@ -795,26 +854,57 @@ function CompactItems({ items, onOpen }: { items: WorkItem[]; onOpen(workItem: W
 }
 
 function Backlog({
+  api,
   onCreateWorkItem,
   onPlanWork,
-  onFilter,
   onOpenWorkItem,
+  projectId,
   workItems
 }: {
+  api: DesktopApi
   onCreateWorkItem(): void
   onPlanWork(): void
-  onFilter(filters: WorkItemFilters): void
   onOpenWorkItem(workItem: WorkItem): void
+  projectId: string
   workItems: WorkItem[]
 }): JSX.Element {
   const [query, setQuery] = useState('')
+  const [type, setType] = useState('')
   const [priority, setPriority] = useState('')
-  const filter = (nextQuery: string, nextPriority: string): void => {
-    onFilter({
-      query: nextQuery || undefined,
-      priority: nextPriority ? (nextPriority as WorkItem['priority']) : undefined
+  const [created, setCreated] = useState('')
+  const [attachments, setAttachments] = useState<'all' | 'with' | 'without'>('all')
+  const [source, setSource] = useState<'all' | 'manual' | 'ai'>('all')
+  const [sort, setSort] = useState<'created-desc' | 'created-asc' | 'priority' | 'title'>('created-desc')
+  const [attachmentCounts, setAttachmentCounts] = useState<Record<string, number>>({})
+  const backlogItems = useMemo(() => workItems.filter((item) => item.status === 'backlog'), [workItems])
+
+  useEffect(() => {
+    let current = true
+    void Promise.all(backlogItems.map(async (item) => [item.id, (await api.attachments.list(projectId, item.id)).length] as const))
+      .then((counts) => {
+        if (current) setAttachmentCounts(Object.fromEntries(counts))
+      })
+      .catch(() => {
+        if (current) setAttachmentCounts({})
+      })
+    return () => { current = false }
+  }, [api, projectId, backlogItems])
+
+  const filteredItems = backlogItems
+    .filter((item) => {
+      const normalizedQuery = query.trim().toLowerCase()
+      const matchesQuery = !normalizedQuery || `${item.displayId} ${item.title} ${item.descriptionMarkdown} ${item.acceptanceCriteriaMarkdown}`.toLowerCase().includes(normalizedQuery)
+      const matchesCreated = !created || matchesCreatedPeriod(item.createdAt, created)
+      const matchesAttachments = attachments === 'all' || (attachments === 'with' ? Boolean(attachmentCounts[item.id]) : !attachmentCounts[item.id])
+      const matchesSource = source === 'all' || (source === 'manual' ? item.source === 'manual' : item.source !== 'manual')
+      return matchesQuery && (!type || item.type === type) && (!priority || item.priority === priority) && matchesCreated && matchesAttachments && matchesSource
     })
-  }
+    .sort((left, right) => {
+      if (sort === 'created-asc') return left.createdAt.localeCompare(right.createdAt)
+      if (sort === 'priority') return priorityRank(left.priority) - priorityRank(right.priority) || right.createdAt.localeCompare(left.createdAt)
+      if (sort === 'title') return left.title.localeCompare(right.title)
+      return right.createdAt.localeCompare(left.createdAt)
+    })
   return (
     <section className="page-content backlog-page" aria-labelledby="backlog-heading">
       <div className="page-toolbar">
@@ -831,21 +921,24 @@ function Backlog({
             placeholder="Search backlog"
             type="search"
             value={query}
-            onChange={(event) => {
-              setQuery(event.target.value)
-              filter(event.target.value, priority)
-            }}
+            onChange={(event) => setQuery(event.target.value)}
           />
+        </label>
+        <label>
+          <span className="sr-only">Filter by type</span>
+          <select aria-label="Filter by type" value={type} onChange={(event) => setType(event.target.value)}>
+            <option value="">All types</option>
+            <option value="feature">Feature</option>
+            <option value="bug">Bug</option>
+            <option value="chore">Chore</option>
+          </select>
         </label>
         <label>
           <span className="sr-only">Filter by priority</span>
           <select
             aria-label="Filter by priority"
             value={priority}
-            onChange={(event) => {
-              setPriority(event.target.value)
-              filter(query, event.target.value)
-            }}
+            onChange={(event) => setPriority(event.target.value)}
           >
             <option value="">All priorities</option>
             <option value="high">High</option>
@@ -853,8 +946,12 @@ function Backlog({
             <option value="low">Low</option>
           </select>
         </label>
+        <label><span className="sr-only">Filter by created date</span><select aria-label="Filter by created date" value={created} onChange={(event) => setCreated(event.target.value)}><option value="">Any time</option><option value="today">Today</option><option value="week">Past 7 days</option><option value="month">Past 30 days</option><option value="older">Older than 30 days</option></select></label>
+        <label><span className="sr-only">Filter by attachments</span><select aria-label="Filter by attachments" value={attachments} onChange={(event) => setAttachments(event.target.value as typeof attachments)}><option value="all">All attachments</option><option value="with">Has attachments</option><option value="without">No attachments</option></select></label>
+        <label><span className="sr-only">Filter by source</span><select aria-label="Filter by source" value={source} onChange={(event) => setSource(event.target.value as typeof source)}><option value="all">All sources</option><option value="manual">Manual</option><option value="ai">AI generated</option></select></label>
+        <label><span className="sr-only">Sort backlog</span><select aria-label="Sort backlog" value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="created-desc">Newest created</option><option value="created-asc">Oldest created</option><option value="priority">Priority</option><option value="title">Title</option></select></label>
       </div>
-      {workItems.length ? (
+      {filteredItems.length ? (
         <div className="work-table" role="table" aria-label="Backlog work items">
           <div className="work-table-header" role="row">
             <span role="columnheader">ID</span>
@@ -862,21 +959,23 @@ function Backlog({
             <span role="columnheader">Title</span>
             <span role="columnheader">Priority</span>
             <span role="columnheader">Created</span>
+            <span role="columnheader">Files</span>
           </div>
-          {workItems.map((item) => (
+          {filteredItems.map((item) => (
             <div className="work-table-row" key={item.id} role="row">
               <span role="cell">{item.displayId}</span>
               <span role="cell"><TypeBadge type={item.type} /></span>
               <span className="work-title" role="cell"><button type="button" onClick={() => onOpenWorkItem(item)}>{item.title}</button></span>
               <span role="cell"><PriorityBadge priority={item.priority} /></span>
               <span role="cell">{formatDate(item.createdAt)}</span>
+              <span aria-label={attachmentCounts[item.id] ? `${attachmentCounts[item.id]} attachments` : 'No attachments'} role="cell">{attachmentCounts[item.id] ? `⌁ ${attachmentCounts[item.id]}` : '—'}</span>
             </div>
           ))}
         </div>
       ) : (
         <div className="inline-empty">
-          <h2>Your backlog is empty</h2>
-          <p>Add something yourself or discuss the next feature with Workstack.</p>
+          <h2>{backlogItems.length ? 'No backlog items match these filters' : 'Your backlog is empty'}</h2>
+          <p>{backlogItems.length ? 'Try removing a filter or changing the search.' : 'Add something yourself or discuss the next feature with Workstack.'}</p>
           <div className="empty-actions">
             <button className="secondary-button" type="button" onClick={onCreateWorkItem}>New Work Item</button>
             <button aria-label="Plan new work with AI" className="primary-button" type="button" onClick={onPlanWork}>Plan with AI</button>
@@ -888,40 +987,96 @@ function Backlog({
 }
 
 function WorkItemHistory({
+  api,
   description,
   items,
   onOpenWorkItem,
+  projectId,
   title
 }: {
+  api: DesktopApi
   description: string
   items: WorkItem[]
   onOpenWorkItem(workItem: WorkItem): void
+  projectId: string
   title: string
 }): JSX.Element {
+  const [query, setQuery] = useState('')
+  const [completions, setCompletions] = useState<Record<string, CompletionRecord>>({})
+
+  useEffect(() => {
+    let current = true
+    void Promise.all(items.map(async (item) => [item.id, await api.claims.getCompletion(projectId, item.id)] as const))
+      .then((records) => {
+        if (current) setCompletions(Object.fromEntries(records.filter((entry): entry is [string, CompletionRecord] => Boolean(entry[1]))))
+      })
+      .catch(() => {
+        if (current) setCompletions({})
+      })
+    return () => { current = false }
+  }, [api, items, projectId])
+
+  const normalizedQuery = query.trim().toLowerCase()
+  const filteredItems = items
+    .filter((item) => {
+      const completion = completions[item.id]
+      const corpus = [
+        item.displayId,
+        item.title,
+        item.descriptionMarkdown,
+        item.acceptanceCriteriaMarkdown,
+        completion?.summaryMarkdown,
+        completion?.implementationNotesMarkdown,
+        completion?.validationMarkdown,
+        completion?.filesChanged.join(' '),
+        completion?.componentsChanged.join(' '),
+        completion?.commitSha,
+        completion?.branch,
+        completion?.prUrl,
+        completion?.completedByAgentId,
+        completion?.completedBySessionId
+      ].filter(Boolean).join(' ').toLowerCase()
+      return !normalizedQuery || corpus.includes(normalizedQuery)
+    })
+    .sort((left, right) => (right.completedAt ?? right.updatedAt).localeCompare(left.completedAt ?? left.updatedAt))
+  const groups = filteredItems.reduce<Record<string, WorkItem[]>>((result, item) => {
+    const day = formatHistoryDate(item.completedAt ?? item.updatedAt)
+    result[day] ??= []
+    result[day].push(item)
+    return result
+  }, {})
   return (
     <section className="page-content" aria-labelledby={`${title.toLowerCase().replace(' ', '-')}-heading`}>
       <p className="eyebrow">WORK HISTORY</p>
       <h1 id={`${title.toLowerCase().replace(' ', '-')}-heading`}>{title}</h1>
-      {items.length ? <CompactItems items={items} onOpen={onOpenWorkItem} /> : <div className="inline-empty"><p>{description}</p></div>}
+      <p className="page-intro">Search completed work, implementation evidence, and agent delivery metadata.</p>
+      <label className="search-field history-search"><span className="sr-only">Search completed work</span><input aria-label="Search completed work" placeholder="Search completed work" type="search" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+      {filteredItems.length ? <div className="history-groups">{Object.entries(groups).map(([day, dayItems]) => <section aria-label={`Completed ${day}`} className="history-group" key={day}><h2>{day}</h2><CompactItems items={dayItems} onOpen={onOpenWorkItem} /></section>)}</div> : <div className="inline-empty"><p>{items.length ? 'No completed work matches this search.' : description}</p></div>}
     </section>
   )
 }
 
 function ActiveWorkPage({
+  api,
   claims,
   items,
-  onOpenWorkItem
+  onOpenWorkItem,
+  projectId
 }: {
+  api: DesktopApi
   claims: WorkClaim[]
   items: WorkItem[]
   onOpenWorkItem(workItem: WorkItem): void
+  projectId: string
 }): JSX.Element {
+  const [agentDetail, setAgentDetail] = useState<{ claim: WorkClaim; item: WorkItem }>()
   return (
     <section className="page-content" aria-labelledby="in-progress-heading">
       <p className="eyebrow">AGENT COORDINATION</p>
       <h1 id="in-progress-heading">In Progress</h1>
       <p className="page-intro">Current coding-agent leases are authoritative. Review the owner and health before intervening.</p>
-      <ActiveWorkList claims={claims} items={items} onOpenWorkItem={onOpenWorkItem} />
+      <ActiveWorkList claims={claims} items={items} onOpenWorkItem={onOpenWorkItem} onViewAgentDetails={(claim, item) => setAgentDetail({ claim, item })} />
+      {agentDetail ? <AgentDetailSheet api={api} claim={agentDetail.claim} item={agentDetail.item} projectId={projectId} onCancel={() => setAgentDetail(undefined)} /> : null}
     </section>
   )
 }
@@ -930,12 +1085,14 @@ function ActiveWorkList({
   claims,
   compact = false,
   items,
-  onOpenWorkItem
+  onOpenWorkItem,
+  onViewAgentDetails
 }: {
   claims: WorkClaim[]
   compact?: boolean
   items: WorkItem[]
   onOpenWorkItem(workItem: WorkItem): void
+  onViewAgentDetails?(claim: WorkClaim, item: WorkItem): void
 }): JSX.Element {
   const activeItems = claims.flatMap((claim) => {
     const item = items.find((candidate) => candidate.id === claim.workItemId)
@@ -950,7 +1107,7 @@ function ActiveWorkList({
     <ul className={`active-work-list ${compact ? 'compact' : ''}`} aria-label="Active work items">
       {activeItems.map(({ claim, item }) => (
         <li key={claim.id}>
-          <button type="button" onClick={() => onOpenWorkItem(item)}>
+          <button className="active-work-open" type="button" onClick={() => onOpenWorkItem(item)}>
             <span className="active-work-heading">
               <span><span className="work-id">{item.displayId}</span> {item.title}</span>
               <ClaimHealthBadge claim={claim} />
@@ -959,6 +1116,7 @@ function ActiveWorkList({
             {claim.sessionId ? <span className="active-work-session">Session {claim.sessionId}</span> : null}
             {claim.blockedReason ? <span className="active-work-reason">{claim.blockedReason}</span> : null}
           </button>
+          {onViewAgentDetails ? <button aria-label={`View details for ${claim.agentDisplayName ?? claim.agentId}`} className="agent-details-button" type="button" onClick={() => onViewAgentDetails(claim, item)}>Agent details</button> : null}
         </li>
       ))}
     </ul>
@@ -971,7 +1129,9 @@ function KnowledgePage({
   onSourceSheetRequestHandled,
   projectId,
   sourceSheetRequest,
-  sources
+  sources,
+  workItems,
+  onOpenWorkItem
 }: {
   api: DesktopApi
   onAddSource(input: { displayName: string; filename: string; content: string }): Promise<void>
@@ -979,9 +1139,12 @@ function KnowledgePage({
   projectId: string
   sourceSheetRequest: number
   sources: KnowledgeSource[]
+  workItems: WorkItem[]
+  onOpenWorkItem(workItem: WorkItem): void
 }): JSX.Element {
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState<KnowledgeSearchResult[]>([])
+  const [retrieval, setRetrieval] = useState<ProjectKnowledgeRetrieval>()
+  const [preview, setPreview] = useState<KnowledgeRetrievalResult>()
   const [showSourceSheet, setShowSourceSheet] = useState(false)
   const [processing, setProcessing] = useState(false)
   const [displaySources, setDisplaySources] = useState(sources)
@@ -1002,10 +1165,10 @@ function KnowledgePage({
   const search = (value: string): void => {
     setQuery(value)
     if (!value.trim()) {
-      setResults([])
+      setRetrieval(undefined)
       return
     }
-    void api.knowledge.search(projectId, value).then(setResults)
+    void api.knowledge.retrieve(projectId, value).then(setRetrieval)
   }
 
   const refreshSources = async (): Promise<void> => {
@@ -1036,8 +1199,34 @@ function KnowledgePage({
         <input aria-label="Search knowledge" placeholder="Search knowledge" type="search" value={query} onChange={(event) => search(event.target.value)} />
       </label>
       {query ? (
-        <section className="knowledge-results" aria-label="Knowledge search results">
-          {results.length ? results.map((result) => <article key={result.sourceId}><strong>{result.title}</strong><p>{result.excerpt}</p></article>) : <p className="muted">No knowledge matches this search.</p>}
+        <section className="knowledge-results" aria-label="Knowledge retrieval results">
+          {retrieval?.results.length ? (
+            <>
+              <p className="retrieval-summary" role="status">{retrieval.results.length} project records, ranked by lexical relevance.</p>
+              {retrieval.groups.map((group) => group.results.length ? (
+                <section className="retrieval-group" key={group.sourceType} aria-labelledby={`retrieval-${group.sourceType}`}>
+                  <h2 id={`retrieval-${group.sourceType}`}>{group.label}</h2>
+                  <ul>
+                    {group.results.map((result) => (
+                      <li key={result.sourceId}>
+                        <button type="button" className="retrieval-result" onClick={() => {
+                          setPreview(result)
+                          if (result.workItemId) {
+                            const item = workItems.find((candidate) => candidate.id === result.workItemId)
+                            if (item) onOpenWorkItem(item)
+                          }
+                        }}>
+                          <span className="retrieval-result-title">{result.title}</span>
+                          <span className="retrieval-result-excerpt">{result.excerpt}</span>
+                          <span className="retrieval-provenance">{sourceTypeLabel(result.sourceType)} · {result.location}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null)}
+            </>
+          ) : <p className="muted">No project records match this search.</p>}
         </section>
       ) : (
         <>
@@ -1051,10 +1240,29 @@ function KnowledgePage({
         </section>
         </>
       )}
+      {preview && !preview.workItemId ? <KnowledgeProvenancePreview result={preview} onClose={() => setPreview(undefined)} /> : null}
       {showSourceSheet ? <KnowledgeSourceSheet onCancel={() => setShowSourceSheet(false)} onSubmit={async (input) => { await onAddSource(input); setShowSourceSheet(false) }} /> : null}
       {editingArticle ? <WikiArticleSheet article={editingArticle} onCancel={() => setEditingArticle(undefined)} onSave={async (article) => { const saved = await api.knowledge.saveWiki(projectId, article.slug, article.content); setArticles(await api.knowledge.listWiki(projectId)); setEditingArticle(saved) }} /> : null}
     </section>
   )
+}
+
+function KnowledgeProvenancePreview({ result, onClose }: { result: KnowledgeRetrievalResult; onClose(): void }): JSX.Element {
+  return (
+    <aside className="provenance-preview" aria-label="Source provenance">
+      <div>
+        <span className="provenance-type">{sourceTypeLabel(result.sourceType)}</span>
+        <strong>{result.title}</strong>
+      </div>
+      <p>{result.excerpt}</p>
+      <small>Source ID: {result.sourceId}<br />Location: {result.location}</small>
+      <button className="secondary-button" type="button" onClick={onClose}>Close preview</button>
+    </aside>
+  )
+}
+
+function sourceTypeLabel(sourceType: KnowledgeRetrievalResult['sourceType']): string {
+  return sourceType.replace('_', ' ')
 }
 
 function WikiArticleSheet({ article, onCancel, onSave }: { article: import('../../core/knowledge').WikiArticle; onCancel(): void; onSave(article: import('../../core/knowledge').WikiArticle): Promise<void> }): JSX.Element {
@@ -1112,6 +1320,7 @@ function WorkItemDetail({
 }): JSX.Element {
   const [editing, setEditing] = useState(false)
   const [showReleaseSheet, setShowReleaseSheet] = useState(false)
+  const [showAgentDetails, setShowAgentDetails] = useState(false)
   const [title, setTitle] = useState(item.title)
   const [description, setDescription] = useState(item.descriptionMarkdown)
   const [criteria, setCriteria] = useState(item.acceptanceCriteriaMarkdown)
@@ -1177,7 +1386,7 @@ function WorkItemDetail({
             <>
               <h1 id="work-item-heading">{item.title}</h1>
               {claim ? (
-                <ClaimStatusStrip claim={claim} onForceRelease={() => setShowReleaseSheet(true)} />
+                <ClaimStatusStrip claim={claim} onForceRelease={() => setShowReleaseSheet(true)} onViewAgentDetails={() => setShowAgentDetails(true)} />
               ) : null}
               <DocumentSection attachments={attachments} previewUrls={previewUrls} title="Description">{item.descriptionMarkdown || 'No description has been added yet.'}</DocumentSection>
               <DocumentSection title="Acceptance criteria">{item.acceptanceCriteriaMarkdown || 'No acceptance criteria have been added yet.'}</DocumentSection>
@@ -1211,6 +1420,7 @@ function WorkItemDetail({
           </dl>
         </aside>
       </div>
+      {showAgentDetails && claim ? <AgentDetailSheet api={api} claim={claim} item={item} projectId={projectId} onCancel={() => setShowAgentDetails(false)} /> : null}
       {showReleaseSheet && claim ? (
         <ReleaseClaimSheet
           claim={claim}
@@ -1333,6 +1543,7 @@ function AttachmentPanel({
   onRemove(attachment: Attachment): Promise<void>
   previewUrls: Record<string, string>
 }): JSX.Element {
+  const [quickLookAttachment, setQuickLookAttachment] = useState<Attachment>()
   const handleDrop = (files: File[]): void => {
     if (files.length) {
       void onAttachFiles(files)
@@ -1379,19 +1590,34 @@ function AttachmentPanel({
         <ul className="attachment-grid">
           {attachments.map((attachment) => (
             <li key={attachment.id}>
-              {attachment.mimeType?.startsWith('image/') && previewUrls[attachment.id] ? (
-                <img alt={`${attachment.originalFilename} preview`} src={previewUrls[attachment.id]} />
-              ) : (
-                <span className="file-thumbnail" aria-hidden="true">FILE</span>
-              )}
-              <span className="attachment-name">{attachment.originalFilename}</span>
-              <span className="attachment-size">{formatSize(attachment.sizeBytes)}</span>
+              <button aria-label={`Quick Look ${attachment.originalFilename}`} className="attachment-preview-trigger" type="button" onClick={() => setQuickLookAttachment(attachment)}>
+                {attachment.mimeType?.startsWith('image/') && previewUrls[attachment.id] ? (
+                  <img alt={`${attachment.originalFilename} preview`} src={previewUrls[attachment.id]} />
+                ) : (
+                  <span className="file-thumbnail" aria-hidden="true">FILE</span>
+                )}
+                <span className="attachment-name">{attachment.originalFilename}</span>
+                <span className="attachment-size">Press Space to Quick Look · {formatSize(attachment.sizeBytes)}</span>
+              </button>
               <button type="button" onClick={() => void onRemove(attachment)}>Remove {attachment.originalFilename}</button>
             </li>
           ))}
         </ul>
       ) : <p className="muted attachment-empty">No attachments yet.</p>}
+      {quickLookAttachment ? <QuickLookSheet attachment={quickLookAttachment} previewUrl={previewUrls[quickLookAttachment.id]} onCancel={() => setQuickLookAttachment(undefined)} /> : null}
     </section>
+  )
+}
+
+function QuickLookSheet({ attachment, onCancel, previewUrl }: { attachment: Attachment; onCancel(): void; previewUrl?: string }): JSX.Element {
+  return (
+    <Modal title="Quick Look" onCancel={onCancel}>
+      <section className="quick-look" aria-label={`Quick Look ${attachment.originalFilename}`}>
+        {attachment.mimeType?.startsWith('image/') && previewUrl ? <img alt={attachment.originalFilename} src={previewUrl} /> : <span aria-hidden="true" className="quick-look-file">FILE</span>}
+        <h3>{attachment.originalFilename}</h3>
+        <p>{attachment.mimeType ?? 'Unknown file type'} · {formatSize(attachment.sizeBytes)}</p>
+      </section>
+    </Modal>
   )
 }
 
@@ -1465,6 +1691,7 @@ function ProjectSettings({
   description,
   name,
   onDetach,
+  onDelete,
   onOpenFolder,
   onSave,
   projectSettings,
@@ -1473,6 +1700,7 @@ function ProjectSettings({
   description: string
   name: string
   onDetach(): void
+  onDelete(): void
   onOpenFolder(): void
   onSave(input: Parameters<DesktopApi['projects']['update']>[1]): Promise<void>
   projectSettings?: ProjectMetadata['settings']
@@ -1526,8 +1754,66 @@ function ProjectSettings({
         <h2>Detach Project</h2>
         <p>Remove this project from Workstack without deleting its `.workstack` folder or project data.</p>
         <button className="danger-button" type="button" onClick={onDetach}>Detach Project</button>
+        <div className="delete-project-action">
+          <h3>Delete Workstack data</h3>
+          <p>Back up and remove only this project’s `.workstack` data. Your project folder and every other file stay untouched.</p>
+          <button className="danger-button" type="button" onClick={onDelete}>Delete Project</button>
+        </div>
       </section>
     </section>
+  )
+}
+
+function ProjectDeletionSheet({
+  name,
+  onCancel,
+  onConfirm,
+  rootPath
+}: {
+  name: string
+  onCancel(): void
+  onConfirm(): Promise<void>
+  rootPath: string
+}): JSX.Element {
+  const [confirmed, setConfirmed] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState<string>()
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault()
+    if (!confirmed || deleting) {
+      return
+    }
+    setDeleting(true)
+    setError(undefined)
+    try {
+      await onConfirm()
+    } catch (reason) {
+      setError(messageFor(reason))
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <section aria-describedby="delete-project-description" aria-labelledby="delete-project-heading" aria-modal="true" className="modal deletion-modal" role="dialog">
+        <p className="eyebrow">PERMANENT CHANGE</p>
+        <h2 id="delete-project-heading">Delete {name} from Workstack?</h2>
+        <p id="delete-project-description">Workstack will first export <strong>{rootPath}/.workstack</strong> to a recoverable backup. Only after the backup succeeds will it remove that data and this project’s registry entry.</p>
+        <p>Your repository root and all non-Workstack files will remain exactly where they are.</p>
+        <form onSubmit={(event) => void submit(event)}>
+          <label className="confirmation-check">
+            <input checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} type="checkbox" />
+            I understand that Workstack data will be removed after its backup is created.
+          </label>
+          {error ? <p className="inline-error" role="alert">{error}</p> : null}
+          <div className="modal-actions">
+            <button className="secondary-button" disabled={deleting} type="button" onClick={onCancel}>Cancel</button>
+            <button className="danger-button" disabled={!confirmed || deleting} type="submit">{deleting ? 'Creating backup…' : 'Back up and delete project'}</button>
+          </div>
+        </form>
+      </section>
+    </div>
   )
 }
 
@@ -1656,37 +1942,47 @@ function PlanningSheet({
 }): JSX.Element {
   const [title, setTitle] = useState(proposal.title)
   const [description, setDescription] = useState(proposal.descriptionMarkdown)
+  const [requirements, setRequirements] = useState(proposal.requirementsMarkdown)
   const [criteria, setCriteria] = useState(proposal.acceptanceCriteriaMarkdown)
-  const [context, setContext] = useState<Array<{ title: string; excerpt: string }>>([])
+  const [implementationContext, setImplementationContext] = useState(proposal.implementationContextMarkdown)
+  const [relatedReferences, setRelatedReferences] = useState(proposal.relatedReferences.join('\n'))
+  const [type, setType] = useState(proposal.type)
+  const [priority, setPriority] = useState(proposal.priority)
+  const [context, setContext] = useState<PlanningContext>()
   const [contextVisible, setContextVisible] = useState(false)
   const [suggestion, setSuggestion] = useState<string>()
   const [suggestionError, setSuggestionError] = useState<string>()
   const [messages, setMessages] = useState<import('../../core/types').PlanningMessage[]>([])
+  const { attachments, attachFiles, pasteImage, previewUrls, removeAttachment } = usePlanningAttachments(
+    api,
+    projectId,
+    proposal.planningSessionId,
+    setSuggestionError
+  )
 
   useEffect(() => {
     void api.planning.listMessages(projectId, proposal.planningSessionId).then(setMessages)
   }, [api, projectId, proposal.planningSessionId])
-  const inspectContext = async (): Promise<void> => {
+  const contextQuery = `${title} ${description}`.trim()
+  const inspectContext = async (): Promise<PlanningContext | undefined> => {
     setContextVisible(true)
-    if (!title.trim()) {
-      setContext([])
-      return
+    try {
+      const nextContext = await api.planning.context(projectId, proposal.planningSessionId, contextQuery)
+      setContext(nextContext)
+      return nextContext
+    } catch (reason) {
+      setSuggestionError(messageFor(reason))
+      return undefined
     }
-    const [knowledge, relatedWork] = await Promise.all([
-      api.knowledge.search(projectId, title),
-      api.workItems.list(projectId, { query: title, limit: 5 })
-    ])
-    setContext([
-      ...knowledge.map((item) => ({ title: item.title, excerpt: item.excerpt })),
-      ...relatedWork.map((item) => ({ title: item.displayId, excerpt: item.title }))
-    ])
   }
   const requestSuggestion = async (): Promise<void> => {
     try {
       setSuggestionError(undefined)
-      const prompt = `Create a concise implementation suggestion for "${title}" in this project. Objective: ${description}`
+      const planningContext = await inspectContext()
+      if (!planningContext) return
+      const prompt = `Create a concise implementation suggestion for "${title}" while preserving all user-edited proposal fields. Objective: ${description}`
       await api.planning.addMessage(projectId, proposal.planningSessionId, 'user', prompt)
-      const response = await api.ai.propose(prompt)
+      const response = await api.ai.proposePlanning(projectId, proposal.planningSessionId, prompt)
       await api.planning.addMessage(projectId, proposal.planningSessionId, 'assistant', response)
       setSuggestion(response)
       setMessages(await api.planning.listMessages(projectId, proposal.planningSessionId))
@@ -1695,12 +1991,41 @@ function PlanningSheet({
     }
   }
   return (
-    <Modal title="Plan with AI" onCancel={onCancel}>
-      <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => { event.preventDefault(); void onConvert({ title, descriptionMarkdown: description, acceptanceCriteriaMarkdown: criteria }) }}>
-        <p className="modal-copy">Draft the proposal directly. AI enrichment is optional and will not overwrite your edited fields.</p>
+    <Modal className="planning-modal" title="Plan with AI" onCancel={onCancel}>
+      <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => {
+        event.preventDefault()
+        void onConvert({
+          title,
+          type,
+          descriptionMarkdown: description,
+          requirementsMarkdown: requirements,
+          acceptanceCriteriaMarkdown: criteria,
+          implementationContextMarkdown: implementationContext,
+          relatedReferences: relatedReferences.split('\n').map((reference) => reference.trim()).filter(Boolean),
+          priority
+        })
+      }}>
+        <div className="planning-context-chip" role="status">
+          Using project context — {context ? `${context.knowledge.length} knowledge · ${context.completedWork.length} completed · ${context.backlogOverlap.length} backlog · ${context.planningAttachments.length} attachments` : 'inspect evidence before asking'}
+        </div>
+        <p className="modal-copy">Draft the proposal directly. Suggestions are separate evidence-aware notes and never overwrite your edited fields.</p>
+        <div className="planning-field-grid">
+          <label className="field-label">Type<select aria-label="Proposal type" value={type} onBlur={() => void onSave({ type })} onChange={(event) => setType(event.target.value as WorkItem['type'])}><option value="feature">Feature</option><option value="bug">Bug</option><option value="chore">Chore</option></select></label>
+          <label className="field-label">Priority<select aria-label="Proposal priority" value={priority} onBlur={() => void onSave({ priority })} onChange={(event) => setPriority(event.target.value as WorkItem['priority'])}><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
+        </div>
         <label className="field-label">Proposal title<input required aria-label="Proposal title" value={title} onBlur={() => void onSave({ title })} onChange={(event) => setTitle(event.target.value)} /></label>
         <label className="field-label">Objective<textarea aria-label="Proposal objective" value={description} onBlur={() => void onSave({ descriptionMarkdown: description })} onChange={(event) => setDescription(event.target.value)} /></label>
+        <label className="field-label">Requirements<textarea aria-label="Proposal requirements" value={requirements} onBlur={() => void onSave({ requirementsMarkdown: requirements })} onChange={(event) => setRequirements(event.target.value)} /></label>
         <label className="field-label">Acceptance criteria<textarea aria-label="Proposal acceptance criteria" value={criteria} onBlur={() => void onSave({ acceptanceCriteriaMarkdown: criteria })} onChange={(event) => setCriteria(event.target.value)} /></label>
+        <label className="field-label">Implementation context<textarea aria-label="Proposal implementation context" value={implementationContext} onBlur={() => void onSave({ implementationContextMarkdown: implementationContext })} onChange={(event) => setImplementationContext(event.target.value)} /></label>
+        <label className="field-label">Related work and references<textarea aria-label="Proposal related references" placeholder="One work item ID, wiki article, or note per line" value={relatedReferences} onBlur={() => void onSave({ relatedReferences: relatedReferences.split('\n').map((reference) => reference.trim()).filter(Boolean) })} onChange={(event) => setRelatedReferences(event.target.value)} /></label>
+        <section className="planning-attachments" aria-labelledby="planning-attachments-heading">
+          <div className="section-heading"><h3 id="planning-attachments-heading">Planning evidence</h3><label className="secondary-button file-picker-label">Attach files<input aria-label="Attach planning files" multiple type="file" onChange={(event) => { void attachFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = '' }} /></label></div>
+          <div aria-label="Drop planning evidence or paste screenshots here" className="attachment-drop-zone" role="region" tabIndex={0} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void attachFiles(Array.from(event.dataTransfer.files)) }} onPaste={(event) => { const image = Array.from(event.clipboardData.files).find((file) => file.type.startsWith('image/')); if (image) { event.preventDefault(); void pasteImage(image) } }}>
+            Drop files here, choose files, or paste a screenshot.
+          </div>
+          {attachments.length ? <ul className="attachment-grid">{attachments.map((attachment) => <li key={attachment.id}>{attachment.mimeType?.startsWith('image/') && previewUrls[attachment.id] ? <img alt={`${attachment.originalFilename} preview`} src={previewUrls[attachment.id]} /> : <span className="file-thumbnail" aria-hidden="true">FILE</span>}<span className="attachment-name">{attachment.originalFilename}</span><span className="attachment-size">{formatSize(attachment.sizeBytes)}</span><button type="button" onClick={() => void removeAttachment(attachment)}>Remove {attachment.originalFilename}</button></li>)}</ul> : <p className="muted attachment-empty">No planning evidence attached yet.</p>}
+        </section>
         <section className="planning-suggestion" aria-labelledby="planning-suggestion-heading">
           <div className="section-heading"><h3 id="planning-suggestion-heading">AI suggestion</h3><button className="secondary-button" type="button" onClick={() => void requestSuggestion()}>Request suggestion</button></div>
           <p className="muted">Suggestions never overwrite your proposal. Apply relevant details manually.</p>
@@ -1710,7 +2035,7 @@ function PlanningSheet({
         </section>
         <section className="planning-context" aria-labelledby="planning-context-heading">
           <div className="section-heading"><h3 id="planning-context-heading">Context inspector</h3><button className="secondary-button" type="button" onClick={() => void inspectContext()}>Inspect context</button></div>
-          {contextVisible ? (context.length ? <ul>{context.map((item) => <li key={`${item.title}-${item.excerpt}`}><strong>{item.title}</strong><span>{item.excerpt}</span></li>)}</ul> : <p className="muted">No matching project context was retrieved.</p>) : <p className="muted">Inspect the evidence used to keep this proposal project-aware.</p>}
+          {contextVisible ? context ? <ContextEvidence context={context} /> : <p className="muted">No matching project context was retrieved.</p> : <p className="muted">Inspect project identity, matching knowledge, completed work, backlog overlap, and attachment metadata.</p>}
         </section>
         <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button><button className="primary-button" type="submit">Add to Backlog</button></div>
       </form>
@@ -1718,7 +2043,75 @@ function PlanningSheet({
   )
 }
 
-function Modal({ children, onCancel, title }: { children: ReactNode; onCancel(): void; title: string }): JSX.Element {
+function usePlanningAttachments(
+  api: DesktopApi,
+  projectId: string,
+  sessionId: string,
+  onError: (message: string) => void
+): {
+  attachments: Attachment[]
+  attachFiles(files: File[]): Promise<void>
+  pasteImage(file: File): Promise<void>
+  previewUrls: Record<string, string>
+  removeAttachment(attachment: Attachment): Promise<void>
+} {
+  const [attachments, setAttachments] = useState<Attachment[]>([])
+  const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({})
+  const reload = useCallback(async () => {
+    try {
+      const next = await api.planning.listAttachments(projectId, sessionId)
+      const previews = await Promise.all(next.map(async (attachment) => [attachment.id, await api.planning.previewAttachmentUrl(projectId, sessionId, attachment.id)] as const))
+      setAttachments(next)
+      setPreviewUrls(Object.fromEntries(previews))
+    } catch (reason) {
+      onError(messageFor(reason))
+    }
+  }, [api, onError, projectId, sessionId])
+  useEffect(() => { void reload() }, [reload])
+  const attachFiles = useCallback(async (files: File[]) => {
+    try {
+      for (const file of files) await api.planning.attachBytes(projectId, sessionId, await toAttachmentPayload(file))
+      await reload()
+    } catch (reason) {
+      onError(messageFor(reason))
+    }
+  }, [api, onError, projectId, reload, sessionId])
+  const pasteImage = useCallback(async (file: File) => {
+    try {
+      await api.planning.pasteImage(projectId, sessionId, await toAttachmentPayload(file))
+      await reload()
+    } catch (reason) {
+      onError(messageFor(reason))
+    }
+  }, [api, onError, projectId, reload, sessionId])
+  const removeAttachment = useCallback(async (attachment: Attachment) => {
+    try {
+      await api.planning.removeAttachment(projectId, sessionId, attachment.id)
+      await reload()
+    } catch (reason) {
+      onError(messageFor(reason))
+    }
+  }, [api, onError, projectId, reload, sessionId])
+  return { attachments, attachFiles, pasteImage, previewUrls, removeAttachment }
+}
+
+function ContextEvidence({ context }: { context: PlanningContext }): JSX.Element {
+  const sections: Array<{ label: string; items: PlanningContext['knowledge'] }> = [
+    { label: 'Knowledge', items: context.knowledge },
+    { label: 'Completed work', items: context.completedWork },
+    { label: 'Backlog overlap', items: context.backlogOverlap },
+    { label: 'Planning attachments', items: context.planningAttachments }
+  ]
+  return (
+    <div className="context-evidence">
+      <p><strong>{context.project.name}</strong>{context.project.description ? ` — ${context.project.description}` : ''}</p>
+      {sections.map((section) => section.items.length ? <section key={section.label}><h4>{section.label}</h4><ul>{section.items.map((item) => <li key={`${item.kind}-${item.sourceId}`}><strong>{item.title}</strong><span>{item.excerpt}</span>{item.metadata ? <small>{Object.entries(item.metadata).map(([key, value]) => `${key}: ${value ?? 'unknown'}`).join(' · ')}</small> : null}</li>)}</ul></section> : null)}
+      {!sections.some((section) => section.items.length) ? <p className="muted">No matching project context was retrieved.</p> : null}
+    </div>
+  )
+}
+
+function Modal({ children, className, onCancel, title }: { children: ReactNode; className?: string; onCancel(): void; title: string }): JSX.Element {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') {
@@ -1731,7 +2124,7 @@ function Modal({ children, onCancel, title }: { children: ReactNode; onCancel():
   }, [onCancel])
   return (
     <div className="modal-backdrop" role="presentation">
-      <section aria-labelledby="modal-heading" aria-modal="true" className="modal" role="dialog" onKeyDown={(event) => {
+      <section aria-labelledby="modal-heading" aria-modal="true" className={`modal ${className ?? ''}`} role="dialog" onKeyDown={(event) => {
         if (event.key === 'Escape') {
           event.stopPropagation()
           onCancel()
@@ -1797,7 +2190,7 @@ function StatusBadge({ status }: { status: WorkItem['status'] }): JSX.Element {
   return <span className={`status status-${status}`}><span aria-hidden="true" className="status-icon" />{label}</span>
 }
 
-function ClaimStatusStrip({ claim, onForceRelease }: { claim: WorkClaim; onForceRelease(): void }): JSX.Element {
+function ClaimStatusStrip({ claim, onForceRelease, onViewAgentDetails }: { claim: WorkClaim; onForceRelease(): void; onViewAgentDetails?(): void }): JSX.Element {
   const owner = claim.agentDisplayName ?? claim.agentId
   return (
     <section className={`claim-status-strip claim-${claimHealth(claim)}`}>
@@ -1811,8 +2204,51 @@ function ClaimStatusStrip({ claim, onForceRelease }: { claim: WorkClaim; onForce
           {claim.blockedReason ? ` · ${claim.blockedReason}` : ''}
         </p>
       </div>
-      <button className="danger-button" type="button" onClick={onForceRelease}>Force release</button>
+      <div className="claim-status-actions">
+        {onViewAgentDetails ? <button className="secondary-button" type="button" onClick={onViewAgentDetails}>View agent details</button> : null}
+        <button className="danger-button" type="button" onClick={onForceRelease}>Force release</button>
+      </div>
     </section>
+  )
+}
+
+function AgentDetailSheet({
+  api,
+  claim,
+  item,
+  onCancel,
+  projectId
+}: {
+  api: DesktopApi
+  claim: WorkClaim
+  item: WorkItem
+  onCancel(): void
+  projectId: string
+}): JSX.Element {
+  const [actions, setActions] = useState<import('../../core/types').ActivityEvent[]>([])
+  const name = claim.agentDisplayName ?? claim.agentId
+  useEffect(() => {
+    let current = true
+    void api.activity.list(projectId).then((events) => {
+      if (current) setActions(events.filter((event) => event.actorType === 'agent' && event.actorId === claim.agentId).sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 8))
+    }).catch(() => {
+      if (current) setActions([])
+    })
+    return () => { current = false }
+  }, [api, claim.agentId, projectId])
+  return (
+    <Modal title="Agent details" onCancel={onCancel}>
+      <section className="agent-detail-sheet" aria-label={`Details for ${name}`}>
+        <div className="agent-identity"><span aria-hidden="true">{name.slice(0, 1).toUpperCase()}</span><div><h3>{name}</h3><p>{claim.agentId}{claim.sessionId ? ` · Session ${claim.sessionId}` : ''}</p></div></div>
+        <dl>
+          <dt>Current work item</dt><dd>{item.displayId} · {item.title}</dd>
+          <dt>Claimed</dt><dd>{formatDateTime(claim.claimedAt)}</dd>
+          <dt>Last heartbeat</dt><dd>{formatDateTime(claim.lastHeartbeatAt)}</dd>
+          <dt>Lease expires</dt><dd>{formatDateTime(claim.leaseExpiresAt)} · <ClaimHealthBadge claim={claim} /></dd>
+        </dl>
+        <section aria-labelledby="agent-actions-heading"><h3 id="agent-actions-heading">Recent Workstack actions</h3>{actions.length ? <ol className="agent-actions">{actions.map((action) => <li key={action.id}><strong>{action.eventType.replaceAll('_', ' ')}</strong><span>{formatDateTime(action.createdAt)}</span></li>)}</ol> : <p className="muted">No agent actions have been recorded yet.</p>}</section>
+      </section>
+    </Modal>
   )
 }
 
@@ -1850,6 +2286,27 @@ function copyTextFallback(value: string): boolean {
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(new Date(value))
+}
+
+function formatHistoryDate(value: string): string {
+  return new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date(value))
+}
+
+function formatDateTime(value: string): string {
+  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(value))
+}
+
+function matchesCreatedPeriod(value: string, period: string): boolean {
+  const age = Date.now() - new Date(value).getTime()
+  const day = 24 * 60 * 60 * 1000
+  if (period === 'today') return age >= 0 && age < day
+  if (period === 'week') return age >= 0 && age <= 7 * day
+  if (period === 'month') return age >= 0 && age <= 30 * day
+  return age > 30 * day
+}
+
+function priorityRank(priority: WorkItem['priority']): number {
+  return { high: 0, normal: 1, low: 2 }[priority]
 }
 
 function messageFor(reason: unknown): string {

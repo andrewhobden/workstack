@@ -3,6 +3,7 @@ import type {
   ActivityEvent,
   CompletionRecord,
   CreateWorkItemInput,
+  ProjectDeletionResult,
   ForceReleaseInput,
   ProjectMetadata,
   ProjectSummary,
@@ -10,12 +11,12 @@ import type {
   UpdateWorkItemInput,
   PlanningProposal,
   PlanningMessage,
+  PlanningContext,
   WorkItem,
   WorkItemFilters,
   WorkClaim
 } from '../core/types'
-import type { KnowledgeSource } from '../core/knowledge'
-import type { WikiArticle } from '../core/knowledge'
+import type { KnowledgeSource, ProjectKnowledgeRetrieval, WikiArticle } from '../core/knowledge'
 
 export interface DesktopApi {
   system: {
@@ -25,6 +26,7 @@ export interface DesktopApi {
     settings(): Promise<AiProviderSettings>
     configure(input: AiProviderConfiguration): Promise<AiProviderSettings>
     propose(prompt: string): Promise<string>
+    proposePlanning(projectId: string, sessionId: string, prompt: string): Promise<string>
   }
   projects: {
     list(): Promise<ProjectSummary[]>
@@ -32,6 +34,7 @@ export interface DesktopApi {
     get(projectId: string): Promise<ProjectMetadata>
     update(projectId: string, updates: UpdateProjectInput): Promise<ProjectSummary>
     detach(projectId: string): Promise<void>
+    delete(projectId: string, input: DeleteProjectInput): Promise<ProjectDeletionResult>
     chooseFolder(): Promise<string | undefined>
     openFolder(projectId: string): Promise<void>
   }
@@ -55,6 +58,7 @@ export interface DesktopApi {
     listSources(projectId: string): Promise<KnowledgeSource[]>
     addSource(projectId: string, input: KnowledgeSourceInput): Promise<KnowledgeSource>
     search(projectId: string, query: string): Promise<KnowledgeSearchResult[]>
+    retrieve(projectId: string, query: string, limit?: number): Promise<ProjectKnowledgeRetrieval>
     processNext(projectId: string): Promise<KnowledgeSource | undefined>
     retryFailed(projectId: string): Promise<number>
     listWiki(projectId: string): Promise<WikiArticle[]>
@@ -67,6 +71,12 @@ export interface DesktopApi {
     convert(projectId: string, sessionId: string): Promise<WorkItem>
     listMessages(projectId: string, sessionId: string): Promise<PlanningMessage[]>
     addMessage(projectId: string, sessionId: string, role: PlanningMessage['role'], contentMarkdown: string): Promise<PlanningMessage>
+    context(projectId: string, sessionId: string, query: string): Promise<PlanningContext>
+    listAttachments(projectId: string, sessionId: string): Promise<Attachment[]>
+    attachBytes(projectId: string, sessionId: string, input: BinaryAttachmentPayload): Promise<Attachment>
+    pasteImage(projectId: string, sessionId: string, input: BinaryAttachmentPayload): Promise<Attachment>
+    removeAttachment(projectId: string, sessionId: string, attachmentId: string): Promise<void>
+    previewAttachmentUrl(projectId: string, sessionId: string, attachmentId: string): Promise<string>
   }
   attachments: {
     list(projectId: string, workItemId: string): Promise<Attachment[]>
@@ -82,6 +92,10 @@ export interface CreateProjectInput {
   name: string
   description?: string
   workItemPrefix?: string
+}
+
+export interface DeleteProjectInput {
+  confirmed: true
 }
 
 export interface AiProviderSettings {

@@ -8,7 +8,8 @@ import type { Attachment, BinaryAttachmentInput, FileAttachmentInput, PastedImag
 
 interface AttachmentRow {
   id: string
-  work_item_id: string
+  work_item_id: string | null
+  planning_session_id: string | null
   original_filename: string
   stored_relative_path: string
   mime_type: string | null
@@ -30,7 +31,7 @@ export class ArtifactStore {
     }
 
     const originalFilename = input.originalFilename ?? path.basename(input.sourcePath)
-    return this.persist(workItemId, {
+    return this.persist({ kind: 'work_item', id: workItemId }, {
       originalFilename,
       mimeType: input.mimeType ?? 'application/octet-stream',
       write: (destination) => copyFileSync(input.sourcePath, destination)
@@ -42,7 +43,7 @@ export class ArtifactStore {
       throw new WorkstackError('VALIDATION_ERROR', 'Attachment data cannot be empty.')
     }
 
-    return this.persist(workItemId, {
+    return this.persist({ kind: 'work_item', id: workItemId }, {
       originalFilename: input.originalFilename,
       mimeType: input.mimeType ?? 'application/octet-stream',
       write: (destination) => writeFileSync(destination, input.data)
@@ -75,10 +76,52 @@ export class ArtifactStore {
     ).map(toAttachment)
   }
 
+  attachPlanningBytes(sessionId: string, input: BinaryAttachmentInput): Attachment {
+    if (input.data.length === 0) {
+      throw new WorkstackError('VALIDATION_ERROR', 'Attachment data cannot be empty.')
+    }
+    return this.persist({ kind: 'planning_session', id: sessionId }, {
+      originalFilename: input.originalFilename,
+      mimeType: input.mimeType ?? 'application/octet-stream',
+      write: (destination) => writeFileSync(destination, input.data)
+    })
+  }
+
+  pastePlanningImage(sessionId: string, input: PastedImageInput): Attachment {
+    if (input.data.length === 0) {
+      throw new WorkstackError('VALIDATION_ERROR', 'Pasted image data cannot be empty.')
+    }
+    return this.attachPlanningBytes(sessionId, {
+      data: input.data,
+      originalFilename: input.originalFilename ?? 'screenshot.png',
+      mimeType: input.mimeType ?? 'image/png'
+    })
+  }
+
+  listPlanning(sessionId: string): Attachment[] {
+    this.requirePlanningSession(sessionId)
+    return (
+      this.store.database
+        .prepare('SELECT * FROM attachments WHERE planning_session_id = ? ORDER BY created_at ASC, id ASC')
+        .all(sessionId) as AttachmentRow[]
+    ).map(toAttachment)
+  }
+
   get(workItemId: string, attachmentId: string): Attachment {
     const row = this.store.database
       .prepare('SELECT * FROM attachments WHERE id = ? AND work_item_id = ?')
       .get(attachmentId, workItemId) as AttachmentRow | undefined
+    if (!row) {
+      throw new WorkstackError('ATTACHMENT_NOT_FOUND', 'The requested attachment does not exist.')
+    }
+    return toAttachment(row)
+  }
+
+  getPlanning(sessionId: string, attachmentId: string): Attachment {
+    this.requirePlanningSession(sessionId)
+    const row = this.store.database
+      .prepare('SELECT * FROM attachments WHERE id = ? AND planning_session_id = ?')
+      .get(attachmentId, sessionId) as AttachmentRow | undefined
     if (!row) {
       throw new WorkstackError('ATTACHMENT_NOT_FOUND', 'The requested attachment does not exist.')
     }
@@ -99,17 +142,35 @@ export class ArtifactStore {
     return readFileSync(this.resolvePath(workItemId, attachmentId))
   }
 
+  readPlanning(sessionId: string, attachmentId: string): Buffer {
+    return readFileSync(this.resolvePlanningPath(sessionId, attachmentId))
+  }
+
   remove(workItemId: string, attachmentId: string): void {
     const pathToRemove = this.resolvePath(workItemId, attachmentId)
     this.store.database.prepare('DELETE FROM attachments WHERE id = ? AND work_item_id = ?').run(attachmentId, workItemId)
     rmSync(pathToRemove, { force: true })
   }
 
+  removePlanning(sessionId: string, attachmentId: string): void {
+    const pathToRemove = this.resolvePlanningPath(sessionId, attachmentId)
+    this.store.database.prepare('DELETE FROM attachments WHERE id = ? AND planning_session_id = ?').run(attachmentId, sessionId)
+    rmSync(pathToRemove, { force: true })
+  }
+
+  resolvePlanningPath(sessionId: string, attachmentId: string): string {
+    return this.resolveAttachmentPath(this.getPlanning(sessionId, attachmentId))
+  }
+
   private persist(
-    workItemId: string,
+    owner: { kind: 'work_item' | 'planning_session'; id: string },
     input: { originalFilename: string; mimeType: string; write(destination: string): void }
   ): Attachment {
-    const workItem = new WorkItemRepository(this.store).get(workItemId)
+    if (owner.kind === 'work_item') {
+      new WorkItemRepository(this.store).get(owner.id)
+    } else {
+      this.requirePlanningSession(owner.id)
+    }
     const id = this.createId()
     const originalFilename = input.originalFilename.trim()
     if (!originalFilename) {
@@ -117,7 +178,9 @@ export class ArtifactStore {
     }
 
     const storedFilename = `${id}-${safeFilename(originalFilename)}`
-    const directory = path.join(this.store.paths.workItemsPath, workItem.id, 'attachments')
+    const directory = owner.kind === 'work_item'
+      ? path.join(this.store.paths.workItemsPath, owner.id, 'attachments')
+      : path.join(this.store.paths.workstackPath, 'planning-sessions', owner.id, 'attachments')
     const destination = path.join(directory, storedFilename)
     const storedRelativePath = path.relative(this.store.paths.workstackPath, destination).split(path.sep).join('/')
     mkdirSync(directory, { recursive: true })
@@ -125,7 +188,8 @@ export class ArtifactStore {
     const contents = readFileSync(destination)
     const attachment: Attachment = {
       id,
-      workItemId,
+      workItemId: owner.kind === 'work_item' ? owner.id : null,
+      planningSessionId: owner.kind === 'planning_session' ? owner.id : null,
       originalFilename,
       storedRelativePath,
       mimeType: input.mimeType,
@@ -137,11 +201,29 @@ export class ArtifactStore {
     this.store.database
       .prepare(
         `INSERT INTO attachments (
-          id, work_item_id, original_filename, stored_relative_path, mime_type, size_bytes, sha256, created_at
-        ) VALUES (@id, @workItemId, @originalFilename, @storedRelativePath, @mimeType, @sizeBytes, @sha256, @createdAt)`
+          id, work_item_id, planning_session_id, original_filename, stored_relative_path, mime_type, size_bytes, sha256, created_at
+        ) VALUES (@id, @workItemId, @planningSessionId, @originalFilename, @storedRelativePath, @mimeType, @sizeBytes, @sha256, @createdAt)`
       )
       .run(attachment)
     return attachment
+  }
+
+  private resolveAttachmentPath(attachment: Attachment): string {
+    const candidate = path.resolve(this.store.paths.workstackPath, attachment.storedRelativePath)
+    const artifactRoot = path.resolve(this.store.paths.workstackPath)
+    if (!candidate.startsWith(`${artifactRoot}${path.sep}`)) {
+      throw new WorkstackError('ATTACHMENT_NOT_FOUND', 'The attachment path is outside the Workstack artifact store.')
+    }
+    return candidate
+  }
+
+  private requirePlanningSession(sessionId: string): void {
+    const session = this.store.database
+      .prepare('SELECT id FROM planning_sessions WHERE id = ? AND project_id = ?')
+      .get(sessionId, this.store.project.id)
+    if (!session) {
+      throw new WorkstackError('WORK_ITEM_NOT_FOUND', 'The requested planning session does not exist.')
+    }
   }
 }
 
@@ -158,6 +240,7 @@ function toAttachment(row: AttachmentRow): Attachment {
   return {
     id: row.id,
     workItemId: row.work_item_id,
+    planningSessionId: row.planning_session_id,
     originalFilename: row.original_filename,
     storedRelativePath: row.stored_relative_path,
     mimeType: row.mime_type,

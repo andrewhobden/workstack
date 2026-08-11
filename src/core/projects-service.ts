@@ -1,10 +1,16 @@
-import { stat } from 'node:fs/promises'
+import * as fs from 'node:fs/promises'
+import path from 'node:path'
 import { ProjectRegistry } from './project-registry'
 import { ProjectStore } from './project-store'
 import { WorkItemRepository } from './work-items'
 import { ArtifactStore } from './artifact-store'
 import { ClaimsRepository } from './claims'
-import { KnowledgeRepository, type KnowledgeSource, type WikiArticle } from './knowledge'
+import {
+  KnowledgeRepository,
+  type KnowledgeSource,
+  type ProjectKnowledgeRetrieval,
+  type WikiArticle
+} from './knowledge'
 import { PlanningRepository } from './planning'
 import { WorkstackError } from './errors'
 import type {
@@ -20,9 +26,11 @@ import type {
   FileAttachmentInput,
   InitializeProjectInput,
   ProjectMetadata,
+  ProjectDeletionResult,
   ProjectRegistryRecord,
   ProjectSummary,
   PlanningProposal,
+  PlanningContext,
   UpdateProjectInput,
   UpdateWorkItemInput,
   WorkItem,
@@ -36,8 +44,26 @@ interface CountRow {
   completed_count: number
 }
 
+interface ProjectDeletionFileSystem {
+  cp: typeof fs.cp
+  lstat: typeof fs.lstat
+  mkdir: typeof fs.mkdir
+  rm: typeof fs.rm
+}
+
+const projectDeletionFileSystem: ProjectDeletionFileSystem = {
+  cp: fs.cp,
+  lstat: fs.lstat,
+  mkdir: fs.mkdir,
+  rm: fs.rm
+}
+
 export class ProjectsService {
-  constructor(private readonly registry: ProjectRegistry) {}
+  constructor(
+    private readonly registry: ProjectRegistry,
+    private readonly deletionBackupDirectory: string = registry.deletionBackupDirectory,
+    private readonly deletionFileSystem: ProjectDeletionFileSystem = projectDeletionFileSystem
+  ) {}
 
   async createProject(input: InitializeProjectInput): Promise<ProjectSummary> {
     const store = await ProjectStore.initialize(input)
@@ -82,6 +108,51 @@ export class ProjectsService {
     if (!detached) {
       throw new WorkstackError('PROJECT_NOT_FOUND', 'The selected project is not registered.')
     }
+  }
+
+  async deleteProject(id: string): Promise<ProjectDeletionResult> {
+    const record = await this.requireRecord(id)
+    const paths = await deletionPaths(record.rootPath, this.deletionFileSystem)
+    const store = await ProjectStore.open(paths.rootPath)
+    try {
+      if (store.project.id !== record.id || path.resolve(store.project.rootPath) !== paths.rootPath) {
+        throw new WorkstackError('PROJECT_NOT_FOUND', 'The project registry points to a different project.')
+      }
+    } finally {
+      store.close()
+    }
+
+    const backupPath = await this.backupProjectData(paths.workstackPath, record.id)
+    try {
+      await this.deletionFileSystem.rm(paths.workstackPath, { recursive: true, force: false })
+    } catch {
+      throw new WorkstackError(
+        'INTERNAL_ERROR',
+        `Project data could not be deleted. Your backup remains at ${backupPath}.`
+      )
+    }
+
+    try {
+      const deleted = await this.registry.remove(id)
+      if (!deleted) {
+        throw new WorkstackError('PROJECT_NOT_FOUND', 'The selected project is not registered.')
+      }
+    } catch {
+      try {
+        await this.deletionFileSystem.cp(backupPath, paths.workstackPath, { recursive: true, force: false, errorOnExist: true })
+      } catch {
+        throw new WorkstackError(
+          'INTERNAL_ERROR',
+          `The project registry could not be removed. Restore the project data from ${backupPath}.`
+        )
+      }
+      throw new WorkstackError(
+        'INTERNAL_ERROR',
+        `The project registry could not be removed. Project data was restored; the backup remains at ${backupPath}.`
+      )
+    }
+
+    return { backupPath }
   }
 
   async createWorkItem(projectId: string, input: CreateWorkItemInput): Promise<WorkItem> {
@@ -172,6 +243,10 @@ export class ProjectsService {
     return this.withStore(projectId, (store) => new KnowledgeRepository(store).search(query))
   }
 
+  async retrieveKnowledge(projectId: string, query: string, limit?: number): Promise<ProjectKnowledgeRetrieval> {
+    return this.withStore(projectId, (store) => new KnowledgeRepository(store).retrieve(query, limit))
+  }
+
   async processKnowledgeJob(projectId: string): Promise<KnowledgeSource | undefined> {
     return this.withStore(projectId, (store) => new KnowledgeRepository(store).processNextJob())
   }
@@ -221,6 +296,36 @@ export class ProjectsService {
     return this.withStore(projectId, (store) => new PlanningRepository(store).convertToWorkItem(sessionId))
   }
 
+  async getPlanningContext(projectId: string, sessionId: string, query: string): Promise<PlanningContext> {
+    return this.withStore(projectId, (store) => new PlanningRepository(store).assembleContext(sessionId, query))
+  }
+
+  async listPlanningAttachments(projectId: string, sessionId: string): Promise<Attachment[]> {
+    return this.withStore(projectId, (store) => new ArtifactStore(store).listPlanning(sessionId))
+  }
+
+  async attachPlanningBytes(projectId: string, sessionId: string, input: BinaryAttachmentInput): Promise<Attachment> {
+    return this.withStore(projectId, (store) => new ArtifactStore(store).attachPlanningBytes(sessionId, input))
+  }
+
+  async pastePlanningImage(projectId: string, sessionId: string, input: BinaryAttachmentInput): Promise<Attachment> {
+    return this.withStore(projectId, (store) => new ArtifactStore(store).pastePlanningImage(sessionId, input))
+  }
+
+  async readPlanningAttachment(projectId: string, sessionId: string, attachmentId: string): Promise<{ attachment: Attachment; data: Buffer }> {
+    return this.withStore(projectId, (store) => {
+      const artifacts = new ArtifactStore(store)
+      return {
+        attachment: artifacts.getPlanning(sessionId, attachmentId),
+        data: artifacts.readPlanning(sessionId, attachmentId)
+      }
+    })
+  }
+
+  async removePlanningAttachment(projectId: string, sessionId: string, attachmentId: string): Promise<void> {
+    await this.withStore(projectId, (store) => new ArtifactStore(store).removePlanning(sessionId, attachmentId))
+  }
+
   async listAttachments(projectId: string, workItemId: string): Promise<Attachment[]> {
     return this.withStore(projectId, (store) => new ArtifactStore(store).list(workItemId))
   }
@@ -253,7 +358,7 @@ export class ProjectsService {
 
   async verifyProjectRoot(id: string): Promise<string> {
     const record = await this.requireRecord(id)
-    await stat(record.rootPath)
+    await fs.stat(record.rootPath)
     return record.rootPath
   }
 
@@ -283,8 +388,50 @@ export class ProjectsService {
     }
     return record
   }
+
+  private async backupProjectData(workstackPath: string, projectId: string): Promise<string> {
+    const backupBase = path.resolve(this.deletionBackupDirectory)
+    const backupDirectory = path.resolve(
+      backupBase,
+      `${projectId}-${new Date().toISOString().replace(/[:.]/g, '-')}`
+    )
+
+    try {
+      await this.deletionFileSystem.mkdir(backupBase, { recursive: true })
+      await this.deletionFileSystem.mkdir(backupDirectory)
+      const backupPath = path.join(backupDirectory, '.workstack')
+      await this.deletionFileSystem.cp(workstackPath, backupPath, { recursive: true, force: false, errorOnExist: true })
+      const backupStore = await ProjectStore.open(backupDirectory)
+      backupStore.close()
+      return backupPath
+    } catch {
+      await this.deletionFileSystem.rm(backupDirectory, { recursive: true, force: true }).catch(() => undefined)
+      throw new WorkstackError('INTERNAL_ERROR', 'Project deletion was cancelled because the backup could not be completed.')
+    }
+  }
 }
 
+async function deletionPaths(
+  rootPath: string,
+  fileSystem: Pick<ProjectDeletionFileSystem, 'lstat'>
+): Promise<{ rootPath: string; workstackPath: string }> {
+  if (!path.isAbsolute(rootPath) || path.resolve(rootPath) !== rootPath) {
+    throw new WorkstackError('VALIDATION_ERROR', 'The registered project path is not safe to delete.')
+  }
+
+  const root = await fileSystem.lstat(rootPath)
+  if (!root.isDirectory() || root.isSymbolicLink()) {
+    throw new WorkstackError('VALIDATION_ERROR', 'The registered project folder is not safe to delete.')
+  }
+
+  const workstackPath = path.resolve(rootPath, '.workstack')
+  const workstack = await fileSystem.lstat(workstackPath)
+  if (!workstack.isDirectory() || workstack.isSymbolicLink()) {
+    throw new WorkstackError('VALIDATION_ERROR', 'The Workstack data path is not safe to delete.')
+  }
+
+  return { rootPath, workstackPath }
+}
 function toProjectSummary(record: ProjectRegistryRecord, store: ProjectStore): ProjectSummary {
   const counts = store.database
     .prepare(

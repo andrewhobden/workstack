@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
   createProjectInputSchema,
+  deleteProjectInputSchema,
   createWorkItemInputSchema,
   binaryAttachmentInputSchema,
+  planningAttachmentInputSchema,
   forceReleaseWorkItemInputSchema,
+  knowledgeRetrievalInputSchema,
   planningProposalInputSchema,
+  planningSessionReferenceSchema,
   updateProjectInputSchema,
   updateWorkItemInputSchema,
   workItemFiltersSchema,
@@ -24,6 +28,7 @@ describe('desktop IPC contracts', () => {
       name: 'Updated',
       settings: { heartbeatSeconds: 120, autoUpdateKnowledgeOnCompletion: false }
     })).toMatchObject({ projectId, settings: { heartbeatSeconds: 120, autoUpdateKnowledgeOnCompletion: false } })
+    expect(deleteProjectInputSchema.parse({ projectId, confirmed: true })).toEqual({ projectId, confirmed: true })
     expect(createWorkItemInputSchema.parse({ projectId, title: 'Create work item' })).toMatchObject({
       projectId,
       title: 'Create work item'
@@ -39,6 +44,11 @@ describe('desktop IPC contracts', () => {
       status: 'backlog',
       limit: 10
     })
+    expect(knowledgeRetrievalInputSchema.parse({ projectId, query: 'atomic leases', limit: 10 })).toMatchObject({
+      projectId,
+      query: 'atomic leases',
+      limit: 10
+    })
     expect(planningProposalInputSchema.parse({
       projectId,
       sessionId: workItemId,
@@ -46,6 +56,14 @@ describe('desktop IPC contracts', () => {
       priority: 'normal',
       relatedReferences: ['knowledge/schema.md']
     })).toMatchObject({ title: 'Plan project-aware work' })
+    expect(planningSessionReferenceSchema.parse({ projectId, sessionId: workItemId })).toMatchObject({ sessionId: workItemId })
+    expect(planningAttachmentInputSchema.parse({
+      projectId,
+      sessionId: workItemId,
+      data: new Uint8Array([112, 108, 97, 110]),
+      originalFilename: 'planning.md',
+      mimeType: 'text/markdown'
+    })).toMatchObject({ originalFilename: 'planning.md' })
     expect(
       binaryAttachmentInputSchema.parse({
         projectId,
@@ -61,13 +79,17 @@ describe('desktop IPC contracts', () => {
     expect(() => createProjectInputSchema.parse({ rootPath: '', name: 'Workstack' })).toThrow()
     expect(() => createProjectInputSchema.parse({ rootPath: '/tmp/workstack', name: 'Workstack', extra: true })).toThrow()
     expect(() => updateProjectInputSchema.parse({ projectId: 'not-a-uuid' })).toThrow()
+    expect(() => deleteProjectInputSchema.parse({ projectId, confirmed: false })).toThrow()
+    expect(() => deleteProjectInputSchema.parse({ projectId, confirmed: true, extra: true })).toThrow()
     expect(() => updateProjectInputSchema.parse({ projectId, settings: { heartbeatSeconds: 10 } })).toThrow()
     expect(() => createWorkItemInputSchema.parse({ projectId, title: ' ', priority: 'urgent' })).toThrow()
     expect(() => workItemReferenceSchema.parse({ projectId, workItemId: '../unsafe' })).toThrow()
     expect(() => updateWorkItemInputSchema.parse({ projectId, workItemId, status: 'completed' })).toThrow()
     expect(() => forceReleaseWorkItemInputSchema.parse({ projectId, workItemId, reason: ' ', actorId: 'unexpected' })).toThrow()
     expect(() => planningProposalInputSchema.parse({ projectId, sessionId: 'not-a-uuid', priority: 'urgent' })).toThrow()
+    expect(() => planningAttachmentInputSchema.parse({ projectId, sessionId: workItemId, data: [], originalFilename: 'notes.txt', extra: true })).toThrow()
     expect(() => workItemFiltersSchema.parse({ limit: 101 })).toThrow()
+    expect(() => knowledgeRetrievalInputSchema.parse({ projectId, query: ' ', limit: 101 })).toThrow()
     expect(() => binaryAttachmentInputSchema.parse({ projectId, workItemId, data: [], originalFilename: 'x.png' })).toThrow()
   })
 })

@@ -20,6 +20,32 @@ export interface WikiArticle {
   content: string
 }
 
+export const KNOWLEDGE_RETRIEVAL_SOURCE_TYPES = ['wiki_article', 'raw_source', 'completed_work', 'backlog'] as const
+
+export type KnowledgeRetrievalSourceType = (typeof KNOWLEDGE_RETRIEVAL_SOURCE_TYPES)[number]
+
+export interface KnowledgeRetrievalResult {
+  sourceId: string
+  sourceType: KnowledgeRetrievalSourceType
+  title: string
+  excerpt: string
+  location: string
+  relevance: number
+  workItemId?: string
+}
+
+export interface KnowledgeRetrievalGroup {
+  sourceType: KnowledgeRetrievalSourceType
+  label: string
+  results: KnowledgeRetrievalResult[]
+}
+
+export interface ProjectKnowledgeRetrieval {
+  query: string
+  results: KnowledgeRetrievalResult[]
+  groups: KnowledgeRetrievalGroup[]
+}
+
 interface KnowledgeSourceRow {
   id: string
   kind: KnowledgeSource['kind']
@@ -163,12 +189,120 @@ export class KnowledgeRepository {
     }))
   }
 
+  retrieve(query: string, limit = 40): ProjectKnowledgeRetrieval {
+    const normalized = query.trim()
+    if (!normalized) {
+      return { query: normalized, results: [], groups: retrievalGroups([]) }
+    }
+
+    const sourceById = new Map(this.listSources().map((source) => [source.id, source]))
+    const candidates: RetrievalCandidate[] = [
+      ...this.listWikiArticles().map((article) => ({
+        sourceId: `wiki:${article.slug}`,
+        sourceType: 'wiki_article' as const,
+        title: articleTitle(article),
+        excerpt: excerptFor(article.content, normalized),
+        location: `knowledge/wiki/${article.slug}.md`,
+        content: article.content
+      })),
+      ...(this.store.database
+        .prepare('SELECT source_id, title, content FROM knowledge_search')
+        .all() as Array<{ source_id: string; title: string; content: string }>)
+        .flatMap((row) => {
+          const source = sourceById.get(row.source_id)
+          if (!source || source.kind === 'work_completion') return []
+          return [{
+            sourceId: `raw:${source.id}`,
+            sourceType: 'raw_source' as const,
+            title: source.displayName,
+            excerpt: excerptFor(row.content, normalized),
+            location: source.relativeOrExternalLocation,
+            content: `${row.title}\n${row.content}`
+          }]
+        }),
+      ...(this.store.database
+        .prepare(
+          `SELECT wi.id, wi.display_id, wi.title, wi.description_markdown, wi.acceptance_criteria_markdown,
+                  cr.summary_markdown, cr.implementation_notes_markdown, cr.validation_markdown,
+                  cr.known_limitations_markdown, cr.files_changed_json, cr.components_changed_json
+           FROM work_items wi
+           LEFT JOIN completion_records cr ON cr.work_item_id = wi.id
+           WHERE wi.status = 'completed'`
+        )
+        .all() as CompletedWorkRow[])
+        .map((row) => {
+          const content = completedWorkContent(row)
+          return {
+            sourceId: `completed:${row.id}`,
+            sourceType: 'completed_work' as const,
+            title: `${row.display_id} · ${row.title}`,
+            excerpt: excerptFor(content, normalized),
+            location: `work-items/${row.id}/completion.md`,
+            workItemId: row.id,
+            content
+          }
+        }),
+      ...(this.store.database
+        .prepare(
+          `SELECT id, display_id, title, description_markdown, acceptance_criteria_markdown
+           FROM work_items WHERE status = 'backlog'`
+        )
+        .all() as BacklogWorkRow[])
+        .map((row) => {
+          const content = `${row.title}\n${row.description_markdown}\n${row.acceptance_criteria_markdown}`
+          return {
+            sourceId: `backlog:${row.id}`,
+            sourceType: 'backlog' as const,
+            title: `${row.display_id} · ${row.title}`,
+            excerpt: excerptFor(content, normalized),
+            location: `work-items/${row.id}/work-item.md`,
+            workItemId: row.id,
+            content
+          }
+        })
+    ]
+
+    const results = candidates
+      .map(({ content, ...candidate }) => ({ ...candidate, relevance: lexicalRelevance(`${candidate.title}\n${content}`, normalized) }))
+      .filter((result) => result.relevance > 0)
+      .sort(compareRetrievalResults)
+      .slice(0, limit)
+
+    return { query: normalized, results, groups: retrievalGroups(results) }
+  }
+
   private appendCompletionKnowledge(source: KnowledgeSourceRow, content: string): void {
     if (source.kind !== 'work_completion') return
     mkdirSync(this.store.paths.wikiPath, { recursive: true })
     appendFileSync(path.join(this.store.paths.wikiPath, 'completed-work.md'), `\n\n## ${source.display_name}\n\n${content}\n`, 'utf8')
     appendFileSync(path.join(this.store.paths.knowledgePath, 'log.md'), `\n- Indexed ${source.display_name} (${source.id}).\n`, 'utf8')
   }
+}
+
+interface CompletedWorkRow {
+  id: string
+  display_id: string
+  title: string
+  description_markdown: string
+  acceptance_criteria_markdown: string
+  summary_markdown: string | null
+  implementation_notes_markdown: string | null
+  validation_markdown: string | null
+  known_limitations_markdown: string | null
+  files_changed_json: string | null
+  components_changed_json: string | null
+}
+
+interface BacklogWorkRow {
+  id: string
+  display_id: string
+  title: string
+  description_markdown: string
+  acceptance_criteria_markdown: string
+}
+
+interface RetrievalCandidate extends Omit<KnowledgeRetrievalResult, 'relevance'> {
+  content: string
 }
 
 function toKnowledgeSource(row: KnowledgeSourceRow): KnowledgeSource {
@@ -188,6 +322,74 @@ function safeFilename(filename: string): string {
 }
 
 function excerptFor(content: string, query: string): string {
-  const index = content.toLowerCase().indexOf(query.toLowerCase().split(/\s+/)[0])
-  return content.slice(Math.max(0, index - 40), index + 180).trim()
+  const firstTerm = query.toLowerCase().split(/\s+/)[0]
+  const index = content.toLowerCase().indexOf(firstTerm)
+  const start = index < 0 ? 0 : Math.max(0, index - 40)
+  return content.slice(start, start + 220).trim()
+}
+
+function articleTitle(article: WikiArticle): string {
+  const heading = article.content.match(/^#\s+(.+)$/m)?.[1]?.trim()
+  return heading ? `Wiki: ${heading}` : `Wiki: ${article.slug}`
+}
+
+function completedWorkContent(row: CompletedWorkRow): string {
+  return [
+    row.title,
+    row.description_markdown,
+    row.acceptance_criteria_markdown,
+    row.summary_markdown ?? '',
+    row.implementation_notes_markdown ?? '',
+    row.validation_markdown ?? '',
+    row.known_limitations_markdown ?? '',
+    row.files_changed_json ?? '',
+    row.components_changed_json ?? ''
+  ].join('\n')
+}
+
+function lexicalRelevance(content: string, query: string): number {
+  const normalizedContent = content.toLowerCase()
+  const normalizedQuery = query.toLowerCase()
+  const terms = [...new Set(normalizedQuery.match(/[a-z0-9_-]+/g) ?? [])]
+  if (!terms.some((term) => normalizedContent.includes(term))) return 0
+
+  const phraseMatches = countOccurrences(normalizedContent, normalizedQuery)
+  const termMatches = terms.reduce((total, term) => total + countOccurrences(normalizedContent, term), 0)
+  const title = content.split('\n', 1)[0].toLowerCase()
+  const titleMatches = terms.reduce((total, term) => total + countOccurrences(title, term), 0)
+  return phraseMatches * 100 + titleMatches * 20 + termMatches
+}
+
+function countOccurrences(content: string, term: string): number {
+  let count = 0
+  let start = 0
+  while (true) {
+    const index = content.indexOf(term, start)
+    if (index === -1) return count
+    count += 1
+    start = index + term.length
+  }
+}
+
+function compareRetrievalResults(left: KnowledgeRetrievalResult, right: KnowledgeRetrievalResult): number {
+  if (right.relevance !== left.relevance) return right.relevance - left.relevance
+  const typeOrder = KNOWLEDGE_RETRIEVAL_SOURCE_TYPES.indexOf(left.sourceType) - KNOWLEDGE_RETRIEVAL_SOURCE_TYPES.indexOf(right.sourceType)
+  if (typeOrder !== 0) return typeOrder
+  const titleOrder = left.title.localeCompare(right.title, 'en-US')
+  if (titleOrder !== 0) return titleOrder
+  return left.sourceId.localeCompare(right.sourceId, 'en-US')
+}
+
+function retrievalGroups(results: KnowledgeRetrievalResult[]): KnowledgeRetrievalGroup[] {
+  const labels: Record<KnowledgeRetrievalSourceType, string> = {
+    wiki_article: 'Wiki articles',
+    raw_source: 'Raw sources',
+    completed_work: 'Completed work',
+    backlog: 'Backlog'
+  }
+  return KNOWLEDGE_RETRIEVAL_SOURCE_TYPES.map((sourceType) => ({
+    sourceType,
+    label: labels[sourceType],
+    results: results.filter((result) => result.sourceType === sourceType)
+  }))
 }
