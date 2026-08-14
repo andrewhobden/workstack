@@ -6,11 +6,18 @@ import {
   binaryAttachmentInputSchema,
   planningAttachmentInputSchema,
   forceReleaseWorkItemInputSchema,
+  knowledgeChatMessageInputSchema,
+  knowledgeChatPendingActionReferenceSchema,
+  knowledgeChatSessionReferenceSchema,
   knowledgeRetrievalInputSchema,
+  launchCopilotInputSchema,
   planningProposalInputSchema,
   planningSessionReferenceSchema,
   updateProjectInputSchema,
   updateWorkItemInputSchema,
+  updateWorkerHandoffInputSchema,
+  wikiAutomationRescanInputSchema,
+  wikiAutomationJobReferenceSchema,
   workItemFiltersSchema,
   workItemReferenceSchema
 } from '../../src/contracts/desktop'
@@ -26,19 +33,25 @@ describe('desktop IPC contracts', () => {
     expect(updateProjectInputSchema.parse({
       projectId,
       name: 'Updated',
-      settings: { heartbeatSeconds: 120, autoUpdateKnowledgeOnCompletion: false }
-    })).toMatchObject({ projectId, settings: { heartbeatSeconds: 120, autoUpdateKnowledgeOnCompletion: false } })
+      settings: { heartbeatSeconds: 120, autoUpdateKnowledgeOnCompletion: false, copilotLaunchPrompt: 'Claim the selected work item.' }
+    })).toMatchObject({ projectId, settings: { heartbeatSeconds: 120, autoUpdateKnowledgeOnCompletion: false, copilotLaunchPrompt: 'Claim the selected work item.' } })
     expect(deleteProjectInputSchema.parse({ projectId, confirmed: true })).toEqual({ projectId, confirmed: true })
     expect(createWorkItemInputSchema.parse({ projectId, title: 'Create work item' })).toMatchObject({
       projectId,
       title: 'Create work item'
     })
     expect(workItemReferenceSchema.parse({ projectId, workItemId })).toMatchObject({ projectId, workItemId })
+    expect(launchCopilotInputSchema.parse({ projectId, workItemId, prompt: 'Claim this item.' })).toMatchObject({
+      prompt: 'Claim this item.'
+    })
     expect(updateWorkItemInputSchema.parse({ projectId, workItemId, priority: 'high' })).toMatchObject({
       priority: 'high'
     })
     expect(forceReleaseWorkItemInputSchema.parse({ projectId, workItemId, reason: 'Agent stopped responding' })).toMatchObject({
       reason: 'Agent stopped responding'
+    })
+    expect(updateWorkerHandoffInputSchema.parse({ projectId, workItemId, sessionSummaryMarkdown: 'Resume from the current worktree.' })).toMatchObject({
+      sessionSummaryMarkdown: 'Resume from the current worktree.'
     })
     expect(workItemFiltersSchema.parse({ status: 'backlog', limit: 10 })).toMatchObject({
       status: 'backlog',
@@ -48,6 +61,18 @@ describe('desktop IPC contracts', () => {
       projectId,
       query: 'atomic leases',
       limit: 10
+    })
+    expect(wikiAutomationJobReferenceSchema.parse({ projectId, jobId: workItemId })).toMatchObject({ projectId, jobId: workItemId })
+    expect(wikiAutomationRescanInputSchema.parse({ projectId })).toEqual({ projectId })
+    expect(knowledgeChatSessionReferenceSchema.parse({ projectId, sessionId: workItemId })).toMatchObject({
+      projectId,
+      sessionId: workItemId
+    })
+    expect(knowledgeChatMessageInputSchema.parse({ projectId, sessionId: workItemId, contentMarkdown: 'How does this work?' })).toMatchObject({
+      contentMarkdown: 'How does this work?'
+    })
+    expect(knowledgeChatPendingActionReferenceSchema.parse({ projectId, sessionId: workItemId, actionId: workItemId })).toMatchObject({
+      actionId: workItemId
     })
     expect(planningProposalInputSchema.parse({
       projectId,
@@ -84,12 +109,19 @@ describe('desktop IPC contracts', () => {
     expect(() => updateProjectInputSchema.parse({ projectId, settings: { heartbeatSeconds: 10 } })).toThrow()
     expect(() => createWorkItemInputSchema.parse({ projectId, title: ' ', priority: 'urgent' })).toThrow()
     expect(() => workItemReferenceSchema.parse({ projectId, workItemId: '../unsafe' })).toThrow()
+    expect(() => launchCopilotInputSchema.parse({ projectId, workItemId, prompt: ' ' })).toThrow()
     expect(() => updateWorkItemInputSchema.parse({ projectId, workItemId, status: 'completed' })).toThrow()
     expect(() => forceReleaseWorkItemInputSchema.parse({ projectId, workItemId, reason: ' ', actorId: 'unexpected' })).toThrow()
+    expect(() => updateWorkerHandoffInputSchema.parse({ projectId, workItemId, sessionSummaryMarkdown: 'x'.repeat(20_001) })).toThrow()
     expect(() => planningProposalInputSchema.parse({ projectId, sessionId: 'not-a-uuid', priority: 'urgent' })).toThrow()
     expect(() => planningAttachmentInputSchema.parse({ projectId, sessionId: workItemId, data: [], originalFilename: 'notes.txt', extra: true })).toThrow()
     expect(() => workItemFiltersSchema.parse({ limit: 101 })).toThrow()
     expect(() => knowledgeRetrievalInputSchema.parse({ projectId, query: ' ', limit: 101 })).toThrow()
+    expect(() => wikiAutomationJobReferenceSchema.parse({ projectId, jobId: '../unsafe' })).toThrow()
+    expect(() => wikiAutomationRescanInputSchema.parse({ projectId: 'not-a-uuid' })).toThrow()
+    expect(() => knowledgeChatSessionReferenceSchema.parse({ projectId, sessionId: 'not-a-uuid' })).toThrow()
+    expect(() => knowledgeChatMessageInputSchema.parse({ projectId, sessionId: workItemId, contentMarkdown: ' ' })).toThrow()
+    expect(() => knowledgeChatPendingActionReferenceSchema.parse({ projectId, sessionId: workItemId, actionId: '../unsafe' })).toThrow()
     expect(() => binaryAttachmentInputSchema.parse({ projectId, workItemId, data: [], originalFilename: 'x.png' })).toThrow()
   })
 })

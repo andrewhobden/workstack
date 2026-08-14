@@ -33,6 +33,9 @@ describe('Workstack MCP tools', () => {
       'workstack_create_bug',
       'workstack_search_completed',
       'workstack_get_work_item',
+      'workstack_get_work_item_handoff',
+      'workstack_list_wiki_articles',
+      'workstack_get_wiki_article',
       'workstack_claim_work_item',
       'workstack_heartbeat_work_item',
       'workstack_release_work_item',
@@ -90,6 +93,13 @@ describe('Workstack MCP tools', () => {
     await expect(tools.call('workstack_list_backlog', { project: project.name })).resolves.toMatchObject({
       work_items: expect.arrayContaining([expect.objectContaining({ id: workItem.id, displayId: workItem.displayId })])
     })
+    await projects.saveWikiArticle(project.id, 'handoff', 'Use the current worktree and preserve its branch.')
+    await expect(tools.call('workstack_list_wiki_articles', { project: project.name })).resolves.toEqual({
+      articles: [{ slug: 'handoff', preview: 'Use the current worktree and preserve its branch.' }]
+    })
+    await expect(tools.call('workstack_get_wiki_article', { project: project.name, slug: 'handoff' })).resolves.toEqual({
+      article: { slug: 'handoff', content: 'Use the current worktree and preserve its branch.' }
+    })
 
     const claimed = await tools.call('workstack_claim_work_item', {
       project_id: project.id,
@@ -105,6 +115,14 @@ describe('Workstack MCP tools', () => {
     }) as { current_claim: Record<string, unknown> }
     expect(detail.current_claim).toMatchObject({ agentId: 'codex' })
     expect(detail.current_claim).not.toHaveProperty('claimToken')
+    await expect(tools.call('workstack_get_work_item_handoff', {
+      project_id: project.id,
+      work_item_id: workItem.id
+    })).resolves.toMatchObject({
+      work_item: { id: workItem.id },
+      current_claim: { agentId: 'codex' },
+      completion: undefined
+    })
 
     await expect(
       tools.call('workstack_complete_work_item', {

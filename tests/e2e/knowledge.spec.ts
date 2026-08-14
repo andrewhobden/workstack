@@ -15,12 +15,26 @@ test('adds, searches, and retains a durable knowledge source @a11y @visual', asy
   await dialog.getByLabel('Source content').fill('Workstack uses SQLite WAL for atomic leases.')
   await dialog.getByRole('button', { name: 'Add Source' }).click()
   await expect(page.getByText('Architecture notes', { exact: true })).toBeVisible()
+  const automation = page.getByRole('region', { name: 'Knowledge automation' })
+  await expect(automation).toContainText('No sources pending.')
+  await expect(automation).toContainText('No failed sources.')
+  await expect(automation.getByRole('button', { name: 'Process pending' })).toBeDisabled()
+  await expect(automation.getByRole('button', { name: 'Retry failed' })).toBeDisabled()
+  const wikiAutomation = page.getByRole('region', { name: 'Wiki automation runs' })
+  await expect(wikiAutomation).toContainText('No wiki automation jobs yet.')
+  await wikiAutomation.getByRole('button', { name: 'Rescan codebase' }).click()
+  await expect(wikiAutomation).toContainText('Manual full-codebase wiki rescan')
+  await expect(wikiAutomation).toContainText('Queued · attempt 0')
+  await expect(wikiAutomation).toContainText('Queued ')
+  await expect(wikiAutomation.getByRole('button', { name: 'Rescan codebase' })).toBeDisabled()
+  await expect(page.getByRole('status')).toContainText('Codebase rescan queued.')
   await page.getByRole('button', { name: 'New wiki article' }).click()
   const wikiDialog = page.getByRole('dialog', { name: 'Wiki Article' })
   await wikiDialog.getByLabel('Article name').fill('lease-design')
   await wikiDialog.getByLabel('Article content').fill('# Lease design\n\nAtomic leases are a durable project decision.')
   await wikiDialog.getByRole('button', { name: 'Save article' }).click()
   await wikiDialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect(page.getByText('Manual · editable')).toBeVisible()
   await page.getByRole('button', { name: 'Backlog', exact: true }).click()
   await page.getByRole('button', { name: '+ New Work Item' }).click()
   const workDialog = page.getByRole('dialog', { name: 'New Work Item' })
@@ -41,4 +55,94 @@ test('adds, searches, and retains a durable knowledge source @a11y @visual', asy
   await expect(page.getByText('Architecture notes', { exact: true })).toBeVisible()
   await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
   await expect(page).toHaveScreenshot('knowledge-sources.png', { animations: 'disabled', maxDiffPixelRatio: 0.01 })
+})
+
+test('refreshes active wiki automation statuses @a11y', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '+ New Project' }).first().click()
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project name').fill('Wiki Status Project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project folder').fill('/tmp/wiki-status-project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByRole('button', { name: 'Create Project' }).click()
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
+  const wikiAutomation = page.getByRole('region', { name: 'Wiki automation runs' })
+  await wikiAutomation.getByRole('button', { name: 'Rescan codebase' }).click()
+  await expect(wikiAutomation).toContainText('Queued · attempt 0')
+  await page.evaluate(() => {
+    const storageKey = 'workstack-browser-state'
+    const state = JSON.parse(localStorage.getItem(storageKey) ?? '{}')
+    const projectId = state.projects[0].id
+    const job = state.wikiAutomationReportsByProject[projectId][0].job
+    const now = new Date().toISOString()
+    job.status = 'running'
+    job.attemptCount = 1
+    job.startedAt = now
+    job.updatedAt = now
+    const completedJob = { ...job, id: crypto.randomUUID(), status: 'completed', completedAt: now }
+    const failedJob = { ...job, id: crypto.randomUUID(), status: 'failed', errorMessage: 'The AI provider did not respond.', completedAt: now }
+    state.wikiAutomationReportsByProject[projectId].push(
+      { job: completedJob, artifacts: [], handoffs: [] },
+      { job: failedJob, artifacts: [], handoffs: [] }
+    )
+    localStorage.setItem(storageKey, JSON.stringify(state))
+  })
+  await expect(wikiAutomation).toContainText('Running · attempt 1')
+  await expect(wikiAutomation).toContainText('Started ')
+  await expect(wikiAutomation).toContainText('Completed · attempt 1')
+  await expect(wikiAutomation).toContainText('Completed ')
+  await expect(wikiAutomation).toContainText('Failed · attempt 1')
+  await expect(wikiAutomation.getByRole('alert')).toContainText('The AI provider did not respond.')
+  await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+})
+
+test('answers with project chat tools and requires approval before adding work @a11y', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '+ New Project' }).first().click()
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project name').fill('Chat Knowledge Project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project folder').fill('/tmp/chat-knowledge-project')
+  await page.getByRole('dialog', { name: 'New Project' }).getByRole('button', { name: 'Create Project' }).click()
+  await page.getByRole('button', { name: 'Knowledge', exact: true }).click()
+  await page.getByRole('button', { name: '+ Add Source' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Add Knowledge Source' })
+  await dialog.getByLabel('Source name').fill('Chat architecture')
+  await dialog.getByLabel('Source filename').fill('chat-architecture.md')
+  await dialog.getByLabel('Source content').fill('The knowledge chat agent uses approval gates before creating backlog work.')
+  await dialog.getByRole('button', { name: 'Add Source' }).click()
+  await page.getByRole('button', { name: 'Agent', exact: true }).click()
+
+  const chat = page.getByRole('region', { name: 'Project AI chat' })
+  await chat.getByLabel('Message project AI chat').fill('How does the chat agent create work? Include a code snippet.')
+  await chat.getByLabel('Message project AI chat').press('Meta+Enter')
+  await expect(chat).toContainText('I found')
+  const userMessage = chat.locator('.chat-message.user').last()
+  await expect(userMessage.locator('strong')).toHaveCount(0)
+  await expect(userMessage).toHaveCSS('align-self', 'flex-end')
+  const assistantMessage = chat.locator('.chat-message.assistant').last()
+  await expect(assistantMessage.locator('strong')).toHaveCount(0)
+  await expect(assistantMessage).toHaveCSS('align-self', 'flex-start')
+  await expect(assistantMessage.locator('.chat-code-block')).toContainText('npm run dev')
+  await expect(assistantMessage.locator('.chat-code-block')).toHaveCSS('background-color', 'rgb(248, 250, 252)')
+  await expect(assistantMessage).not.toContainText('```')
+  await expect(chat.getByRole('button', { name: /search_knowledge/ })).toBeVisible()
+  const transcript = chat.locator('.chat-transcript')
+  await expect(transcript).toHaveCSS('overflow-y', 'auto')
+  const documentHeight = await page.evaluate(() => ({
+    clientHeight: document.scrollingElement?.clientHeight,
+    scrollHeight: document.scrollingElement?.scrollHeight
+  }))
+  expect(documentHeight.scrollHeight).toBe(documentHeight.clientHeight)
+  await chat.getByRole('button', { name: /search_knowledge/ }).click()
+  await expect(page.getByRole('dialog', { name: 'Tool call details' })).toContainText('chat agent create work')
+  await page.getByRole('button', { name: 'Close Tool call details' }).click()
+
+  await chat.getByLabel('Message project AI chat').fill('Create a bug for chat approval flow')
+  await chat.getByLabel('Message project AI chat').press('Meta+Enter')
+  await expect(chat.getByRole('heading', { name: 'Approval needed' })).toBeVisible()
+  await page.getByRole('button', { name: 'Backlog', exact: true }).click()
+  await expect(page.getByText('chat approval flow')).toHaveCount(0)
+
+  await page.getByRole('button', { name: 'Agent', exact: true }).click()
+  await page.getByRole('button', { name: 'Approve and add to Backlog' }).click()
+  await page.getByRole('button', { name: 'Backlog', exact: true }).click()
+  await expect(page.getByText('for chat approval flow')).toBeVisible()
+  await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
 })

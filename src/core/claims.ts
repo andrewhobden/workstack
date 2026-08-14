@@ -38,6 +38,7 @@ const forceReleaseInputSchema = z.object({
 
 const completionInputSchema = z.object({
   summaryMarkdown: z.string().trim().min(1),
+  sessionSummaryMarkdown: z.string().default(''),
   implementationNotesMarkdown: z.string().default(''),
   validationMarkdown: z.string().default(''),
   knownLimitationsMarkdown: z.string().default(''),
@@ -46,6 +47,10 @@ const completionInputSchema = z.object({
   commitSha: z.string().trim().min(1).optional(),
   branch: z.string().trim().min(1).optional(),
   prUrl: z.string().url().nullable().optional()
+})
+
+const workerHandoffInputSchema = z.object({
+  sessionSummaryMarkdown: z.string().max(20_000)
 })
 
 interface WorkClaimRow {
@@ -68,6 +73,7 @@ interface WorkClaimRow {
 interface CompletionRecordRow {
   work_item_id: string
   summary_markdown: string
+  session_summary_markdown: string
   implementation_notes_markdown: string
   validation_markdown: string
   known_limitations_markdown: string
@@ -195,6 +201,23 @@ export class ClaimsRepository {
     return row ? toCompletionRecord(row) : undefined
   }
 
+  updateWorkerHandoff(workItemId: string, input: { sessionSummaryMarkdown: string }): CompletionRecord {
+    const parsed = workerHandoffInputSchema.parse(input)
+    const completion = this.immediate(() => {
+      this.workItems.get(workItemId)
+      const existing = this.getCompletion(workItemId)
+      if (!existing) {
+        throw new WorkstackError('INVALID_STATE_TRANSITION', 'A worker handoff can only be added after a completion has been recorded.')
+      }
+      this.store.database
+        .prepare('UPDATE completion_records SET session_summary_markdown = ? WHERE work_item_id = ?')
+        .run(parsed.sessionSummaryMarkdown, workItemId)
+      return { ...existing, sessionSummaryMarkdown: parsed.sessionSummaryMarkdown }
+    })
+    this.writeCompletionMirror(completion)
+    return completion
+  }
+
   heartbeat(workItemId: string, claimToken: string): WorkClaim {
     this.normalizeExpiredClaims()
     return this.immediate(() => {
@@ -274,12 +297,13 @@ export class ClaimsRepository {
   complete(workItemId: string, claimToken: string, input: CompletionInput): CompletionRecord {
     const parsed = completionInputSchema.parse(input)
     this.normalizeExpiredClaims()
-    const completion = this.immediate(() => {
+    const { completion, finalized } = this.immediate(() => {
       const now = this.now()
       const claim = this.requireActiveClaimOwner(workItemId, claimToken)
       const completion: CompletionRecord = {
         workItemId,
         summaryMarkdown: parsed.summaryMarkdown,
+        sessionSummaryMarkdown: parsed.sessionSummaryMarkdown,
         implementationNotesMarkdown: parsed.implementationNotesMarkdown,
         validationMarkdown: parsed.validationMarkdown,
         knownLimitationsMarkdown: parsed.knownLimitationsMarkdown,
@@ -295,11 +319,11 @@ export class ClaimsRepository {
       this.store.database
         .prepare(
           `INSERT INTO completion_records (
-            work_item_id, summary_markdown, implementation_notes_markdown, validation_markdown,
+            work_item_id, summary_markdown, session_summary_markdown, implementation_notes_markdown, validation_markdown,
             known_limitations_markdown, files_changed_json, components_changed_json, commit_sha,
             branch, pr_url, completed_by_agent_id, completed_by_session_id, created_at
           ) VALUES (
-            @workItemId, @summaryMarkdown, @implementationNotesMarkdown, @validationMarkdown,
+            @workItemId, @summaryMarkdown, @sessionSummaryMarkdown, @implementationNotesMarkdown, @validationMarkdown,
             @knownLimitationsMarkdown, @filesChangedJson, @componentsChangedJson, @commitSha,
             @branch, @prUrl, @completedByAgentId, @completedBySessionId, @createdAt
           )`
@@ -312,52 +336,33 @@ export class ClaimsRepository {
       this.store.database
         .prepare("UPDATE work_claims SET state = 'completed', completed_at = ? WHERE id = ? AND state = 'active'")
         .run(now, claim.id)
-      this.store.database
-        .prepare(
-          `UPDATE work_items
-           SET status = 'completed', completed_at = ?, updated_at = ?
-           WHERE id = ? AND status = 'in_progress'`
-        )
-        .run(now, now, workItemId)
-      this.workItems.updateCompletionSearchDocument(
-        workItemId,
-        [
-          completion.summaryMarkdown,
-          completion.implementationNotesMarkdown,
-          completion.validationMarkdown,
-          completion.knownLimitationsMarkdown,
-          completion.filesChanged.join('\n'),
-          completion.componentsChanged.join('\n')
-        ].join('\n')
-      )
-      const sourceId = this.createId()
-      this.store.database
-        .prepare(
-          `INSERT INTO knowledge_sources (
-            id, kind, display_name, relative_or_external_location, source_work_item_id,
-            status, created_at, updated_at
-          ) VALUES (?, 'work_completion', ?, ?, ?, 'pending', ?, ?)`
-        )
-        .run(
-          sourceId,
-          `Completion: ${this.workItems.get(workItemId).displayId}`,
-          `work-items/${workItemId}/completion.md`,
-          workItemId,
-          now,
-          now
-        )
-      this.store.database
-        .prepare(
-          `INSERT INTO knowledge_jobs (
-            id, source_id, status, attempts, created_at, updated_at
-          ) VALUES (?, ?, 'pending', 0, ?, ?)`
-        )
-        .run(this.createId(), sourceId, now, now)
-      this.workItems.recordActivity('work_item_completed', 'agent', claim.agentId, workItemId, {
-        commitSha: completion.commitSha,
-        branch: completion.branch,
-        knowledgeSourceId: sourceId
-      })
+      const finalized = !completion.prUrl
+      if (finalized) {
+        this.finalizeCompletion(completion, now)
+      }
+      this.syncWorkItemMirror(workItemId)
+      return { completion, finalized }
+    })
+    if (finalized) {
+      this.writeCompletionMirror(completion)
+    }
+    if (finalized && this.store.project.settings.autoUpdateKnowledgeOnCompletion) {
+      new KnowledgeRepository(this.store, { clock: this.clock() }).processNextJob()
+    }
+    return completion
+  }
+
+  finalizeMergedPullRequest(workItemId: string): CompletionRecord {
+    const completion = this.immediate(() => {
+      const workItem = this.workItems.get(workItemId)
+      const row = this.store.database
+        .prepare('SELECT * FROM completion_records WHERE work_item_id = ?')
+        .get(workItemId) as CompletionRecordRow | undefined
+      const completion = row ? toCompletionRecord(row) : undefined
+      if (!completion?.prUrl || workItem.status !== 'in_progress') {
+        throw new WorkstackError('INVALID_STATE_TRANSITION', 'The work item is not awaiting a pull request merge.')
+      }
+      this.finalizeCompletion(completion, this.now())
       this.syncWorkItemMirror(workItemId)
       return completion
     })
@@ -473,6 +478,58 @@ export class ClaimsRepository {
     return row ? toWorkClaim(row) : undefined
   }
 
+  private finalizeCompletion(completion: CompletionRecord, now: string): void {
+    const transitioned = this.store.database
+      .prepare(
+        `UPDATE work_items
+         SET status = 'completed', completed_at = ?, updated_at = ?
+         WHERE id = ? AND status = 'in_progress'`
+      )
+      .run(now, now, completion.workItemId)
+    if (transitioned.changes !== 1) {
+      throw new WorkstackError('INVALID_STATE_TRANSITION', 'The work item cannot be completed.')
+    }
+    this.workItems.updateCompletionSearchDocument(
+      completion.workItemId,
+      [
+        completion.summaryMarkdown,
+        completion.implementationNotesMarkdown,
+        completion.validationMarkdown,
+        completion.knownLimitationsMarkdown,
+        completion.filesChanged.join('\n'),
+        completion.componentsChanged.join('\n')
+      ].join('\n')
+    )
+    const sourceId = this.createId()
+    this.store.database
+      .prepare(
+        `INSERT INTO knowledge_sources (
+          id, kind, display_name, relative_or_external_location, source_work_item_id,
+          status, created_at, updated_at
+        ) VALUES (?, 'work_completion', ?, ?, ?, 'pending', ?, ?)`
+      )
+      .run(
+        sourceId,
+        `Completion: ${this.workItems.get(completion.workItemId).displayId}`,
+        `work-items/${completion.workItemId}/completion.md`,
+        completion.workItemId,
+        now,
+        now
+      )
+    this.store.database
+      .prepare(
+        `INSERT INTO knowledge_jobs (
+          id, source_id, status, attempts, created_at, updated_at
+        ) VALUES (?, ?, 'pending', 0, ?, ?)`
+      )
+      .run(this.createId(), sourceId, now, now)
+    this.workItems.recordActivity('work_item_completed', 'agent', completion.completedByAgentId, completion.workItemId, {
+      commitSha: completion.commitSha,
+      branch: completion.branch,
+      knowledgeSourceId: sourceId
+    })
+  }
+
   private syncWorkItemMirror(workItemId: string): void {
     this.workItems.syncMirror(this.workItems.get(workItemId))
   }
@@ -535,6 +592,7 @@ function toCompletionRecord(row: CompletionRecordRow): CompletionRecord {
   return {
     workItemId: row.work_item_id,
     summaryMarkdown: row.summary_markdown,
+    sessionSummaryMarkdown: row.session_summary_markdown ?? '',
     implementationNotesMarkdown: row.implementation_notes_markdown,
     validationMarkdown: row.validation_markdown,
     knownLimitationsMarkdown: row.known_limitations_markdown,
@@ -560,6 +618,9 @@ commit: ${completion.commitSha ?? ''}
 
 # Completion
 ${completion.summaryMarkdown}
+
+## Worker handoff
+${completion.sessionSummaryMarkdown}
 
 ## Implementation notes
 ${completion.implementationNotesMarkdown}

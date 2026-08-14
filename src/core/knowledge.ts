@@ -3,6 +3,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { systemClock, type Clock } from './clock'
+import { WorkstackError } from './errors'
 import { ProjectStore } from './project-store'
 
 export interface KnowledgeSource {
@@ -19,6 +20,8 @@ export interface WikiArticle {
   slug: string
   content: string
 }
+
+const GENERATED_WIKI_SLUG_PREFIX = 'generated-'
 
 export const KNOWLEDGE_RETRIEVAL_SOURCE_TYPES = ['wiki_article', 'raw_source', 'completed_work', 'backlog'] as const
 
@@ -147,16 +150,30 @@ export class KnowledgeRepository {
   }
 
   saveWikiArticle(slug: string, content: string): WikiArticle {
-    const safeSlug = slug.trim().toLowerCase()
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(safeSlug)) throw new Error('Wiki article names may contain lowercase letters, numbers, and hyphens only.')
+    const safeSlug = wikiSlug(slug)
+    if (isGeneratedWikiSlug(safeSlug)) {
+      throw new WorkstackError('VALIDATION_ERROR', 'Generated wiki articles are reserved for automation.')
+    }
+    return this.writeWikiArticle(safeSlug, content)
+  }
+
+  saveGeneratedWikiArticle(slug: string, content: string): WikiArticle {
+    const safeSlug = wikiSlug(slug)
+    if (!isGeneratedWikiSlug(safeSlug)) {
+      throw new WorkstackError('VALIDATION_ERROR', 'The generated wiki API only accepts reserved generated article slugs.')
+    }
+    return this.writeWikiArticle(safeSlug, content)
+  }
+
+  private writeWikiArticle(slug: string, content: string): WikiArticle {
     mkdirSync(this.store.paths.wikiPath, { recursive: true })
-    const article = { slug: safeSlug, content }
-    writeFileSync(path.join(this.store.paths.wikiPath, `${safeSlug}.md`), content, 'utf8')
+    const article = { slug, content }
+    writeFileSync(path.join(this.store.paths.wikiPath, `${slug}.md`), content, 'utf8')
     this.store.database.transaction(() => {
-      this.store.database.prepare('DELETE FROM knowledge_search WHERE source_id = ?').run(`wiki:${safeSlug}`)
+      this.store.database.prepare('DELETE FROM knowledge_search WHERE source_id = ?').run(`wiki:${slug}`)
       this.store.database.prepare('INSERT INTO knowledge_search (source_id, title, content) VALUES (?, ?, ?)').run(
-        `wiki:${safeSlug}`,
-        `Wiki: ${safeSlug}`,
+        `wiki:${slug}`,
+        `Wiki: ${slug}`,
         content
       )
     })()
@@ -319,6 +336,18 @@ function toKnowledgeSource(row: KnowledgeSourceRow): KnowledgeSource {
 
 function safeFilename(filename: string): string {
   return filename.split(/[\\/]/).at(-1)?.replace(/[^A-Za-z0-9._-]/g, '-') || 'source.md'
+}
+
+function wikiSlug(slug: string): string {
+  const safeSlug = slug.trim().toLowerCase()
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(safeSlug)) {
+    throw new WorkstackError('VALIDATION_ERROR', 'Wiki article names may contain lowercase letters, numbers, and hyphens only.')
+  }
+  return safeSlug
+}
+
+function isGeneratedWikiSlug(slug: string): boolean {
+  return slug.startsWith(GENERATED_WIKI_SLUG_PREFIX)
 }
 
 function excerptFor(content: string, query: string): string {

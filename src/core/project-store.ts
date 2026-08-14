@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { systemClock, type Clock } from './clock'
 import { WorkstackError } from './errors'
 import { migrate } from './migrations'
+import { DEFAULT_COPILOT_LAUNCH_PROMPT, LEGACY_DEFAULT_COPILOT_LAUNCH_PROMPT } from './types'
 import type {
   InitializeProjectInput,
   ProjectMetadata,
@@ -19,7 +20,8 @@ const projectSettingsSchema = z.object({
   defaultLeaseSeconds: z.number().int().min(60),
   heartbeatSeconds: z.number().int().min(30),
   autoReleaseExpiredClaims: z.boolean(),
-  autoUpdateKnowledgeOnCompletion: z.boolean()
+  autoUpdateKnowledgeOnCompletion: z.boolean(),
+  copilotLaunchPrompt: z.string().trim().min(1).max(20_000)
 })
 
 const projectSchema = z.object({
@@ -32,6 +34,7 @@ const projectSchema = z.object({
   heartbeatSeconds: z.number().int().min(30).default(300),
   autoReleaseExpiredClaims: z.boolean().default(true),
   autoUpdateKnowledgeOnCompletion: z.boolean().default(true),
+  copilotLaunchPrompt: z.string().trim().min(1).max(20_000).default(DEFAULT_COPILOT_LAUNCH_PROMPT),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime()
 })
@@ -69,7 +72,7 @@ export class ProjectStore {
     const projectFileExists = await exists(paths.projectPath)
 
     if (projectFileExists) {
-      return ProjectStore.open(input.rootPath)
+      return ProjectStore.openOrRepairInitializedProject(paths, input.rootPath)
     }
 
     const now = clock.now().toISOString()
@@ -92,17 +95,26 @@ export class ProjectStore {
         `INSERT INTO projects (id, name, description, root_path, settings_json, created_at, updated_at)
          VALUES (@id, @name, @description, @rootPath, @settingsJson, @createdAt, @updatedAt)`
       )
-      .run({
-        id: metadata.id,
-        name: metadata.name,
-        description: metadata.description,
-        rootPath: metadata.rootPath,
-        settingsJson: JSON.stringify(metadata.settings),
-        createdAt: metadata.createdAt,
-        updatedAt: metadata.updatedAt
-      })
+      .run(projectRecordValues(metadata))
 
     return new ProjectStore(paths, metadata, database)
+  }
+
+  private static async openOrRepairInitializedProject(paths: WorkstackPaths, rootPath: string): Promise<ProjectStore> {
+    const metadata = await readProjectMetadata(paths.projectPath)
+    const database = openDatabase(paths.databasePath)
+    const persistedProject = database.prepare('SELECT id FROM projects WHERE id = ?').get(metadata.id)
+
+    if (!persistedProject) {
+      database
+        .prepare(
+          `INSERT INTO projects (id, name, description, root_path, settings_json, created_at, updated_at)
+           VALUES (@id, @name, @description, @rootPath, @settingsJson, @createdAt, @updatedAt)`
+        )
+        .run(projectRecordValues(metadata))
+    }
+
+    return new ProjectStore(projectPaths(rootPath), metadata, database)
   }
 
   static async open(rootPath: string): Promise<ProjectStore> {
@@ -191,13 +203,34 @@ export function projectPaths(rootPath: string): WorkstackPaths {
   }
 }
 
+function projectRecordValues(metadata: ProjectMetadata): {
+  id: string
+  name: string
+  description: string
+  rootPath: string
+  settingsJson: string
+  createdAt: string
+  updatedAt: string
+} {
+  return {
+    id: metadata.id,
+    name: metadata.name,
+    description: metadata.description,
+    rootPath: metadata.rootPath,
+    settingsJson: JSON.stringify(metadata.settings),
+    createdAt: metadata.createdAt,
+    updatedAt: metadata.updatedAt
+  }
+}
+
 function defaultSettings(workItemPrefix: string): ProjectSettings {
   return {
     workItemPrefix,
     defaultLeaseSeconds: 1800,
     heartbeatSeconds: 300,
     autoReleaseExpiredClaims: true,
-    autoUpdateKnowledgeOnCompletion: true
+    autoUpdateKnowledgeOnCompletion: true,
+    copilotLaunchPrompt: DEFAULT_COPILOT_LAUNCH_PROMPT
   }
 }
 
@@ -251,7 +284,10 @@ async function readProjectMetadata(projectPath: string): Promise<ProjectMetadata
       defaultLeaseSeconds: parsed.data.defaultLeaseSeconds,
       heartbeatSeconds: parsed.data.heartbeatSeconds,
       autoReleaseExpiredClaims: parsed.data.autoReleaseExpiredClaims,
-      autoUpdateKnowledgeOnCompletion: parsed.data.autoUpdateKnowledgeOnCompletion
+      autoUpdateKnowledgeOnCompletion: parsed.data.autoUpdateKnowledgeOnCompletion,
+      copilotLaunchPrompt: parsed.data.copilotLaunchPrompt === LEGACY_DEFAULT_COPILOT_LAUNCH_PROMPT
+        ? DEFAULT_COPILOT_LAUNCH_PROMPT
+        : parsed.data.copilotLaunchPrompt
     },
     createdAt: parsed.data.createdAt,
     updatedAt: parsed.data.updatedAt
@@ -270,6 +306,7 @@ function serializeProjectMetadata(metadata: ProjectMetadata): string {
       heartbeatSeconds: metadata.settings.heartbeatSeconds,
       autoReleaseExpiredClaims: metadata.settings.autoReleaseExpiredClaims,
       autoUpdateKnowledgeOnCompletion: metadata.settings.autoUpdateKnowledgeOnCompletion,
+      copilotLaunchPrompt: metadata.settings.copilotLaunchPrompt,
       createdAt: metadata.createdAt,
       updatedAt: metadata.updatedAt
     },

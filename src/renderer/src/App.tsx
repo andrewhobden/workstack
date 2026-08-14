@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState, type ClipboardEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 import { getDesktopApi } from './api'
-import type { DesktopApi } from '../../shared/desktop-api'
+import type { DesktopApi, ProjectPullRequest } from '../../shared/desktop-api'
 import type {
   Attachment,
   CompletionRecord,
@@ -9,18 +9,28 @@ import type {
   ProjectSummary,
   UpdateWorkItemInput,
   WorkItem,
-  WorkClaim
+  WorkClaim,
+  KnowledgeChatSession,
+  KnowledgeChatMessage,
+  KnowledgeChatPendingAction,
+  KnowledgeChatToolCall,
+  WikiAutomationJobReport
 } from '../../core/types'
+import { DEFAULT_COPILOT_LAUNCH_PROMPT } from '../../core/types'
 import type { PlanningContext, PlanningProposal } from '../../core/types'
 import type { KnowledgeSource } from '../../core/knowledge'
 import type { KnowledgeRetrievalResult, ProjectKnowledgeRetrieval } from '../../core/knowledge'
 
-type ProjectView = 'projects' | 'overview' | 'backlog' | 'in-progress' | 'completed' | 'knowledge' | 'activity' | 'settings'
+type ProjectView = 'projects' | 'overview' | 'agent' | 'backlog' | 'in-progress' | 'prs' | 'completed' | 'knowledge' | 'activity' | 'settings'
+
+const WIKI_AUTOMATION_POLL_INTERVAL_MS = 2_000
 
 const navigation: Array<{ id: Exclude<ProjectView, 'projects'>; label: string }> = [
   { id: 'overview', label: 'Overview' },
+  { id: 'agent', label: 'Agent' },
   { id: 'backlog', label: 'Backlog' },
   { id: 'in-progress', label: 'In Progress' },
+  { id: 'prs', label: 'PRs' },
   { id: 'completed', label: 'Completed' },
   { id: 'knowledge', label: 'Knowledge' },
   { id: 'activity', label: 'Activity' },
@@ -85,7 +95,9 @@ export function App(): JSX.Element {
           '2': 'backlog',
           '3': 'in-progress',
           '4': 'completed',
-          '5': 'knowledge'
+          '5': 'knowledge',
+          '6': 'agent',
+          '7': 'prs'
         }
         const nextView = shortcutViews[event.key]
         if (nextView) {
@@ -241,13 +253,16 @@ export function App(): JSX.Element {
     }
   }
 
-  const createWorkItem = async (input: CreateWorkItemInput): Promise<void> => {
+  const createWorkItem = async (input: CreateWorkItemInput, screenshots: File[]): Promise<void> => {
     if (!selectedProjectId) {
       return
     }
 
     try {
-      await api.workItems.create(selectedProjectId, input)
+      const workItem = await api.workItems.create(selectedProjectId, input)
+      for (const screenshot of screenshots) {
+        await api.attachments.pasteImage(selectedProjectId, workItem.id, await toAttachmentPayload(screenshot))
+      }
       setShowWorkItemSheet(false)
       await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId)])
     } catch (reason) {
@@ -302,7 +317,6 @@ export function App(): JSX.Element {
       await refreshProjects()
     } catch (reason) {
       setError(messageFor(reason))
-      throw reason
     }
   }
 
@@ -320,6 +334,33 @@ export function App(): JSX.Element {
     }
   }
 
+  const launchCopilot = async (workItem: WorkItem, prompt: string): Promise<boolean> => {
+    if (!selectedProjectId) {
+      return false
+    }
+    if (typeof api.workItems.launchCopilot !== 'function') {
+      setError('Restart Workstack to enable launching Copilot from backlog items.')
+      return false
+    }
+
+    try {
+      const result = await api.workItems.launchCopilot(selectedProjectId, workItem.id, prompt)
+      await Promise.all([
+        refreshProjects(),
+        refreshWorkItems(selectedProjectId),
+        refreshClaims(selectedProjectId),
+        api.projects.get(selectedProjectId).then(setSelectedProject)
+      ])
+      setNotice(result.started
+        ? `Opened Copilot for ${workItem.displayId} in Terminal.`
+        : `Found an existing pull request for ${workItem.displayId}; it was moved out of the backlog.`)
+      return true
+    } catch (reason) {
+      setError(messageFor(reason))
+      return false
+    }
+  }
+
   const forceReleaseWorkItem = async (workItemId: string, reason: string): Promise<void> => {
     if (!selectedProjectId) {
       return
@@ -328,6 +369,44 @@ export function App(): JSX.Element {
       await api.claims.forceRelease(selectedProjectId, workItemId, { reason })
       const updated = await api.workItems.get(selectedProjectId, workItemId)
       setSelectedWorkItem(updated)
+      await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId), refreshClaims(selectedProjectId)])
+    } catch (reason) {
+      setError(messageFor(reason))
+      throw reason
+    }
+  }
+
+  const restackWorkItem = async (workItem: WorkItem): Promise<void> => {
+    if (!selectedProjectId) {
+      return
+    }
+    if (typeof api.workItems.restack !== 'function') {
+      setError('Restart Workstack to enable restacking Copilot sessions.')
+      return
+    }
+
+    try {
+      await api.workItems.restack(selectedProjectId, workItem.id)
+      setNotice(`${workItem.displayId} was returned to the backlog.`)
+      await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId), refreshClaims(selectedProjectId)])
+    } catch (reason) {
+      setError(messageFor(reason))
+      throw reason
+    }
+  }
+
+  const restartWorkItem = async (workItem: WorkItem): Promise<void> => {
+    if (!selectedProjectId) {
+      return
+    }
+    if (typeof api.workItems.restart !== 'function') {
+      setError('Restart Workstack to enable restarting Copilot sessions.')
+      return
+    }
+
+    try {
+      await api.workItems.restart(selectedProjectId, workItem.id)
+      setNotice(`Restarted Copilot for ${workItem.displayId} in Terminal.`)
       await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId), refreshClaims(selectedProjectId)])
     } catch (reason) {
       setError(messageFor(reason))
@@ -441,6 +520,9 @@ export function App(): JSX.Element {
             onAddKnowledgeSource={addKnowledgeSource}
             knowledgeSourceRequest={knowledgeSourceRequest}
             onKnowledgeSourceRequestHandled={() => setKnowledgeSourceRequest(0)}
+            onLaunchCopilot={launchCopilot}
+            onRestartWorkItem={restartWorkItem}
+            onRestackWorkItem={restackWorkItem}
             onUpdateProject={updateProject}
             view={view}
             workItems={workItems}
@@ -701,6 +783,9 @@ function ProjectViewContent({
   onDeleteProject,
   onAddKnowledgeSource,
   onKnowledgeSourceRequestHandled,
+  onLaunchCopilot,
+  onRestartWorkItem,
+  onRestackWorkItem,
   knowledgeSourceRequest,
   onOpenFolder,
   onOpenWorkItem,
@@ -718,6 +803,9 @@ function ProjectViewContent({
   onDeleteProject(): void
   onAddKnowledgeSource(input: { displayName: string; filename: string; content: string }): Promise<void>
   onKnowledgeSourceRequestHandled(): void
+  onLaunchCopilot(workItem: WorkItem, prompt: string): Promise<boolean>
+  onRestartWorkItem(workItem: WorkItem): Promise<void>
+  onRestackWorkItem(workItem: WorkItem): Promise<void>
   knowledgeSourceRequest: number
   onOpenFolder(): void
   onOpenWorkItem(workItem: WorkItem): void
@@ -728,14 +816,20 @@ function ProjectViewContent({
   if (view === 'overview') {
     return <Overview claims={claims} project={activeProject} workItems={workItems} onOpenWorkItem={onOpenWorkItem} />
   }
+  if (view === 'agent') {
+    return <AgentPage api={getDesktopApi()} projectId={activeProject.id} />
+  }
   if (view === 'backlog') {
-    return <Backlog api={getDesktopApi()} projectId={activeProject.id} workItems={workItems} onCreateWorkItem={onCreateWorkItem} onPlanWork={onPlanWork} onOpenWorkItem={onOpenWorkItem} />
+    return <Backlog api={getDesktopApi()} initialCopilotPrompt={metadata?.settings.copilotLaunchPrompt ?? DEFAULT_COPILOT_LAUNCH_PROMPT} projectId={activeProject.id} workItems={workItems} onCreateWorkItem={onCreateWorkItem} onLaunchCopilot={onLaunchCopilot} onPlanWork={onPlanWork} onOpenWorkItem={onOpenWorkItem} />
   }
   if (view === 'completed') {
     return <WorkItemHistory api={getDesktopApi()} projectId={activeProject.id} title="Completed" description="Nothing has been completed yet. Completed work becomes part of Workstack's long-term project memory." items={workItems.filter((item) => item.status === 'completed')} onOpenWorkItem={onOpenWorkItem} />
   }
   if (view === 'in-progress') {
-    return <ActiveWorkPage api={getDesktopApi()} projectId={activeProject.id} claims={claims} items={workItems} onOpenWorkItem={onOpenWorkItem} />
+    return <ActiveWorkPage api={getDesktopApi()} projectId={activeProject.id} claims={claims} items={workItems} onOpenWorkItem={onOpenWorkItem} onRestart={onRestartWorkItem} onRestack={onRestackWorkItem} />
+  }
+  if (view === 'prs') {
+    return <PullRequestsPage api={getDesktopApi()} projectId={activeProject.id} />
   }
   if (view === 'knowledge') {
     return <KnowledgePage api={getDesktopApi()} projectId={activeProject.id} sources={knowledgeSources} workItems={workItems} onOpenWorkItem={onOpenWorkItem} onAddSource={onAddKnowledgeSource} sourceSheetRequest={knowledgeSourceRequest} onSourceSheetRequestHandled={onKnowledgeSourceRequestHandled} />
@@ -855,14 +949,18 @@ function CompactItems({ items, onOpen }: { items: WorkItem[]; onOpen(workItem: W
 
 function Backlog({
   api,
+  initialCopilotPrompt,
   onCreateWorkItem,
+  onLaunchCopilot,
   onPlanWork,
   onOpenWorkItem,
   projectId,
   workItems
 }: {
   api: DesktopApi
+  initialCopilotPrompt: string
   onCreateWorkItem(): void
+  onLaunchCopilot(workItem: WorkItem, prompt: string): Promise<boolean>
   onPlanWork(): void
   onOpenWorkItem(workItem: WorkItem): void
   projectId: string
@@ -876,7 +974,19 @@ function Backlog({
   const [source, setSource] = useState<'all' | 'manual' | 'ai'>('all')
   const [sort, setSort] = useState<'created-desc' | 'created-asc' | 'priority' | 'title'>('created-desc')
   const [attachmentCounts, setAttachmentCounts] = useState<Record<string, number>>({})
+  const [copilotWorkItem, setCopilotWorkItem] = useState<WorkItem>()
+  const [copilotPrompt, setCopilotPrompt] = useState(initialCopilotPrompt)
+  const [launchingCopilot, setLaunchingCopilot] = useState(false)
+  const [launchedCopilotWorkItemIds, setLaunchedCopilotWorkItemIds] = useState<Set<string>>(new Set())
   const backlogItems = useMemo(() => workItems.filter((item) => item.status === 'backlog'), [workItems])
+
+  useEffect(() => {
+    const backlogIds = new Set(backlogItems.map((item) => item.id))
+    setLaunchedCopilotWorkItemIds((current) => {
+      const next = new Set([...current].filter((itemId) => backlogIds.has(itemId)))
+      return next.size === current.size ? current : next
+    })
+  }, [backlogItems])
 
   useEffect(() => {
     let current = true
@@ -960,6 +1070,7 @@ function Backlog({
             <span role="columnheader">Priority</span>
             <span role="columnheader">Created</span>
             <span role="columnheader">Files</span>
+            <span role="columnheader">Start</span>
           </div>
           {filteredItems.map((item) => (
             <div className="work-table-row" key={item.id} role="row">
@@ -969,6 +1080,10 @@ function Backlog({
               <span role="cell"><PriorityBadge priority={item.priority} /></span>
               <span role="cell">{formatDate(item.createdAt)}</span>
               <span aria-label={attachmentCounts[item.id] ? `${attachmentCounts[item.id]} attachments` : 'No attachments'} role="cell">{attachmentCounts[item.id] ? `⌁ ${attachmentCounts[item.id]}` : '—'}</span>
+              <span role="cell"><button aria-label={`Start Copilot for ${item.displayId}: ${item.title}`} className="play-button" disabled={launchedCopilotWorkItemIds.has(item.id)} type="button" onClick={() => {
+                setCopilotPrompt(initialCopilotPrompt)
+                setCopilotWorkItem(item)
+              }}>▶</button></span>
             </div>
           ))}
         </div>
@@ -982,7 +1097,59 @@ function Backlog({
           </div>
         </div>
       )}
+      {copilotWorkItem ? (
+        <CopilotLaunchSheet
+          busy={launchingCopilot}
+          prompt={copilotPrompt}
+          workItem={copilotWorkItem}
+          onCancel={() => setCopilotWorkItem(undefined)}
+          onPromptChange={setCopilotPrompt}
+          onSubmit={async () => {
+            setLaunchingCopilot(true)
+            try {
+              const launched = await onLaunchCopilot(copilotWorkItem, copilotPrompt)
+              if (launched) {
+                setLaunchedCopilotWorkItemIds((current) => new Set(current).add(copilotWorkItem.id))
+                setCopilotWorkItem(undefined)
+              }
+              return launched
+            } finally {
+              setLaunchingCopilot(false)
+            }
+          }}
+        />
+      ) : null}
     </section>
+  )
+}
+
+function CopilotLaunchSheet({
+  busy,
+  onCancel,
+  onPromptChange,
+  onSubmit,
+  prompt,
+  workItem
+}: {
+  busy: boolean
+  onCancel(): void
+  onPromptChange(value: string): void
+  onSubmit(): Promise<boolean>
+  prompt: string
+  workItem: WorkItem
+}): JSX.Element {
+  return (
+    <Modal title={`Start Copilot for ${workItem.displayId}`} onCancel={onCancel}>
+      <form className="copilot-launch-form" onSubmit={(event) => { event.preventDefault(); void onSubmit() }}>
+        <p>Copilot will open in a new Terminal session for <strong>{workItem.displayId} - {workItem.title}</strong>. Workstack MCP will be available for this session.</p>
+        <label className="field-label">Initial prompt<textarea aria-label="Initial Copilot prompt" required value={prompt} onChange={(event) => onPromptChange(event.target.value)} /></label>
+        <p className="muted">Changes become this project&apos;s default prompt when you start Copilot.</p>
+        <div className="modal-actions">
+          <button className="secondary-button" disabled={busy} type="button" onClick={onCancel}>Cancel</button>
+          <button className="primary-button" disabled={busy || !prompt.trim()} type="submit">{busy ? 'Opening...' : 'Start Copilot'}</button>
+        </div>
+      </form>
+    </Modal>
   )
 }
 
@@ -1061,24 +1228,163 @@ function ActiveWorkPage({
   claims,
   items,
   onOpenWorkItem,
+  onRestart,
+  onRestack,
   projectId
 }: {
   api: DesktopApi
   claims: WorkClaim[]
   items: WorkItem[]
   onOpenWorkItem(workItem: WorkItem): void
+  onRestart(workItem: WorkItem): Promise<void>
+  onRestack(workItem: WorkItem): Promise<void>
   projectId: string
 }): JSX.Element {
   const [agentDetail, setAgentDetail] = useState<{ claim: WorkClaim; item: WorkItem }>()
+  const [restartingWorkItemId, setRestartingWorkItemId] = useState<string>()
+  const [restackingWorkItemId, setRestackingWorkItemId] = useState<string>()
   return (
     <section className="page-content" aria-labelledby="in-progress-heading">
       <p className="eyebrow">AGENT COORDINATION</p>
       <h1 id="in-progress-heading">In Progress</h1>
       <p className="page-intro">Current coding-agent leases are authoritative. Review the owner and health before intervening.</p>
-      <ActiveWorkList claims={claims} items={items} onOpenWorkItem={onOpenWorkItem} onViewAgentDetails={(claim, item) => setAgentDetail({ claim, item })} />
+      <ActiveWorkList
+        claims={claims}
+        items={items}
+        onOpenWorkItem={onOpenWorkItem}
+        onRestart={(item) => {
+          setRestartingWorkItemId(item.id)
+          void onRestart(item).catch(() => undefined).finally(() => setRestartingWorkItemId(undefined))
+        }}
+        restartingWorkItemId={restartingWorkItemId}
+        onRestack={(item) => {
+          setRestackingWorkItemId(item.id)
+          void onRestack(item).catch(() => undefined).finally(() => setRestackingWorkItemId(undefined))
+        }}
+        restackingWorkItemId={restackingWorkItemId}
+        onViewAgentDetails={(claim, item) => setAgentDetail({ claim, item })}
+      />
       {agentDetail ? <AgentDetailSheet api={api} claim={agentDetail.claim} item={agentDetail.item} projectId={projectId} onCancel={() => setAgentDetail(undefined)} /> : null}
     </section>
   )
+}
+
+function PullRequestsPage({ api, projectId }: { api: DesktopApi; projectId: string }): JSX.Element {
+  const [pullRequests, setPullRequests] = useState<ProjectPullRequest[]>([])
+  const [selectedUrls, setSelectedUrls] = useState<Set<string>>(new Set())
+  const [initialLoading, setInitialLoading] = useState(true)
+  const [merging, setMerging] = useState(false)
+  const [error, setError] = useState<string>()
+  const [mergeNotice, setMergeNotice] = useState<string>()
+  const refreshInProgress = useRef(false)
+  const refresh = useCallback(async (): Promise<void> => {
+    if (refreshInProgress.current) return
+
+    refreshInProgress.current = true
+    setError(undefined)
+    if (typeof api.pullRequests?.list !== 'function') {
+      setError('Restart Workstack to enable the PR queue.')
+      setInitialLoading(false)
+      refreshInProgress.current = false
+      return
+    }
+    try {
+      const nextPullRequests = await api.pullRequests.list(projectId)
+      setPullRequests((current) => pullRequestListsEqual(current, nextPullRequests) ? current : nextPullRequests)
+    } catch (reason) {
+      setError(messageFor(reason))
+    } finally {
+      setInitialLoading(false)
+      refreshInProgress.current = false
+    }
+  }, [api, projectId])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+  useEffect(() => {
+    const timer = window.setInterval(() => { void refresh() }, 10_000)
+    return () => window.clearInterval(timer)
+  }, [refresh])
+  const mergeSelected = async (): Promise<void> => {
+    if (typeof api.pullRequests?.merge !== 'function') {
+      setError('Restart Workstack to enable PR merge sessions.')
+      return
+    }
+    setMerging(true)
+    setError(undefined)
+    setMergeNotice(undefined)
+    try {
+      await api.pullRequests.merge(projectId, [...selectedUrls])
+      setSelectedUrls(new Set())
+      setMergeNotice('Copilot merge session started in Terminal.')
+    } catch (reason) {
+      setError(messageFor(reason))
+    } finally {
+      setMerging(false)
+    }
+  }
+
+  return (
+    <section className="page-content pull-requests-page" aria-labelledby="prs-heading">
+      <div className="page-toolbar">
+        <div><p className="eyebrow">DELIVERY QUEUE</p><h1 id="prs-heading">PRs</h1></div>
+        <div className="toolbar-actions">
+          {selectedUrls.size ? <button className="primary-button" disabled={merging} type="button" onClick={() => void mergeSelected()}>{merging ? 'Starting merge...' : `Merge ${selectedUrls.size} PR${selectedUrls.size === 1 ? '' : 's'}`}</button> : null}
+          <button className="secondary-button" disabled={initialLoading} type="button" onClick={() => void refresh()}>Refresh</button>
+        </div>
+      </div>
+      <p className="page-intro">Open pull requests waiting to merge. Work items with a pull request move to Completed only after GitHub reports the merge.</p>
+      {error ? <p role="alert">{error}</p> : null}
+      {mergeNotice ? <p role="status">{mergeNotice}</p> : null}
+      {initialLoading ? <p role="status">Loading pull requests...</p> : null}
+      {!initialLoading && (pullRequests.length ? (
+        <div className="pull-request-list">
+          {pullRequests.map((pullRequest) => (
+            <div className="pull-request-row" key={pullRequest.url}>
+              <input aria-label={`Select PR #${pullRequest.number}`} checked={selectedUrls.has(pullRequest.url)} type="checkbox" onChange={() => {
+                setMergeNotice(undefined)
+                setSelectedUrls((current) => {
+                  const next = new Set(current)
+                  if (next.has(pullRequest.url)) next.delete(pullRequest.url)
+                  else next.add(pullRequest.url)
+                  return next
+                })
+              }} />
+              <button aria-label={`Open PR #${pullRequest.number} in browser`} className="pull-request-open" type="button" onClick={() => {
+                if (typeof api.pullRequests?.open !== 'function') {
+                  setError('Restart Workstack to open pull requests in your browser.')
+                  return
+                }
+                void api.pullRequests.open(pullRequest.url)
+              }}>
+              <span className="pull-request-number">#{pullRequest.number}</span>
+              <span><strong>{pullRequest.title}</strong><small>{pullRequest.headRefName}{pullRequest.authorLogin ? ` · ${pullRequest.authorLogin}` : ''}</small></span>
+              <span>{pullRequest.isDraft ? 'Draft' : 'Ready to merge'}</span>
+              {pullRequest.workItem ? <span>{pullRequest.workItem.displayId} · {pullRequest.workItem.title}</span> : <span>Not linked to a Workstack item</span>}
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : !error ? <div className="inline-empty"><p>No pull requests are waiting to merge.</p></div> : null)}
+    </section>
+  )
+}
+
+function pullRequestListsEqual(left: ProjectPullRequest[], right: ProjectPullRequest[]): boolean {
+  return left.length === right.length && left.every((pullRequest, index) => {
+    const candidate = right[index]
+    return candidate
+      && pullRequest.number === candidate.number
+      && pullRequest.title === candidate.title
+      && pullRequest.url === candidate.url
+      && pullRequest.headRefName === candidate.headRefName
+      && pullRequest.isDraft === candidate.isDraft
+      && pullRequest.authorLogin === candidate.authorLogin
+      && pullRequest.updatedAt === candidate.updatedAt
+      && pullRequest.workItem?.displayId === candidate.workItem?.displayId
+      && pullRequest.workItem?.title === candidate.workItem?.title
+  })
 }
 
 function ActiveWorkList({
@@ -1086,12 +1392,20 @@ function ActiveWorkList({
   compact = false,
   items,
   onOpenWorkItem,
+  onRestart,
+  restartingWorkItemId,
+  onRestack,
+  restackingWorkItemId,
   onViewAgentDetails
 }: {
   claims: WorkClaim[]
   compact?: boolean
   items: WorkItem[]
   onOpenWorkItem(workItem: WorkItem): void
+  onRestart?(workItem: WorkItem): void
+  restartingWorkItemId?: string
+  onRestack?(workItem: WorkItem): void
+  restackingWorkItemId?: string
   onViewAgentDetails?(claim: WorkClaim, item: WorkItem): void
 }): JSX.Element {
   const activeItems = claims.flatMap((claim) => {
@@ -1116,7 +1430,13 @@ function ActiveWorkList({
             {claim.sessionId ? <span className="active-work-session">Session {claim.sessionId}</span> : null}
             {claim.blockedReason ? <span className="active-work-reason">{claim.blockedReason}</span> : null}
           </button>
-          {onViewAgentDetails ? <button aria-label={`View details for ${claim.agentDisplayName ?? claim.agentId}`} className="agent-details-button" type="button" onClick={() => onViewAgentDetails(claim, item)}>Agent details</button> : null}
+          {onViewAgentDetails || onRestart || onRestack ? (
+            <div className="active-work-actions">
+              {onViewAgentDetails ? <button aria-label={`View details for ${claim.agentDisplayName ?? claim.agentId}`} className="agent-details-button" type="button" onClick={() => onViewAgentDetails(claim, item)}>Agent details</button> : null}
+              {onRestart ? <button aria-label={`Restart ${item.displayId}`} className="secondary-button" disabled={restartingWorkItemId === item.id} type="button" onClick={() => onRestart(item)}>{restartingWorkItemId === item.id ? 'Restarting...' : 'Restart'}</button> : null}
+              {onRestack ? <button aria-label={`Restack ${item.displayId}`} className="danger-button" disabled={restackingWorkItemId === item.id} type="button" onClick={() => onRestack(item)}>{restackingWorkItemId === item.id ? 'Restacking...' : 'Restack'}</button> : null}
+            </div>
+          ) : null}
         </li>
       ))}
     </ul>
@@ -1150,11 +1470,48 @@ function KnowledgePage({
   const [displaySources, setDisplaySources] = useState(sources)
   const [articles, setArticles] = useState<import('../../core/knowledge').WikiArticle[]>([])
   const [editingArticle, setEditingArticle] = useState<import('../../core/knowledge').WikiArticle>()
+  const [automationMessage, setAutomationMessage] = useState<string>()
+  const [automationError, setAutomationError] = useState<string>()
+  const [wikiReports, setWikiReports] = useState<WikiAutomationJobReport[]>([])
+  const [wikiAutomationBusy, setWikiAutomationBusy] = useState<string>()
+  const wikiAutomationRescanInFlight = useRef(false)
+  const wikiAutomationRefreshInFlight = useRef(false)
+  const knowledgeAutomation = api.knowledge as Partial<Pick<DesktopApi['knowledge'], 'processNext' | 'retryFailed'>>
+  const wikiAutomation = api.wikiAutomation as Partial<DesktopApi['wikiAutomation']>
+  const supportsKnowledgeAutomation = typeof knowledgeAutomation.processNext === 'function'
+    && typeof knowledgeAutomation.retryFailed === 'function'
+  const pendingSourceCount = displaySources.filter((source) => source.status === 'pending').length
+  const failedSourceCount = displaySources.filter((source) => source.status === 'failed').length
+  const hasActiveCodebaseRescan = wikiReports.some((report) =>
+    report.job.requestedBy === 'manual-full-codebase-rescan'
+      && (report.job.status === 'pending' || report.job.status === 'running')
+  )
+  const hasActiveWikiAutomationJob = wikiReports.some((report) =>
+    report.job.status === 'pending' || report.job.status === 'running'
+  )
 
   useEffect(() => {
     setDisplaySources(sources)
   }, [sources])
   useEffect(() => { void api.knowledge.listWiki(projectId).then(setArticles) }, [api, projectId])
+  const refreshWikiAutomation = useCallback(async (): Promise<void> => {
+    if (!wikiAutomation.listReports || wikiAutomationRefreshInFlight.current) return
+    wikiAutomationRefreshInFlight.current = true
+    try {
+      const reports = await wikiAutomation.listReports(projectId)
+      setWikiReports((current) => wikiAutomationReportsEqual(current, reports) ? current : reports)
+    } catch (reason) {
+      setAutomationError(messageFor(reason))
+    } finally {
+      wikiAutomationRefreshInFlight.current = false
+    }
+  }, [projectId, wikiAutomation])
+  useEffect(() => { void refreshWikiAutomation() }, [refreshWikiAutomation])
+  useEffect(() => {
+    if (!hasActiveWikiAutomationJob) return
+    const timer = window.setInterval(() => { void refreshWikiAutomation() }, WIKI_AUTOMATION_POLL_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [hasActiveWikiAutomationJob, refreshWikiAutomation])
   useEffect(() => {
     if (sourceSheetRequest) {
       setShowSourceSheet(true)
@@ -1172,14 +1529,60 @@ function KnowledgePage({
   }
 
   const refreshSources = async (): Promise<void> => {
-    await api.knowledge.processNext(projectId)
-    setDisplaySources(await api.knowledge.listSources(projectId))
-    setProcessing(false)
+    if (!knowledgeAutomation.processNext) return
+    setAutomationError(undefined)
+    try {
+      const source = await knowledgeAutomation.processNext(projectId)
+      setDisplaySources(await api.knowledge.listSources(projectId))
+      setAutomationMessage(source ? `Processed ${source.displayName}.` : 'No pending sources to process.')
+    } catch (reason) {
+      setAutomationError(messageFor(reason))
+    } finally {
+      setProcessing(false)
+    }
   }
   const retrySources = async (): Promise<void> => {
-    await api.knowledge.retryFailed(projectId)
-    setDisplaySources(await api.knowledge.listSources(projectId))
-    setProcessing(false)
+    if (!knowledgeAutomation.retryFailed) return
+    setAutomationError(undefined)
+    try {
+      const retried = await knowledgeAutomation.retryFailed(projectId)
+      setDisplaySources(await api.knowledge.listSources(projectId))
+      setAutomationMessage(retried ? `Queued ${retried} failed source${retried === 1 ? '' : 's'} for retry.` : 'No failed sources to retry.')
+    } catch (reason) {
+      setAutomationError(messageFor(reason))
+    } finally {
+      setProcessing(false)
+    }
+  }
+  const retryWikiJob = async (jobId: string): Promise<void> => {
+    if (!wikiAutomation.retry) return
+    setWikiAutomationBusy(jobId)
+    setAutomationError(undefined)
+    try {
+      await wikiAutomation.retry(projectId, jobId)
+      await refreshWikiAutomation()
+      setAutomationMessage('Wiki automation job queued for retry.')
+    } catch (reason) {
+      setAutomationError(messageFor(reason))
+    } finally {
+      setWikiAutomationBusy(undefined)
+    }
+  }
+  const rescanCodebase = async (): Promise<void> => {
+    if (!wikiAutomation.rescan || wikiAutomationRescanInFlight.current) return
+    wikiAutomationRescanInFlight.current = true
+    setWikiAutomationBusy('rescan')
+    setAutomationError(undefined)
+    try {
+      await wikiAutomation.rescan(projectId)
+      await refreshWikiAutomation()
+      setAutomationMessage('Codebase rescan queued.')
+    } catch (reason) {
+      setAutomationError(messageFor(reason))
+    } finally {
+      wikiAutomationRescanInFlight.current = false
+      setWikiAutomationBusy(undefined)
+    }
   }
 
   return (
@@ -1188,12 +1591,49 @@ function KnowledgePage({
         <div><p className="eyebrow">PROJECT MEMORY</p><h1 id="knowledge-heading">Knowledge</h1></div>
         <div className="toolbar-actions">
           <button className="secondary-button" type="button" onClick={() => setEditingArticle({ slug: '', content: '' })}>New wiki article</button>
-          <button className="secondary-button" disabled={processing} type="button" onClick={() => { setProcessing(true); void refreshSources() }}>Process pending</button>
-          <button className="secondary-button" disabled={processing} type="button" onClick={() => { setProcessing(true); void retrySources() }}>Retry failed</button>
           <button className="primary-button" type="button" onClick={() => setShowSourceSheet(true)}>+ Add Source</button>
         </div>
       </div>
       <p className="page-intro">Keep source evidence durable and searchable. Manual sources are preserved separately from future maintained wiki articles.</p>
+      {supportsKnowledgeAutomation ? (
+        <section className="knowledge-automation" aria-labelledby="knowledge-automation-heading">
+          <div>
+            <h2 id="knowledge-automation-heading">Knowledge automation</h2>
+            <p>{pendingSourceCount ? `${pendingSourceCount} source${pendingSourceCount === 1 ? '' : 's'} pending.` : 'No sources pending.'} {failedSourceCount ? `${failedSourceCount} failed and need${failedSourceCount === 1 ? 's' : ''} attention.` : 'No failed sources.'}</p>
+          </div>
+          <div className="knowledge-automation-actions">
+            <button className="secondary-button" disabled={processing || !pendingSourceCount} type="button" onClick={() => { setProcessing(true); void refreshSources() }}>Process pending</button>
+            <button className="secondary-button" disabled={processing || !failedSourceCount} type="button" onClick={() => { setProcessing(true); void retrySources() }}>Retry failed</button>
+          </div>
+          {automationMessage ? <p className="knowledge-automation-message" role="status">{automationMessage}</p> : null}
+          {automationError ? <p className="inline-error" role="alert">{automationError}</p> : null}
+        </section>
+      ) : null}
+      {wikiAutomation.listReports ? (
+        <section className="knowledge-automation wiki-automation" aria-labelledby="wiki-automation-heading">
+          <div>
+            <h2 id="wiki-automation-heading">Wiki automation runs</h2>
+            <p>Generation status, merge evidence, artifacts, and automation handoffs are durable. Manual articles remain separate.</p>
+          </div>
+          {wikiAutomation.rescan ? <div className="knowledge-automation-actions"><button className="secondary-button" disabled={Boolean(wikiAutomationBusy) || hasActiveCodebaseRescan} type="button" onClick={() => void rescanCodebase()}>{wikiAutomationBusy === 'rescan' ? 'Rescanning codebase...' : 'Rescan codebase'}</button></div> : null}
+          {wikiReports.length ? <ul className="wiki-automation-reports">{wikiReports.map((report) => (
+            <li key={report.job.id}>
+              <div className="wiki-automation-job">
+                <strong>{report.job.title}</strong>
+                <span aria-atomic="true" aria-live="polite" className={`wiki-automation-status wiki-automation-status-${report.job.status}`}>
+                  {wikiAutomationStatusLabel(report.job.status)} · attempt {report.job.attemptCount}
+                </span>
+                <small>{wikiAutomationTimestamp(report.job)}</small>
+                {report.job.errorMessage ? <p className="inline-error" role="alert">Failure: {report.job.errorMessage}</p> : null}
+                {report.job.status === 'failed' && wikiAutomation.retry ? <button className="secondary-button" disabled={wikiAutomationBusy === report.job.id} type="button" onClick={() => void retryWikiJob(report.job.id)}>{wikiAutomationBusy === report.job.id ? 'Queueing retry...' : 'Retry failed run'}</button> : null}
+              </div>
+              {report.mergeEvidence ? <div className="wiki-automation-evidence"><strong>Merge evidence</strong><span>PR #{report.mergeEvidence.pullRequestNumber}: {report.mergeEvidence.pullRequestTitle}</span><small>{report.mergeEvidence.mergeCommitSha} · {report.mergeEvidence.headRefName}</small><details><summary>View merge evidence</summary><p>{report.mergeEvidence.pullRequestUrl}</p>{report.mergeEvidence.sessionSummaryMarkdown ? <pre>{report.mergeEvidence.sessionSummaryMarkdown}</pre> : null}{report.mergeEvidence.diffMarkdown ? <pre>{report.mergeEvidence.diffMarkdown}</pre> : null}</details></div> : null}
+              {report.artifacts.length ? <div className="wiki-automation-evidence"><strong>Artifacts</strong><ul>{report.artifacts.map((artifact) => <li key={artifact.id}>{artifact.kind}: {artifact.title}{artifact.relativePath ? ` · ${artifact.relativePath}` : ''}<details><summary>View artifact</summary><pre>{artifact.contentMarkdown}</pre></details></li>)}</ul></div> : null}
+              {report.handoffs.length ? <div className="wiki-automation-evidence"><strong>Automation handoffs</strong><ul>{report.handoffs.map((handoff) => <li key={handoff.id}>{handoff.target} · {handoff.status}<small>{handoff.summaryMarkdown}</small></li>)}</ul></div> : null}
+            </li>
+          ))}</ul> : <p className="muted">No wiki automation jobs yet.</p>}
+        </section>
+      ) : null}
       <label className="search-field">
         <span className="sr-only">Search knowledge</span>
         <input aria-label="Search knowledge" placeholder="Search knowledge" type="search" value={query} onChange={(event) => search(event.target.value)} />
@@ -1236,7 +1676,10 @@ function KnowledgePage({
         </section>
         <section className="knowledge-sources" aria-labelledby="wiki-heading">
           <h2 id="wiki-heading">Maintained wiki</h2>
-          {articles.length ? <ul>{articles.map((article) => <li key={article.slug}><button type="button" onClick={() => setEditingArticle(article)}>{article.slug}</button></li>)}</ul> : <p className="muted">No maintained articles yet.</p>}
+          {articles.length ? <ul>{articles.map((article) => {
+            const generated = article.slug.startsWith('generated-')
+            return <li key={article.slug}>{generated ? <span>{article.slug}</span> : <button type="button" onClick={() => setEditingArticle(article)}>{article.slug}</button>}<small>{generated ? 'Generated by automation · read-only' : 'Manual · editable'}</small></li>
+          })}</ul> : <p className="muted">No maintained articles yet.</p>}
         </section>
         </>
       )}
@@ -1245,6 +1688,315 @@ function KnowledgePage({
       {editingArticle ? <WikiArticleSheet article={editingArticle} onCancel={() => setEditingArticle(undefined)} onSave={async (article) => { const saved = await api.knowledge.saveWiki(projectId, article.slug, article.content); setArticles(await api.knowledge.listWiki(projectId)); setEditingArticle(saved) }} /> : null}
     </section>
   )
+}
+
+function AgentPage({ api, projectId }: { api: DesktopApi; projectId: string }): JSX.Element {
+  const [chatSession, setChatSession] = useState<KnowledgeChatSession>()
+  const [chatMessages, setChatMessages] = useState<KnowledgeChatMessage[]>([])
+  const [chatToolCalls, setChatToolCalls] = useState<KnowledgeChatToolCall[]>([])
+  const [chatPendingActions, setChatPendingActions] = useState<KnowledgeChatPendingAction[]>([])
+  const [chatInput, setChatInput] = useState('')
+  const [chatBusy, setChatBusy] = useState(false)
+  const [chatError, setChatError] = useState<string>()
+  const [conversationReady, setConversationReady] = useState(false)
+
+  useEffect(() => {
+    let isCurrent = true
+    async function loadChat(): Promise<void> {
+      setConversationReady(false)
+      setChatError(undefined)
+      try {
+        const sessions = await api.knowledgeChat.listSessions(projectId)
+        const session = sessions[0] ?? await api.knowledgeChat.createSession(projectId)
+        const [messages, toolCalls, pendingActions] = await Promise.all([
+          api.knowledgeChat.listMessages(projectId, session.id),
+          api.knowledgeChat.listToolCalls(projectId, session.id),
+          api.knowledgeChat.listPendingActions(projectId, session.id)
+        ])
+        if (!isCurrent) return
+        setChatSession(session)
+        setChatMessages(messages)
+        setChatToolCalls(toolCalls)
+        setChatPendingActions(pendingActions)
+      } catch (reason) {
+        if (isCurrent) setChatError(messageFor(reason))
+      } finally {
+        if (isCurrent) setConversationReady(true)
+      }
+    }
+    void loadChat()
+    return () => {
+      isCurrent = false
+    }
+  }, [api, projectId])
+
+  const applyChatTurn = (turn: { messages: KnowledgeChatMessage[]; toolCalls: KnowledgeChatToolCall[]; pendingActions: KnowledgeChatPendingAction[] }): void => {
+    setChatMessages(turn.messages)
+    setChatToolCalls(turn.toolCalls)
+    setChatPendingActions(turn.pendingActions)
+  }
+  const sendChatMessage = async (): Promise<void> => {
+    if (!chatSession || !chatInput.trim()) return
+    setChatBusy(true)
+    setChatError(undefined)
+    try {
+      applyChatTurn(await api.knowledgeChat.sendMessage(projectId, chatSession.id, chatInput))
+      setChatInput('')
+    } catch (reason) {
+      setChatError(messageFor(reason))
+    } finally {
+      setChatBusy(false)
+    }
+  }
+  const approveChatAction = async (actionId: string): Promise<void> => {
+    if (!chatSession) return
+    setChatBusy(true)
+    setChatError(undefined)
+    try {
+      applyChatTurn(await api.knowledgeChat.approvePendingAction(projectId, chatSession.id, actionId))
+    } catch (reason) {
+      setChatError(messageFor(reason))
+    } finally {
+      setChatBusy(false)
+    }
+  }
+  const rejectChatAction = async (actionId: string): Promise<void> => {
+    if (!chatSession) return
+    setChatBusy(true)
+    setChatError(undefined)
+    try {
+      applyChatTurn(await api.knowledgeChat.rejectPendingAction(projectId, chatSession.id, actionId))
+    } catch (reason) {
+      setChatError(messageFor(reason))
+    } finally {
+      setChatBusy(false)
+    }
+  }
+
+  return (
+    <section className="page-content agent-page" aria-labelledby="agent-heading">
+      <div className="page-toolbar">
+        <div><p className="eyebrow">PROJECT AGENT</p><h1 id="agent-heading">Agent</h1></div>
+      </div>
+      <KnowledgeChatPanel
+        busy={chatBusy}
+        error={chatError}
+        input={chatInput}
+        loading={!conversationReady}
+        messages={chatMessages}
+        onApproveAction={(actionId) => void approveChatAction(actionId)}
+        onInputChange={setChatInput}
+        onRejectAction={(actionId) => void rejectChatAction(actionId)}
+        onSend={() => void sendChatMessage()}
+        pendingActions={chatPendingActions}
+        toolCalls={chatToolCalls}
+      />
+    </section>
+  )
+}
+
+function KnowledgeChatPanel({
+  busy,
+  error,
+  input,
+  loading,
+  messages,
+  onApproveAction,
+  onInputChange,
+  onRejectAction,
+  onSend,
+  pendingActions,
+  toolCalls
+}: {
+  busy: boolean
+  error?: string
+  input: string
+  loading: boolean
+  messages: KnowledgeChatMessage[]
+  onApproveAction(actionId: string): void
+  onInputChange(value: string): void
+  onRejectAction(actionId: string): void
+  onSend(): void
+  pendingActions: KnowledgeChatPendingAction[]
+  toolCalls: KnowledgeChatToolCall[]
+}): JSX.Element {
+  const transcriptEndRef = useRef<HTMLDivElement>(null)
+  const previousTranscriptState = useRef<{ messages: number; pendingActions: number }>()
+  const [selectedToolCall, setSelectedToolCall] = useState<KnowledgeChatToolCall>()
+  const visiblePending = pendingActions.filter((action) => action.status === 'pending')
+
+  useLayoutEffect(() => {
+    if (!loading) {
+      transcriptEndRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' })
+    }
+  }, [loading])
+
+  useEffect(() => {
+    if (loading) {
+      previousTranscriptState.current = undefined
+      return
+    }
+    const current = { messages: messages.length, pendingActions: pendingActions.length }
+    if (!previousTranscriptState.current) {
+      previousTranscriptState.current = current
+      return
+    }
+    const changed = previousTranscriptState.current.messages !== current.messages
+      || previousTranscriptState.current.pendingActions !== current.pendingActions
+    previousTranscriptState.current = current
+    if (!changed) return
+    transcriptEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' })
+  }, [loading, messages.length, pendingActions.length])
+
+  return (
+    <section className="knowledge-chat-panel agent-chat-panel" aria-label="Project AI chat">
+      {loading ? (
+        <div className="chat-conversation-loading" role="status">
+          <span aria-hidden="true" className="loading-spinner" />
+          Loading Conversation
+        </div>
+      ) : (
+        <>
+      <div className="chat-transcript" role="log" aria-label="Project AI chat transcript">
+        {messages.length ? messages.map((message) => {
+          const toolCall = message.toolCallId ? toolCalls.find((candidate) => candidate.id === message.toolCallId) : undefined
+          if (message.role === 'tool') {
+            return (
+              <button className="chat-tool-message" key={message.id} type="button" onClick={() => toolCall ? setSelectedToolCall(toolCall) : undefined}>
+                <strong>{toolCall?.toolName ?? 'tool'}</strong>
+                <span className="chat-tool-description">{toolCallDescription(toolCall, message.contentMarkdown)}</span>
+              </button>
+            )
+          }
+          return (
+            <article className={`chat-message ${message.role}`} key={message.id}>
+              {message.role === 'system' ? <strong>{message.role}</strong> : null}
+              <div className="chat-markdown">{renderChatMarkdown(message.contentMarkdown)}</div>
+            </article>
+          )
+        }) : <p className="muted">Start a conversation about this project.</p>}
+        <div ref={transcriptEndRef} />
+      </div>
+      {visiblePending.length ? (
+        <section className="pending-actions" aria-label="Pending agent actions">
+          <h3>Approval needed</h3>
+          {visiblePending.map((action) => (
+            <article className="pending-action-card" key={action.id}>
+              <strong>{action.payload.type ?? 'feature'} · {action.payload.title}</strong>
+              {action.payload.descriptionMarkdown ? <p>{action.payload.descriptionMarkdown}</p> : null}
+              <div className="modal-actions">
+                <button className="secondary-button" disabled={busy} type="button" onClick={() => onRejectAction(action.id)}>Reject</button>
+                <button className="primary-button" disabled={busy} type="button" onClick={() => onApproveAction(action.id)}>Approve and add to Backlog</button>
+              </div>
+            </article>
+          ))}
+        </section>
+      ) : null}
+      {selectedToolCall ? <ToolCallDetailSheet toolCall={selectedToolCall} onCancel={() => setSelectedToolCall(undefined)} /> : null}
+      {error ? <p role="alert">{error}</p> : null}
+      <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend() }}>
+        <label className="field-label">Message<textarea aria-label="Message project AI chat" value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+            event.preventDefault()
+            onSend()
+          }
+        }} placeholder="Ask about the project or ask it to draft a bug..." /></label>
+        <button className="primary-button" disabled={busy || !input.trim()} type="submit">{busy ? 'Thinking...' : 'Send'}</button>
+      </form>
+        </>
+      )}
+    </section>
+  )
+}
+
+function ToolCallDetailSheet({ onCancel, toolCall }: { onCancel(): void; toolCall: KnowledgeChatToolCall }): JSX.Element {
+  return (
+    <Modal title="Tool call details" onCancel={onCancel}>
+      <section className="tool-call-detail">
+        <p><strong>{toolCall.toolName}</strong> · {toolCall.status}</p>
+        <h3>Arguments</h3>
+        <pre>{JSON.stringify(toolCall.arguments, null, 2)}</pre>
+        {toolCall.result ? <><h3>Result</h3><pre>{JSON.stringify(toolCall.result, null, 2)}</pre></> : null}
+        {toolCall.errorMessage ? <p role="alert">{toolCall.errorMessage}</p> : null}
+      </section>
+    </Modal>
+  )
+}
+
+function toolCallDescription(toolCall: KnowledgeChatToolCall | undefined, fallback: string): string {
+  if (!toolCall) return fallback.split('\n')[0].slice(0, 140)
+  const query = typeof toolCall.arguments.query === 'string' ? toolCall.arguments.query : undefined
+  if (query) return `"${query}"`
+  const title = typeof toolCall.arguments.title === 'string' ? toolCall.arguments.title : undefined
+  if (title) return title
+  return toolCall.status
+}
+
+function renderChatMarkdown(content: string): ReactNode {
+  const lines = content.split(/\r?\n/)
+  const nodes: ReactNode[] = []
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    const fence = line.match(/^\s*```([^`\s]*)\s*$/)
+    if (fence) {
+      const language = fence[1] || 'text'
+      const codeLines: string[] = []
+      index += 1
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+        codeLines.push(lines[index])
+        index += 1
+      }
+      if (index < lines.length) index += 1
+      nodes.push(
+        <pre className="chat-code-block" key={`code-${index}`}>
+          <span className="chat-code-language">{language}</span>
+          <code>{codeLines.join('\n')}</code>
+        </pre>
+      )
+      continue
+    }
+    if (!line.trim()) {
+      index += 1
+      continue
+    }
+    if (line.startsWith('### ')) {
+      nodes.push(<h4 key={index}>{renderInlineMarkdown(line.slice(4))}</h4>)
+      index += 1
+      continue
+    }
+    if (line.startsWith('## ')) {
+      nodes.push(<h3 key={index}>{renderInlineMarkdown(line.slice(3))}</h3>)
+      index += 1
+      continue
+    }
+    if (line.startsWith('# ')) {
+      nodes.push(<h2 key={index}>{renderInlineMarkdown(line.slice(2))}</h2>)
+      index += 1
+      continue
+    }
+    if (/^[-*] /.test(line)) {
+      const items: string[] = []
+      while (index < lines.length && /^[-*] /.test(lines[index])) {
+        items.push(lines[index].slice(2))
+        index += 1
+      }
+      nodes.push(<ul key={`list-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInlineMarkdown(item)}</li>)}</ul>)
+      continue
+    }
+    nodes.push(<p key={index}>{renderInlineMarkdown(line)}</p>)
+    index += 1
+  }
+  return nodes
+}
+
+function renderInlineMarkdown(content: string): ReactNode[] {
+  const parts = content.split(/(\*\*[^*]+\*\*|`[^`]+`)/g)
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) return <strong key={index}>{part.slice(2, -2)}</strong>
+    if (part.startsWith('`') && part.endsWith('`')) return <code key={index}>{part.slice(1, -1)}</code>
+    return <span key={index}>{part}</span>
+  })
 }
 
 function KnowledgeProvenancePreview({ result, onClose }: { result: KnowledgeRetrievalResult; onClose(): void }): JSX.Element {
@@ -1390,7 +2142,13 @@ function WorkItemDetail({
               ) : null}
               <DocumentSection attachments={attachments} previewUrls={previewUrls} title="Description">{item.descriptionMarkdown || 'No description has been added yet.'}</DocumentSection>
               <DocumentSection title="Acceptance criteria">{item.acceptanceCriteriaMarkdown || 'No acceptance criteria have been added yet.'}</DocumentSection>
-              {completion ? <CompletionResult completion={completion} /> : null}
+              {completion ? (
+                <CompletionResult
+                  completion={completion}
+                  onSaveWorkerHandoff={(sessionSummaryMarkdown) =>
+                    api.claims.updateWorkerHandoff(projectId, item.id, { sessionSummaryMarkdown }).then(setCompletion)}
+                />
+              ) : null}
             </>
           )}
           <AttachmentPanel
@@ -1435,11 +2193,18 @@ function WorkItemDetail({
   )
 }
 
-function CompletionResult({ completion }: { completion: CompletionRecord }): JSX.Element {
+function CompletionResult({
+  completion,
+  onSaveWorkerHandoff
+}: {
+  completion: CompletionRecord
+  onSaveWorkerHandoff(sessionSummaryMarkdown: string): Promise<void>
+}): JSX.Element {
   return (
     <section className="document-section" aria-labelledby="result-heading">
       <h2 id="result-heading">Result</h2>
       <DocumentSection title="Summary">{completion.summaryMarkdown}</DocumentSection>
+      <WorkerHandoffEditor initialValue={completion.sessionSummaryMarkdown} onSave={onSaveWorkerHandoff} />
       {completion.implementationNotesMarkdown ? <DocumentSection title="Implementation details">{completion.implementationNotesMarkdown}</DocumentSection> : null}
       {completion.validationMarkdown ? <DocumentSection title="Validation">{completion.validationMarkdown}</DocumentSection> : null}
       {completion.knownLimitationsMarkdown ? <DocumentSection title="Known limitations">{completion.knownLimitationsMarkdown}</DocumentSection> : null}
@@ -1448,6 +2213,51 @@ function CompletionResult({ completion }: { completion: CompletionRecord }): JSX
       {completion.branch ? <p><strong>Branch:</strong> {completion.branch}</p> : null}
       {completion.commitSha ? <p><strong>Commit:</strong> {completion.commitSha}</p> : null}
       {completion.prUrl ? <p><strong>Pull request:</strong> <a href={completion.prUrl} rel="noreferrer" target="_blank">{completion.prUrl}</a></p> : null}
+    </section>
+  )
+}
+
+function WorkerHandoffEditor({
+  initialValue,
+  onSave
+}: {
+  initialValue: string
+  onSave(sessionSummaryMarkdown: string): Promise<void>
+}): JSX.Element {
+  const [value, setValue] = useState(initialValue)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string>()
+
+  useEffect(() => {
+    setValue(initialValue)
+  }, [initialValue])
+
+  return (
+    <section className="document-section" aria-labelledby="worker-handoff-heading">
+      <h2 id="worker-handoff-heading">Worker handoff</h2>
+      <p className="muted">Paste or edit the worker session summary when it was not included in MCP completion.</p>
+      <label className="field-label">
+        <span className="sr-only">Worker handoff summary</span>
+        <textarea
+          aria-label="Worker handoff summary"
+          maxLength={20_000}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+        />
+      </label>
+      {error ? <p className="inline-error" role="alert">{error}</p> : null}
+      <button
+        className="secondary-button"
+        disabled={saving || value === initialValue}
+        type="button"
+        onClick={() => {
+          setSaving(true)
+          setError(undefined)
+          void onSave(value).catch((reason) => setError(messageFor(reason))).finally(() => setSaving(false))
+        }}
+      >
+        {saving ? 'Saving handoff...' : 'Save handoff'}
+      </button>
     </section>
   )
 }
@@ -1834,18 +2644,59 @@ function McpDiagnostics(): JSX.Element {
 }
 
 function AiProviderSettingsForm({ api }: { api: DesktopApi }): JSX.Element {
-  const [settings, setSettings] = useState<{ baseUrl: string; model: string; configured: boolean }>()
+  const [settings, setSettings] = useState<{ baseUrl: string; model: string; apiMode: 'chat_completions' | 'responses' | 'messages'; configured: boolean }>()
   const [baseUrl, setBaseUrl] = useState('https://api.openai.com/v1')
   const [model, setModel] = useState('gpt-4o-mini')
+  const [apiMode, setApiMode] = useState<'chat_completions' | 'responses' | 'messages'>('chat_completions')
   const [apiKey, setApiKey] = useState('')
+  const [models, setModels] = useState<Array<{ id: string; label?: string }>>([])
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [modelError, setModelError] = useState<string>()
 
   useEffect(() => {
     void api.ai.settings().then((value) => {
       setSettings(value)
       setBaseUrl(value.baseUrl)
       setModel(value.model)
+      setApiMode(value.apiMode)
     })
   }, [api])
+
+  useEffect(() => {
+    const trimmedUrl = baseUrl.trim()
+    if (!trimmedUrl.endsWith('/v1')) {
+      setModels([])
+      setModelError(undefined)
+      return
+    }
+    if (!apiKey && !settings?.configured && !isLoopbackUrl(trimmedUrl)) {
+      setModels([])
+      setModelError(undefined)
+      return
+    }
+    let isCurrent = true
+    setLoadingModels(true)
+    setModelError(undefined)
+    void api.ai.listModels({ baseUrl: trimmedUrl, apiKey: apiKey || undefined })
+      .then((availableModels) => {
+        if (!isCurrent) return
+        setModels(availableModels)
+        if (availableModels.length && !availableModels.some((availableModel) => availableModel.id === model)) {
+          setModel(availableModels[0].id)
+        }
+      })
+      .catch((reason) => {
+        if (!isCurrent) return
+        setModels([])
+        setModelError(messageFor(reason))
+      })
+      .finally(() => {
+        if (isCurrent) setLoadingModels(false)
+      })
+    return () => {
+      isCurrent = false
+    }
+  }, [api, apiKey, baseUrl, model, settings?.configured])
 
   return (
     <section className="settings-section" aria-labelledby="ai-provider-heading">
@@ -1853,18 +2704,41 @@ function AiProviderSettingsForm({ api }: { api: DesktopApi }): JSX.Element {
       <p>{settings?.configured ? 'A provider key is securely configured on this Mac.' : 'No provider key is configured. Planning remains available for manual editing.'}</p>
       <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => {
         event.preventDefault()
-        void api.ai.configure({ baseUrl, model, apiKey: apiKey || undefined }).then((value) => {
+        void api.ai.configure({ baseUrl, model, apiMode, apiKey: apiKey || undefined }).then((value) => {
           setSettings(value)
+          setApiMode(value.apiMode)
           setApiKey('')
         })
       }}>
         <label className="field-label">Provider URL<input aria-label="Provider URL" required type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
-        <label className="field-label">Model<input aria-label="AI model" required value={model} onChange={(event) => setModel(event.target.value)} /></label>
+        <label className="field-label">API style<select aria-label="AI API style" value={apiMode} onChange={(event) => setApiMode(event.target.value as typeof apiMode)}>
+          <option value="chat_completions">Chat Completions (/chat/completions)</option>
+          <option value="responses">Responses (/responses)</option>
+          <option value="messages">Messages (/messages)</option>
+        </select></label>
+        {models.length ? (
+          <label className="field-label">Model<select aria-label="AI model" required value={model} onChange={(event) => setModel(event.target.value)}>
+            {models.map((availableModel) => <option key={availableModel.id} value={availableModel.id}>{availableModel.label ? `${availableModel.id} · ${availableModel.label}` : availableModel.id}</option>)}
+          </select></label>
+        ) : (
+          <label className="field-label">Model<input aria-label="AI model" required value={model} onChange={(event) => setModel(event.target.value)} /></label>
+        )}
+        {loadingModels ? <p role="status">Loading models...</p> : null}
+        {modelError ? <p role="alert">Model list unavailable: {modelError}</p> : null}
         <label className="field-label">API key<input aria-label="AI API key" autoComplete="off" placeholder={settings?.configured ? 'Leave blank to retain the configured key' : 'Enter API key'} type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /></label>
         <button className="secondary-button" type="submit">Save AI provider</button>
       </form>
     </section>
   )
+}
+
+function isLoopbackUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname
+    return hostname === '127.0.0.1' || hostname === '::1' || hostname === 'localhost'
+  } catch {
+    return false
+  }
 }
 
 function ProjectSheet({
@@ -1914,22 +2788,34 @@ function WorkItemSheet({
   onSubmit
 }: {
   onCancel(): void
-  onSubmit(input: CreateWorkItemInput): Promise<void>
+  onSubmit(input: CreateWorkItemInput, screenshots: File[]): Promise<void>
 }): JSX.Element {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [criteria, setCriteria] = useState('')
   const [type, setType] = useState<WorkItem['type']>('feature')
   const [priority, setPriority] = useState<WorkItem['priority']>('normal')
+  const [screenshots, setScreenshots] = useState<File[]>([])
+  const handleScreenshotPaste = (event: ClipboardEvent<HTMLElement>): void => {
+    const screenshot = Array.from(event.clipboardData.files).find((file) => file.type.startsWith('image/'))
+    if (screenshot) {
+      event.preventDefault()
+      setScreenshots((current) => [...current, screenshot])
+    }
+  }
   return (
     <Modal title="New Work Item" onCancel={onCancel}>
       <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => {
         event.preventDefault()
-        void onSubmit({ title, descriptionMarkdown: description, acceptanceCriteriaMarkdown: criteria, type, priority })
+        void onSubmit({ title, descriptionMarkdown: description, acceptanceCriteriaMarkdown: criteria, type, priority }, screenshots)
       }}>
         <label className="field-label">Type<select aria-label="Work item type" value={type} onChange={(event) => setType(event.target.value as WorkItem['type'])}><option value="feature">Feature</option><option value="bug">Bug</option><option value="chore">Chore</option></select></label>
         <label className="field-label">Title<input autoFocus required aria-label="Work item title" value={title} onChange={(event) => setTitle(event.target.value)} /></label>
-        <label className="field-label">Description<textarea aria-label="Work item description" value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+        <label className="field-label">Description<textarea aria-label="Work item description" value={description} onChange={(event) => setDescription(event.target.value)} onPaste={handleScreenshotPaste} /></label>
+        <div aria-label="Paste screenshots here" className="draft-screenshot-zone" role="region" tabIndex={0} onPaste={handleScreenshotPaste}>
+          Paste a screenshot here or into the description. It will be attached when this work item is created.
+          {screenshots.length ? <ul>{screenshots.map((screenshot, index) => <li key={`${screenshot.name}-${index}`}><span>{screenshot.name}</span><button type="button" onClick={() => setScreenshots((current) => current.filter((_, currentIndex) => currentIndex !== index))}>Remove {screenshot.name}</button></li>)}</ul> : null}
+        </div>
         <label className="field-label">Acceptance criteria<textarea aria-label="Work item acceptance criteria" value={criteria} onChange={(event) => setCriteria(event.target.value)} /></label>
         <label className="field-label">Priority<select aria-label="Work item priority" value={priority} onChange={(event) => setPriority(event.target.value as WorkItem['priority'])}><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
         <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button><button className="primary-button" type="submit">Add to Backlog</button></div>
@@ -2307,6 +3193,21 @@ function formatHistoryDate(value: string): string {
 
 function formatDateTime(value: string): string {
   return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date(value))
+}
+
+function wikiAutomationReportsEqual(left: WikiAutomationJobReport[], right: WikiAutomationJobReport[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function wikiAutomationStatusLabel(status: WikiAutomationJobReport['job']['status']): string {
+  return ({ pending: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed' })[status]
+}
+
+function wikiAutomationTimestamp(job: WikiAutomationJobReport['job']): string {
+  if (job.status === 'pending') return `Queued ${formatDateTime(job.createdAt)}`
+  if (job.status === 'running') return `Started ${formatDateTime(job.startedAt ?? job.updatedAt)}`
+  if (job.status === 'completed') return `Completed ${formatDateTime(job.completedAt ?? job.updatedAt)}`
+  return `Failed ${formatDateTime(job.completedAt ?? job.updatedAt)}`
 }
 
 function matchesCreatedPeriod(value: string, period: string): boolean {

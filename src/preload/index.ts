@@ -8,6 +8,7 @@ const workstack: DesktopApi = {
   ai: {
     settings: () => ipcRenderer.invoke('ai:settings'),
     configure: (input) => ipcRenderer.invoke('ai:configure', input),
+    listModels: (input) => ipcRenderer.invoke('ai:list-models', input),
     propose: (prompt) => ipcRenderer.invoke('ai:propose', prompt),
     proposePlanning: (projectId, sessionId, prompt) => ipcRenderer.invoke('ai:propose-planning', projectId, sessionId, prompt)
   },
@@ -26,17 +27,27 @@ const workstack: DesktopApi = {
     create: (projectId, input) => ipcRenderer.invoke('work-items:create', projectId, input),
     get: (projectId, workItemId) => ipcRenderer.invoke('work-items:get', projectId, workItemId),
     update: (projectId, workItemId, patch) => ipcRenderer.invoke('work-items:update', projectId, workItemId, patch),
-    delete: (projectId, workItemId) => ipcRenderer.invoke('work-items:delete', projectId, workItemId)
+    delete: (projectId, workItemId) => ipcRenderer.invoke('work-items:delete', projectId, workItemId),
+    launchCopilot: (projectId, workItemId, prompt) => ipcRenderer.invoke('work-items:launch-copilot', projectId, workItemId, prompt),
+    restack: (projectId, workItemId) => ipcRenderer.invoke('work-items:restack', projectId, workItemId),
+    restart: (projectId, workItemId) => ipcRenderer.invoke('work-items:restart', projectId, workItemId)
   },
   activity: {
     list: (projectId) => ipcRenderer.invoke('activity:list', projectId)
+  },
+  pullRequests: {
+    list: (projectId) => ipcRenderer.invoke('pull-requests:list', projectId),
+    open: (url) => ipcRenderer.invoke('pull-requests:open', url),
+    merge: (projectId, urls) => ipcRenderer.invoke('pull-requests:merge', projectId, urls)
   },
   claims: {
     list: (projectId) => ipcRenderer.invoke('claims:list', projectId),
     get: (projectId, workItemId) => ipcRenderer.invoke('claims:get', projectId, workItemId),
     forceRelease: (projectId, workItemId, input) =>
       ipcRenderer.invoke('claims:force-release', projectId, workItemId, input),
-    getCompletion: (projectId, workItemId) => ipcRenderer.invoke('claims:get-completion', projectId, workItemId)
+    getCompletion: (projectId, workItemId) => ipcRenderer.invoke('claims:get-completion', projectId, workItemId),
+    updateWorkerHandoff: (projectId, workItemId, input) =>
+      ipcRenderer.invoke('claims:update-worker-handoff', projectId, workItemId, input)
   },
   knowledge: {
     listSources: (projectId) => ipcRenderer.invoke('knowledge:list-sources', projectId),
@@ -47,6 +58,24 @@ const workstack: DesktopApi = {
     retryFailed: (projectId) => ipcRenderer.invoke('knowledge:retry-failed', projectId),
     listWiki: (projectId) => ipcRenderer.invoke('knowledge:list-wiki', projectId),
     saveWiki: (projectId, slug, content) => ipcRenderer.invoke('knowledge:save-wiki', projectId, slug, content)
+  },
+  wikiAutomation: {
+    listReports: (projectId) => ipcRenderer.invoke('wiki-automation:list-reports', projectId),
+    rescan: (projectId) => ipcRenderer.invoke('wiki-automation:rescan', projectId),
+    retry: (projectId, jobId) => ipcRenderer.invoke('wiki-automation:retry', projectId, jobId)
+  },
+  knowledgeChat: {
+    listSessions: (projectId) => ipcRenderer.invoke('knowledge-chat:list-sessions', projectId),
+    createSession: (projectId) => ipcRenderer.invoke('knowledge-chat:create-session', projectId),
+    listMessages: (projectId, sessionId) => ipcRenderer.invoke('knowledge-chat:list-messages', projectId, sessionId),
+    listToolCalls: (projectId, sessionId) => ipcRenderer.invoke('knowledge-chat:list-tool-calls', projectId, sessionId),
+    sendMessage: (projectId, sessionId, contentMarkdown) =>
+      ipcRenderer.invoke('knowledge-chat:send-message', projectId, sessionId, contentMarkdown),
+    listPendingActions: (projectId, sessionId) => ipcRenderer.invoke('knowledge-chat:list-pending-actions', projectId, sessionId),
+    approvePendingAction: (projectId, sessionId, actionId) =>
+      ipcRenderer.invoke('knowledge-chat:approve-pending-action', projectId, sessionId, actionId),
+    rejectPendingAction: (projectId, sessionId, actionId) =>
+      ipcRenderer.invoke('knowledge-chat:reject-pending-action', projectId, sessionId, actionId)
   },
   planning: {
     create: (projectId) => ipcRenderer.invoke('planning:create', projectId),

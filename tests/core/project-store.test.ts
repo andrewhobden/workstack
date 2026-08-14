@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { FrozenClock } from '../../src/core/clock'
 import { ProjectStore, projectPaths } from '../../src/core/project-store'
+import { DEFAULT_COPILOT_LAUNCH_PROMPT, LEGACY_DEFAULT_COPILOT_LAUNCH_PROMPT } from '../../src/core/types'
 
 const cleanupPaths: string[] = []
 
@@ -33,13 +34,18 @@ describe('ProjectStore', () => {
       name: 'Workstack',
       description: 'Coordination',
       settings: {
-        workItemPrefix: 'WORKST'
+        workItemPrefix: 'WORKST',
+        copilotLaunchPrompt: DEFAULT_COPILOT_LAUNCH_PROMPT
       }
     })
     expect(store.database.prepare('SELECT version FROM schema_migrations').all()).toEqual([
       { version: 1 },
       { version: 2 },
-      { version: 3 }
+      { version: 3 },
+      { version: 4 },
+      { version: 5 },
+      { version: 6 },
+      { version: 7 }
     ])
     expect(JSON.parse(await readFile(projectPaths(rootPath).projectPath, 'utf8'))).toMatchObject({
       name: 'Workstack',
@@ -61,6 +67,20 @@ describe('ProjectStore', () => {
 
     expect(reopened.project.id).toBe('5f03c679-76e8-4ea8-a8bc-9ec31f367a76')
     expect(reopened.project.name).toBe('Workstack')
+    reopened.close()
+  })
+
+  it('upgrades the legacy Copilot prompt default when reopening a project', async () => {
+    const rootPath = await temporaryProjectRoot()
+    const created = await ProjectStore.initialize({ rootPath, name: 'Workstack' })
+    created.close()
+    const paths = projectPaths(rootPath)
+    const metadata = JSON.parse(await readFile(paths.projectPath, 'utf8')) as Record<string, unknown>
+    await writeFile(paths.projectPath, `${JSON.stringify({ ...metadata, copilotLaunchPrompt: LEGACY_DEFAULT_COPILOT_LAUNCH_PROMPT }, null, 2)}\n`)
+
+    const reopened = await ProjectStore.open(rootPath)
+
+    expect(reopened.project.settings.copilotLaunchPrompt).toBe(DEFAULT_COPILOT_LAUNCH_PROMPT)
     reopened.close()
   })
 
@@ -102,7 +122,8 @@ describe('ProjectStore', () => {
         defaultLeaseSeconds: 900,
         heartbeatSeconds: 120,
         autoReleaseExpiredClaims: false,
-        autoUpdateKnowledgeOnCompletion: false
+        autoUpdateKnowledgeOnCompletion: false,
+        copilotLaunchPrompt: 'Claim this work item first.'
       }
     }, clock)).resolves.toMatchObject({
       name: 'Updated Workstack',
@@ -111,7 +132,8 @@ describe('ProjectStore', () => {
         defaultLeaseSeconds: 900,
         heartbeatSeconds: 120,
         autoReleaseExpiredClaims: false,
-        autoUpdateKnowledgeOnCompletion: false
+        autoUpdateKnowledgeOnCompletion: false,
+        copilotLaunchPrompt: 'Claim this work item first.'
       },
       updatedAt: '2026-08-11T01:00:00.000Z'
     })
@@ -133,7 +155,8 @@ describe('ProjectStore', () => {
         defaultLeaseSeconds: 900,
         heartbeatSeconds: 120,
         autoReleaseExpiredClaims: false,
-        autoUpdateKnowledgeOnCompletion: false
+        autoUpdateKnowledgeOnCompletion: false,
+        copilotLaunchPrompt: 'Claim this work item first.'
       })
     })
     store.close()
@@ -146,7 +169,8 @@ describe('ProjectStore', () => {
         defaultLeaseSeconds: 900,
         heartbeatSeconds: 120,
         autoReleaseExpiredClaims: false,
-        autoUpdateKnowledgeOnCompletion: false
+        autoUpdateKnowledgeOnCompletion: false,
+        copilotLaunchPrompt: 'Claim this work item first.'
       }
     })
     reopened.close()
@@ -189,5 +213,19 @@ describe('ProjectStore', () => {
     await expect(ProjectStore.open(rootPath)).rejects.toMatchObject({
       code: 'PROJECT_NOT_FOUND'
     })
+  })
+
+  it('repairs interrupted initialization when creating an existing project again', async () => {
+    const rootPath = await temporaryProjectRoot()
+    const created = await ProjectStore.initialize({ rootPath, name: 'Workstack' })
+    const projectId = created.project.id
+    created.database.prepare('DELETE FROM projects').run()
+    created.close()
+
+    const recovered = await ProjectStore.initialize({ rootPath, name: 'Workstack' })
+
+    expect(recovered.project.id).toBe(projectId)
+    expect(recovered.database.prepare('SELECT id FROM projects WHERE id = ?').get(projectId)).toMatchObject({ id: projectId })
+    recovered.close()
   })
 })

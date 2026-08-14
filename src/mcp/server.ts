@@ -14,6 +14,9 @@ export const MCP_TOOL_NAMES = [
   'workstack_create_bug',
   'workstack_search_completed',
   'workstack_get_work_item',
+  'workstack_get_work_item_handoff',
+  'workstack_list_wiki_articles',
+  'workstack_get_wiki_article',
   'workstack_claim_work_item',
   'workstack_heartbeat_work_item',
   'workstack_release_work_item',
@@ -28,8 +31,10 @@ const projectReferenceSchema = z.object({
   project_id: z.string().uuid().describe('Deprecated: use the visible project name in project instead.').optional()
 })
 const workItemReferenceSchema = projectReferenceSchema.extend({ work_item_id: z.string().trim().min(1) })
+const wikiArticleReferenceSchema = projectReferenceSchema.extend({ slug: z.string().trim().min(1) })
 const completionSchema = z.object({
   summary_markdown: z.string().trim().min(1),
+  session_summary_markdown: z.string().optional(),
   implementation_notes_markdown: z.string().optional(),
   validation_markdown: z.string().optional(),
   known_limitations_markdown: z.string().optional(),
@@ -78,6 +83,9 @@ const mcpToolInputSchemas = {
   workstack_create_bug: createFeatureOrBugInputSchema,
   workstack_search_completed: searchCompletedInputSchema,
   workstack_get_work_item: workItemReferenceSchema,
+  workstack_get_work_item_handoff: workItemReferenceSchema,
+  workstack_list_wiki_articles: projectReferenceSchema,
+  workstack_get_wiki_article: wikiArticleReferenceSchema,
   workstack_claim_work_item: workItemReferenceSchema.extend({
     agent_id: z.string().trim().min(1),
     agent_display_name: z.string().trim().min(1).optional(),
@@ -121,6 +129,12 @@ export class WorkstackMcpTools {
         return this.searchCompleted(input)
       case 'workstack_get_work_item':
         return this.getWorkItem(input)
+      case 'workstack_get_work_item_handoff':
+        return this.getWorkItemHandoff(input)
+      case 'workstack_list_wiki_articles':
+        return this.listWikiArticles(input)
+      case 'workstack_get_wiki_article':
+        return this.getWikiArticle(input)
       case 'workstack_claim_work_item':
         return this.claim(input)
       case 'workstack_heartbeat_work_item':
@@ -243,6 +257,34 @@ export class WorkstackMcpTools {
       this.projects.getActiveClaim(projectId, item.id)
     ])
     return { work_item: item, attachments, current_claim: claim }
+  }
+
+  private async getWorkItemHandoff(input: unknown): Promise<unknown> {
+    const parsed = workItemReferenceSchema.parse(input)
+    const projectId = await this.resolveProjectId(parsed)
+    const item = await this.resolveWorkItem(projectId, parsed.work_item_id)
+    const [attachments, claim, completion] = await Promise.all([
+      this.projects.listAttachments(projectId, item.id),
+      this.projects.getActiveClaim(projectId, item.id),
+      this.projects.getCompletion(projectId, item.id)
+    ])
+    return { work_item: item, attachments, current_claim: claim, completion }
+  }
+
+  private async listWikiArticles(input: unknown): Promise<{ articles: Array<{ slug: string; preview: string }> }> {
+    const parsed = projectReferenceSchema.parse(input)
+    const articles = await this.projects.listWikiArticles(await this.resolveProjectId(parsed))
+    return { articles: articles.map((article) => ({ slug: article.slug, preview: article.content.slice(0, 240) })) }
+  }
+
+  private async getWikiArticle(input: unknown): Promise<{ article: { slug: string; content: string } }> {
+    const parsed = wikiArticleReferenceSchema.parse(input)
+    const articles = await this.projects.listWikiArticles(await this.resolveProjectId(parsed))
+    const article = articles.find((candidate) => candidate.slug === parsed.slug)
+    if (!article) {
+      throw new WorkstackError('PROJECT_NOT_FOUND', 'The requested wiki article does not exist.')
+    }
+    return { article }
   }
 
   private async claim(input: unknown): Promise<unknown> {
@@ -374,6 +416,7 @@ function asMcpResult(result: Promise<unknown>): Promise<{ content: Array<{ type:
 function toCompletionInput(input: z.infer<typeof completionSchema>): CompletionInput {
   return {
     summaryMarkdown: input.summary_markdown,
+    sessionSummaryMarkdown: input.session_summary_markdown,
     implementationNotesMarkdown: input.implementation_notes_markdown,
     validationMarkdown: input.validation_markdown,
     knownLimitationsMarkdown: input.known_limitations_markdown,

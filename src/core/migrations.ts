@@ -206,6 +206,136 @@ const migrations = [
       );
       CREATE INDEX knowledge_jobs_source_idx ON knowledge_jobs(source_id, status);
     `
+  },
+  {
+    version: 4,
+    sql: `
+      CREATE TABLE knowledge_chat_sessions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('open', 'archived')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE knowledge_chat_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES knowledge_chat_sessions(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system', 'tool')),
+        content_markdown TEXT NOT NULL,
+        tool_call_id TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE knowledge_chat_tool_calls (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES knowledge_chat_sessions(id) ON DELETE CASCADE,
+        tool_name TEXT NOT NULL,
+        arguments_json TEXT NOT NULL DEFAULT '{}',
+        result_json TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+
+      CREATE TABLE knowledge_chat_pending_actions (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES knowledge_chat_sessions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK(kind IN ('create_work_item')),
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected')),
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+
+      CREATE INDEX knowledge_chat_sessions_project_idx ON knowledge_chat_sessions(project_id, updated_at DESC);
+      CREATE INDEX knowledge_chat_messages_session_idx ON knowledge_chat_messages(session_id, created_at ASC);
+      CREATE INDEX knowledge_chat_pending_actions_session_idx ON knowledge_chat_pending_actions(session_id, status);
+    `
+  },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE wiki_automation_jobs (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        prompt_markdown TEXT NOT NULL,
+        source_paths_json TEXT NOT NULL DEFAULT '[]',
+        requested_by TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT
+      );
+
+      CREATE TABLE wiki_automation_artifacts (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES wiki_automation_jobs(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK(kind IN ('dependency_graph', 'wiki_draft', 'wiki_article')),
+        title TEXT NOT NULL,
+        content_markdown TEXT NOT NULL,
+        relative_path TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE wiki_automation_handoffs (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES wiki_automation_jobs(id) ON DELETE CASCADE,
+        target TEXT NOT NULL,
+        summary_markdown TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL CHECK(status IN ('pending', 'accepted', 'rejected')),
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+
+      CREATE INDEX wiki_automation_jobs_status_idx ON wiki_automation_jobs(status, created_at ASC);
+      CREATE INDEX wiki_automation_artifacts_job_idx ON wiki_automation_artifacts(job_id, created_at ASC);
+      CREATE INDEX wiki_automation_handoffs_job_idx ON wiki_automation_handoffs(job_id, status, created_at ASC);
+    `
+  },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE completion_records
+        ADD COLUMN session_summary_markdown TEXT NOT NULL DEFAULT '';
+    `
+  },
+  {
+    version: 7,
+    sql: `
+      ALTER TABLE wiki_automation_jobs
+        ADD COLUMN merge_key TEXT;
+      ALTER TABLE wiki_automation_jobs
+        ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+
+      CREATE UNIQUE INDEX wiki_automation_jobs_merge_key_idx
+        ON wiki_automation_jobs(merge_key)
+        WHERE merge_key IS NOT NULL;
+
+      CREATE TABLE wiki_automation_merge_evidence (
+        job_id TEXT PRIMARY KEY REFERENCES wiki_automation_jobs(id) ON DELETE CASCADE,
+        pull_request_url TEXT NOT NULL,
+        pull_request_number INTEGER NOT NULL,
+        pull_request_title TEXT NOT NULL,
+        head_ref_name TEXT NOT NULL,
+        merged_at TEXT,
+        merge_commit_sha TEXT NOT NULL,
+        work_item_id TEXT NOT NULL,
+        session_summary_markdown TEXT NOT NULL DEFAULT '',
+        diff_markdown TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX wiki_automation_merge_evidence_commit_idx
+        ON wiki_automation_merge_evidence(merge_commit_sha);
+    `
   }
 ] as const
 

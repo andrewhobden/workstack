@@ -236,6 +236,7 @@ describe('ClaimsRepository', () => {
 
     const completion = claims.complete(workItem.id, 'claim-token-one', {
       summaryMarkdown: 'Implemented lease completion.',
+      sessionSummaryMarkdown: 'Worker handoff: lease changes are ready for wiki automation.',
       implementationNotesMarkdown: 'Added atomic state changes.',
       validationMarkdown: 'All tests passed.',
       filesChanged: ['src/core/claims.ts'],
@@ -247,6 +248,7 @@ describe('ClaimsRepository', () => {
     expect(completion).toMatchObject({
       workItemId: workItem.id,
       summaryMarkdown: 'Implemented lease completion.',
+      sessionSummaryMarkdown: 'Worker handoff: lease changes are ready for wiki automation.',
       filesChanged: ['src/core/claims.ts'],
       componentsChanged: ['claims'],
       completedByAgentId: 'codex',
@@ -261,6 +263,7 @@ describe('ClaimsRepository', () => {
     expect(claims.listHistory(workItem.id)).toMatchObject([{ state: 'completed' }])
     expect(store.database.prepare('SELECT * FROM completion_records WHERE work_item_id = ?').get(workItem.id)).toMatchObject({
       summary_markdown: 'Implemented lease completion.',
+      session_summary_markdown: 'Worker handoff: lease changes are ready for wiki automation.',
       files_changed_json: '["src/core/claims.ts"]'
     })
     expect(store.database.prepare('SELECT kind, status FROM knowledge_sources WHERE source_work_item_id = ?').get(workItem.id)).toEqual({
@@ -281,6 +284,40 @@ describe('ClaimsRepository', () => {
     store.close()
   })
 
+  it('updates only the worker handoff after completion without changing completion evidence', async () => {
+    const { claims, store, workItems } = await createClaimsRepository()
+    const workItem = workItems.create({ title: 'Add a missing worker handoff' })
+    claims.claim(workItem.id, { agentId: 'codex' })
+    const completion = claims.complete(workItem.id, 'claim-token-one', {
+      summaryMarkdown: 'Completed without a session handoff.',
+      validationMarkdown: 'Unit tests passed.'
+    })
+
+    const updated = claims.updateWorkerHandoff(workItem.id, {
+      sessionSummaryMarkdown: 'Resume from the current worktree; no further changes are needed.'
+    })
+
+    expect(updated).toEqual({
+      ...completion,
+      sessionSummaryMarkdown: 'Resume from the current worktree; no further changes are needed.'
+    })
+    expect(claims.getCompletion(workItem.id)).toEqual(updated)
+    expect(workItems.get(workItem.id)).toMatchObject({ status: 'completed', completedAt: completion.createdAt })
+    expect(store.database.prepare('SELECT summary_markdown, validation_markdown, session_summary_markdown FROM completion_records WHERE work_item_id = ?').get(workItem.id)).toEqual({
+      summary_markdown: 'Completed without a session handoff.',
+      validation_markdown: 'Unit tests passed.',
+      session_summary_markdown: 'Resume from the current worktree; no further changes are needed.'
+    })
+    await expect(readFile(path.join(store.paths.workItemsPath, workItem.id, 'completion.md'), 'utf8')).resolves.toContain(
+      'Resume from the current worktree; no further changes are needed.'
+    )
+    expectErrorCode(
+      () => claims.updateWorkerHandoff('00000000-0000-4000-8000-000000000000', { sessionSummaryMarkdown: 'No record.' }),
+      'WORK_ITEM_NOT_FOUND'
+    )
+    store.close()
+  })
+
   it('leaves completion knowledge queued when automatic maintenance is disabled', async () => {
     const { claims, store, workItems } = await createClaimsRepository()
     await store.updateMetadata({ settings: { autoUpdateKnowledgeOnCompletion: false } })
@@ -291,6 +328,36 @@ describe('ClaimsRepository', () => {
 
     expect(store.database.prepare('SELECT status FROM knowledge_sources WHERE source_work_item_id = ?').get(workItem.id)).toEqual({ status: 'pending' })
     expect(store.database.prepare('SELECT status FROM knowledge_jobs').get()).toEqual({ status: 'pending' })
+    store.close()
+  })
+
+  it('waits for a pull request merge before completing and indexing work', async () => {
+    const { claims, clock, store, workItems } = await createClaimsRepository()
+    const workItem = workItems.create({ title: 'Merge pull request work' })
+    claims.claim(workItem.id, { agentId: 'codex', sessionId: 'session-42' })
+
+    const completion = claims.complete(workItem.id, 'claim-token-one', {
+      summaryMarkdown: 'Ready for merge.',
+      prUrl: 'https://github.com/example/repo/pull/42'
+    })
+
+    expect(workItems.get(workItem.id)).toMatchObject({ status: 'in_progress', completedAt: null })
+    expect(claims.listHistory(workItem.id)).toMatchObject([{ state: 'completed' }])
+    expect(store.database.prepare('SELECT COUNT(*) AS count FROM knowledge_sources').get()).toEqual({ count: 0 })
+    await expect(readFile(path.join(store.paths.workItemsPath, workItem.id, 'completion.md'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT'
+    })
+
+    clock.advance(60_000)
+    expect(claims.finalizeMergedPullRequest(workItem.id)).toEqual(completion)
+    expect(workItems.get(workItem.id)).toMatchObject({ status: 'completed', completedAt: '2026-08-11T00:01:00.000Z' })
+    expect(store.database.prepare('SELECT status FROM knowledge_sources WHERE source_work_item_id = ?').get(workItem.id)).toEqual({
+      status: 'indexed'
+    })
+    await expect(readFile(path.join(store.paths.workItemsPath, workItem.id, 'completion.md'), 'utf8')).resolves.toContain(
+      'Ready for merge.'
+    )
+    expectErrorCode(() => claims.finalizeMergedPullRequest(workItem.id), 'INVALID_STATE_TRANSITION')
     store.close()
   })
 
@@ -317,6 +384,7 @@ describe('ClaimsRepository', () => {
       commitSha: null,
       branch: null,
       prUrl: null,
+      sessionSummaryMarkdown: '',
       completedBySessionId: null
     })
     store.database.prepare('UPDATE completion_records SET files_changed_json = NULL, components_changed_json = NULL WHERE work_item_id = ?').run(minimal.id)

@@ -22,7 +22,8 @@ export const updateProjectInputSchema = z
         defaultLeaseSeconds: z.number().int().min(60).optional(),
         heartbeatSeconds: z.number().int().min(30).optional(),
         autoReleaseExpiredClaims: z.boolean().optional(),
-        autoUpdateKnowledgeOnCompletion: z.boolean().optional()
+        autoUpdateKnowledgeOnCompletion: z.boolean().optional(),
+        copilotLaunchPrompt: z.string().trim().min(1).max(20_000).optional()
       })
       .strict()
       .optional()
@@ -67,6 +68,12 @@ export const workItemReferenceSchema = z
   })
   .strict()
 
+export const launchCopilotInputSchema = workItemReferenceSchema
+  .extend({
+    prompt: z.string().trim().min(1).max(20_000)
+  })
+  .strict()
+
 export const updateWorkItemInputSchema = workItemReferenceSchema
   .extend({
     type: z.enum(WORK_ITEM_TYPES).optional(),
@@ -80,6 +87,12 @@ export const updateWorkItemInputSchema = workItemReferenceSchema
 export const forceReleaseWorkItemInputSchema = workItemReferenceSchema
   .extend({
     reason: z.string().trim().min(1)
+  })
+  .strict()
+
+export const updateWorkerHandoffInputSchema = workItemReferenceSchema
+  .extend({
+    sessionSummaryMarkdown: z.string().max(20_000)
   })
   .strict()
 
@@ -97,6 +110,38 @@ export const knowledgeRetrievalInputSchema = z
     projectId: projectIdSchema,
     query: z.string().trim().min(1).max(500),
     limit: z.number().int().min(1).max(100).optional()
+  })
+  .strict()
+
+export const wikiAutomationJobReferenceSchema = z
+  .object({
+    projectId: projectIdSchema,
+    jobId: z.string().uuid()
+  })
+  .strict()
+
+export const wikiAutomationRescanInputSchema = z
+  .object({
+    projectId: projectIdSchema
+  })
+  .strict()
+
+export const knowledgeChatSessionReferenceSchema = z
+  .object({
+    projectId: projectIdSchema,
+    sessionId: z.string().uuid()
+  })
+  .strict()
+
+export const knowledgeChatMessageInputSchema = knowledgeChatSessionReferenceSchema
+  .extend({
+    contentMarkdown: z.string().trim().min(1).max(12000)
+  })
+  .strict()
+
+export const knowledgeChatPendingActionReferenceSchema = knowledgeChatSessionReferenceSchema
+  .extend({
+    actionId: z.string().uuid()
   })
   .strict()
 

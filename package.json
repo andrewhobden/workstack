@@ -9,6 +9,8 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "rebuild:native": "electron-rebuild -f -w better-sqlite3",
     "mcp:serve": "electron . --mcp",
     "web:dev": "vite --config vite.renderer.config.ts",
     "web:build": "vite build --config vite.renderer.config.ts",
@@ -27,7 +29,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.10.0",
-    "better-sqlite3": "^11.8.1",
+    "better-sqlite3": "^13.0.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "zod": "^3.24.2"
@@ -43,7 +45,7 @@
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
     "@vitest/coverage-v8": "^2.1.9",
-    "electron": "^31.7.7",
+    "electron": "^40.10.6",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
     "eslint": "^9.20.1",

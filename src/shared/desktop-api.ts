@@ -14,9 +14,31 @@ import type {
   PlanningContext,
   WorkItem,
   WorkItemFilters,
-  WorkClaim
+  WorkClaim,
+  KnowledgeChatSession,
+  KnowledgeChatMessage,
+  KnowledgeChatToolCall,
+  KnowledgeChatTurn,
+  KnowledgeChatPendingAction
 } from '../core/types'
+import type { WikiAutomationJob, WikiAutomationJobReport } from '../core/types'
 import type { KnowledgeSource, ProjectKnowledgeRetrieval, WikiArticle } from '../core/knowledge'
+
+export interface ProjectPullRequest {
+  number: number
+  title: string
+  url: string
+  headRefName: string
+  isDraft: boolean
+  authorLogin: string | null
+  updatedAt: string
+  workItem?: { displayId: string; title: string }
+}
+
+export interface CopilotLaunchResult {
+  started: boolean
+  pullRequestUrl?: string
+}
 
 export interface DesktopApi {
   system: {
@@ -25,6 +47,7 @@ export interface DesktopApi {
   ai: {
     settings(): Promise<AiProviderSettings>
     configure(input: AiProviderConfiguration): Promise<AiProviderSettings>
+    listModels(input: AiModelListInput): Promise<AiModel[]>
     propose(prompt: string): Promise<string>
     proposePlanning(projectId: string, sessionId: string, prompt: string): Promise<string>
   }
@@ -44,15 +67,24 @@ export interface DesktopApi {
     get(projectId: string, workItemId: string): Promise<WorkItem>
     update(projectId: string, workItemId: string, patch: UpdateWorkItemInput): Promise<WorkItem>
     delete(projectId: string, workItemId: string): Promise<void>
+    launchCopilot(projectId: string, workItemId: string, prompt: string): Promise<CopilotLaunchResult>
+    restack(projectId: string, workItemId: string): Promise<void>
+    restart(projectId: string, workItemId: string): Promise<void>
   }
   activity: {
     list(projectId: string): Promise<ActivityEvent[]>
+  }
+  pullRequests: {
+    list(projectId: string): Promise<ProjectPullRequest[]>
+    open(url: string): Promise<void>
+    merge(projectId: string, urls: string[]): Promise<void>
   }
   claims: {
     list(projectId: string): Promise<WorkClaim[]>
     get(projectId: string, workItemId: string): Promise<WorkClaim | undefined>
     forceRelease(projectId: string, workItemId: string, input: ForceReleaseInput): Promise<WorkClaim>
     getCompletion(projectId: string, workItemId: string): Promise<CompletionRecord | undefined>
+    updateWorkerHandoff(projectId: string, workItemId: string, input: { sessionSummaryMarkdown: string }): Promise<CompletionRecord>
   }
   knowledge: {
     listSources(projectId: string): Promise<KnowledgeSource[]>
@@ -63,6 +95,21 @@ export interface DesktopApi {
     retryFailed(projectId: string): Promise<number>
     listWiki(projectId: string): Promise<WikiArticle[]>
     saveWiki(projectId: string, slug: string, content: string): Promise<WikiArticle>
+  }
+  wikiAutomation: {
+    listReports(projectId: string): Promise<WikiAutomationJobReport[]>
+    rescan(projectId: string): Promise<WikiAutomationJob>
+    retry(projectId: string, jobId: string): Promise<WikiAutomationJob>
+  }
+  knowledgeChat: {
+    listSessions(projectId: string): Promise<KnowledgeChatSession[]>
+    createSession(projectId: string): Promise<KnowledgeChatSession>
+    listMessages(projectId: string, sessionId: string): Promise<KnowledgeChatMessage[]>
+    listToolCalls(projectId: string, sessionId: string): Promise<KnowledgeChatToolCall[]>
+    sendMessage(projectId: string, sessionId: string, contentMarkdown: string): Promise<KnowledgeChatTurn>
+    listPendingActions(projectId: string, sessionId: string): Promise<KnowledgeChatPendingAction[]>
+    approvePendingAction(projectId: string, sessionId: string, actionId: string): Promise<KnowledgeChatTurn>
+    rejectPendingAction(projectId: string, sessionId: string, actionId: string): Promise<KnowledgeChatTurn>
   }
   planning: {
     create(projectId: string): Promise<PlanningProposal>
@@ -101,13 +148,27 @@ export interface DeleteProjectInput {
 export interface AiProviderSettings {
   baseUrl: string
   model: string
+  apiMode: AiApiMode
   configured: boolean
 }
 
 export interface AiProviderConfiguration {
   baseUrl: string
   model: string
+  apiMode?: AiApiMode
   apiKey?: string
+}
+
+export type AiApiMode = 'chat_completions' | 'responses' | 'messages'
+
+export interface AiModelListInput {
+  baseUrl: string
+  apiKey?: string
+}
+
+export interface AiModel {
+  id: string
+  label?: string
 }
 
 export interface BinaryAttachmentPayload {

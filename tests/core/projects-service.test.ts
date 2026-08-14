@@ -6,6 +6,7 @@ import { ProjectRegistry } from '../../src/core/project-registry'
 import { ProjectStore, projectPaths } from '../../src/core/project-store'
 import { ProjectsService } from '../../src/core/projects-service'
 import { ClaimsRepository } from '../../src/core/claims'
+import { WikiAutomationRepository } from '../../src/core/wiki-automation'
 
 const cleanupPaths: string[] = []
 
@@ -338,6 +339,41 @@ describe('ProjectsService', () => {
     await expect(service.getCompletion(project.id, completion.id)).resolves.toMatchObject({ summaryMarkdown: 'Finished.' })
   })
 
+  it('finalizes pull request-backed work through the selected project after merge', async () => {
+    const { service, directory } = await createService()
+    const project = await service.createProject({ rootPath: path.join(directory, 'project'), name: 'Workstack' })
+    const workItem = await service.createWorkItem(project.id, { title: 'Merge service work' })
+    const claim = await service.claimWorkItem(project.id, workItem.id, { agentId: 'codex' })
+
+    await service.completeWorkItem(project.id, workItem.id, claim.claimToken, {
+      summaryMarkdown: 'Awaiting merge.',
+      prUrl: 'https://github.com/example/repo/pull/42'
+    })
+
+    await expect(service.getWorkItem(project.id, workItem.id)).resolves.toMatchObject({ status: 'in_progress' })
+    await expect(service.finalizeMergedPullRequestWorkItem(project.id, workItem.id)).resolves.toMatchObject({
+      workItemId: workItem.id
+    })
+    await expect(service.getWorkItem(project.id, workItem.id)).resolves.toMatchObject({ status: 'completed' })
+  })
+
+  it('reconciles a submitted pull request so a backlog item is not launched again', async () => {
+    const { service, directory } = await createService()
+    const project = await service.createProject({ rootPath: path.join(directory, 'project'), name: 'Workstack' })
+    const workItem = await service.createWorkItem(project.id, { title: 'Reconcile submitted work' })
+
+    await expect(service.reconcileSubmittedPullRequest(project.id, workItem.id, {
+      branch: 'anhobden/reconcile-submitted-work',
+      prUrl: 'https://github.com/example/repo/pull/42',
+      merged: false
+    })).resolves.toMatchObject({ prUrl: 'https://github.com/example/repo/pull/42' })
+    await expect(service.getWorkItem(project.id, workItem.id)).resolves.toMatchObject({ status: 'in_progress' })
+    await expect(service.getCompletion(project.id, workItem.id)).resolves.toMatchObject({
+      branch: 'anhobden/reconcile-submitted-work',
+      prUrl: 'https://github.com/example/repo/pull/42'
+    })
+  })
+
   it('routes knowledge evidence and search through the selected project', async () => {
     const { service, directory } = await createService()
     const project = await service.createProject({ rootPath: path.join(directory, 'project'), name: 'Knowledge' })
@@ -355,6 +391,12 @@ describe('ProjectsService', () => {
     await expect(service.retryKnowledgeJobs(project.id)).resolves.toBe(0)
     await expect(service.saveWikiArticle(project.id, 'architecture', '# Architecture')).resolves.toMatchObject({ slug: 'architecture' })
     await expect(service.listWikiArticles(project.id)).resolves.toContainEqual({ slug: 'architecture', content: '# Architecture' })
+    await expect(service.saveWikiArticle(project.id, 'generated-overview', '# Manual overwrite')).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR'
+    })
+    await expect(service.saveGeneratedWikiArticle(project.id, 'generated-overview', '# Generated overview')).resolves.toMatchObject({
+      slug: 'generated-overview'
+    })
     const backlog = await service.createWorkItem(project.id, { title: 'Apply SQLite ownership' })
     await expect(service.retrieveKnowledge(project.id, 'SQLite ownership')).resolves.toMatchObject({
       query: 'SQLite ownership',
@@ -367,6 +409,42 @@ describe('ProjectsService', () => {
         expect.objectContaining({ sourceType: 'backlog' })
       ])
     })
+  })
+
+  it('exposes durable wiki automation reports and retries only through the selected project', async () => {
+    const { service, directory } = await createService()
+    const rootPath = path.join(directory, 'project')
+    const project = await service.createProject({ rootPath, name: 'Wiki automation' })
+    const workItem = await service.createWorkItem(project.id, { title: 'Document merged work' })
+    const store = await ProjectStore.open(rootPath)
+    const repository = new WikiAutomationRepository(store)
+    const job = repository.createMergedPullRequestJob({
+      title: 'Generate merge notes',
+      promptMarkdown: 'Document the merged change.',
+      mergeEvidence: {
+        pullRequestUrl: 'https://github.com/example/workstack/pull/42',
+        pullRequestNumber: 42,
+        pullRequestTitle: 'Document automation',
+        headRefName: 'feature/wiki-automation',
+        mergeCommitSha: 'abc123',
+        workItemId: workItem.id,
+        diffMarkdown: 'Added durable reports.'
+      }
+    })
+    repository.startNextJob()
+    repository.failJob(job.id, 'Provider unavailable')
+    repository.addArtifact(job.id, { kind: 'wiki_draft', title: 'Draft', contentMarkdown: '# Draft' })
+    repository.createHandoff(job.id, { target: 'reviewer', summaryMarkdown: 'Review the generated draft.' })
+    store.close()
+
+    await expect(service.listWikiAutomationReports(project.id)).resolves.toMatchObject([{
+      job: { id: job.id, status: 'failed', errorMessage: 'Provider unavailable' },
+      mergeEvidence: { pullRequestNumber: 42, mergeCommitSha: 'abc123' },
+      artifacts: [{ title: 'Draft', kind: 'wiki_draft' }],
+      handoffs: [{ target: 'reviewer', status: 'pending' }]
+    }])
+    await expect(service.retryWikiAutomationJob(project.id, job.id)).resolves.toMatchObject({ status: 'pending', errorMessage: null })
+    await expect(service.retryWikiAutomationJob(project.id, job.id)).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' })
   })
 
   it('routes explicit planning proposal conversion through the selected project', async () => {

@@ -1,5 +1,5 @@
 import type { BinaryAttachmentPayload, DesktopApi, CreateProjectInput } from '../../shared/desktop-api'
-import type { KnowledgeSearchResult, KnowledgeSourceInput } from '../../shared/desktop-api'
+import type { KnowledgeSearchResult, KnowledgeSourceInput, ProjectPullRequest } from '../../shared/desktop-api'
 import type {
   KnowledgeRetrievalResult,
   KnowledgeRetrievalSourceType,
@@ -19,8 +19,15 @@ import type {
   UpdateWorkItemInput,
   WorkItem,
   WorkItemFilters,
-  WorkClaim
+  WorkClaim,
+  KnowledgeChatSession,
+  KnowledgeChatMessage,
+  KnowledgeChatPendingAction,
+  KnowledgeChatTurn,
+  KnowledgeChatToolCall
 } from '../../core/types'
+import type { WikiAutomationJob, WikiAutomationJobReport } from '../../core/types'
+import { DEFAULT_COPILOT_LAUNCH_PROMPT } from '../../core/types'
 import type { PlanningContext, PlanningMessage, PlanningProposal } from '../../core/types'
 
 interface BrowserState {
@@ -28,9 +35,14 @@ interface BrowserState {
   workItemsByProject: Record<string, WorkItem[]>
   claimsByWorkItem: Record<string, WorkClaim[]>
   knowledgeByProject: Record<string, BrowserKnowledgeSource[]>
+  chatSessionsByProject: Record<string, KnowledgeChatSession[]>
+  chatMessagesBySession: Record<string, KnowledgeChatMessage[]>
+  chatToolCallsBySession: Record<string, KnowledgeChatToolCall[]>
+  chatPendingActionsBySession: Record<string, KnowledgeChatPendingAction[]>
   planningByProject: Record<string, Record<string, PlanningProposal>>
   planningMessagesBySession: Record<string, PlanningMessage[]>
   wikiByProject: Record<string, WikiArticle[]>
+  wikiAutomationReportsByProject: Record<string, WikiAutomationJobReport[]>
   attachmentsByWorkItem: Record<string, BrowserAttachment[]>
   attachmentsByPlanningSession: Record<string, BrowserAttachment[]>
   completionsByWorkItem: Record<string, CompletionRecord>
@@ -56,8 +68,11 @@ const browserDesktopApi: DesktopApi = {
     appVersion: async () => '0.1.0'
   },
   ai: {
-    settings: async () => ({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', configured: false }),
-    configure: async (input) => ({ baseUrl: input.baseUrl, model: input.model, configured: Boolean(input.apiKey) }),
+    settings: async () => ({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', apiMode: 'chat_completions', configured: false }),
+    configure: async (input) => ({ baseUrl: input.baseUrl, model: input.model, apiMode: input.apiMode ?? 'chat_completions', configured: Boolean(input.apiKey) }),
+    listModels: async (input) => input.baseUrl.includes('example.test')
+      ? [{ id: 'test-model' }, { id: 'test-model-large' }]
+      : [{ id: 'gpt-4o-mini' }],
     propose: async (prompt) => `Suggested planning notes for: ${prompt}`,
     proposePlanning: async (projectId, sessionId, prompt) => {
       const context = await browserDesktopApi.planning.context(projectId, sessionId, prompt)
@@ -81,9 +96,11 @@ const browserDesktopApi: DesktopApi = {
       state.projects.push(project)
       state.workItemsByProject[project.id] = []
       state.knowledgeByProject[project.id] = []
+      state.chatSessionsByProject[project.id] = []
       state.planningByProject[project.id] = {}
       state.planningMessagesBySession[project.id] = []
       state.wikiByProject[project.id] = []
+      state.wikiAutomationReportsByProject[project.id] = []
       state.activityByProject[project.id] = []
       saveState(state)
       return toSummary(project, [])
@@ -108,6 +125,7 @@ const browserDesktopApi: DesktopApi = {
       }
       delete state.workItemsByProject[projectId]
       delete state.knowledgeByProject[projectId]
+      delete state.chatSessionsByProject[projectId]
       delete state.planningByProject[projectId]
       saveState(state)
     },
@@ -124,11 +142,14 @@ const browserDesktopApi: DesktopApi = {
       }
       delete state.workItemsByProject[projectId]
       delete state.knowledgeByProject[projectId]
+      delete state.chatSessionsByProject[projectId]
       delete state.planningByProject[projectId]
       saveState(state)
       return { backupPath: `/workstack-browser-backups/project-deletions/${project.id}/.workstack` }
     },
-    chooseFolder: async () => '/tmp/workstack-project',
+    chooseFolder: async () => {
+      throw new Error('Folder selection is only available in the Workstack desktop app.')
+    },
     openFolder: async (projectId) => {
       requireProject(loadState(), projectId)
     }
@@ -187,6 +208,41 @@ const browserDesktopApi: DesktopApi = {
       }
       items.splice(index, 1)
       saveState(state)
+    },
+    launchCopilot: async (projectId, workItemId, prompt) => {
+      const state = loadState()
+      requireWorkItem(state, projectId, workItemId)
+      applyProjectUpdate(requireProject(state, projectId), { settings: { copilotLaunchPrompt: prompt } })
+      saveState(state)
+      return { started: true }
+    },
+    restack: async (projectId, workItemId) => {
+      const state = loadState()
+      const item = requireWorkItem(state, projectId, workItemId)
+      normalizeExpiredBrowserClaims(state, [item])
+      const claim = (state.claimsByWorkItem[workItemId] ?? []).find((candidate) => candidate.state === 'active')
+      if (!claim) throw new Error('There is no active claim to restack.')
+      const now = new Date().toISOString()
+      claim.state = 'released'
+      claim.releaseReason = 'Restacked by Workstack after stopping the Copilot session.'
+      claim.releasedAt = now
+      item.status = 'backlog'
+      item.updatedAt = now
+      saveState(state)
+    },
+    restart: async (projectId, workItemId) => {
+      const state = loadState()
+      const item = requireWorkItem(state, projectId, workItemId)
+      normalizeExpiredBrowserClaims(state, [item])
+      const claim = (state.claimsByWorkItem[workItemId] ?? []).find((candidate) => candidate.state === 'active')
+      if (!claim) throw new Error('There is no active claim to restart.')
+      const now = new Date().toISOString()
+      claim.state = 'released'
+      claim.releaseReason = 'Restarting the Copilot session from the existing worktree.'
+      claim.releasedAt = now
+      item.status = 'backlog'
+      item.updatedAt = now
+      saveState(state)
     }
   },
   activity: {
@@ -194,6 +250,15 @@ const browserDesktopApi: DesktopApi = {
       const state = loadState()
       requireProject(state, projectId)
       return clone(state.activityByProject[projectId] ?? [])
+    }
+  },
+  pullRequests: {
+    list: async (): Promise<ProjectPullRequest[]> => [],
+    open: async () => {
+      throw new Error('Opening pull requests is only available in the Workstack desktop app.')
+    },
+    merge: async () => {
+      throw new Error('Merging pull requests is only available in the Workstack desktop app.')
     }
   },
   claims: {
@@ -216,6 +281,17 @@ const browserDesktopApi: DesktopApi = {
       const state = loadState()
       requireWorkItem(state, projectId, workItemId)
       return clone(state.completionsByWorkItem[workItemId])
+    },
+    updateWorkerHandoff: async (projectId, workItemId, input) => {
+      const state = loadState()
+      requireWorkItem(state, projectId, workItemId)
+      const completion = state.completionsByWorkItem[workItemId]
+      if (!completion) {
+        throw new Error('A worker handoff can only be added after a completion has been recorded.')
+      }
+      completion.sessionSummaryMarkdown = input.sessionSummaryMarkdown
+      saveState(state)
+      return clone(completion)
     },
     forceRelease: async (projectId, workItemId, input) => {
       const state = loadState()
@@ -288,6 +364,157 @@ const browserDesktopApi: DesktopApi = {
       state.wikiByProject[projectId] = articles
       saveState(state)
       return clone(article)
+    }
+  },
+  wikiAutomation: {
+    listReports: async (projectId) => {
+      const state = loadState()
+      requireProject(state, projectId)
+      return clone(state.wikiAutomationReportsByProject ?? {})[projectId] ?? []
+    },
+    rescan: async (projectId) => {
+      const state = loadState()
+      requireProject(state, projectId)
+      const now = new Date().toISOString()
+      const job: WikiAutomationJob = {
+        id: crypto.randomUUID(),
+        title: 'Manual full-codebase wiki rescan',
+        promptMarkdown: '',
+        sourcePaths: [],
+        requestedBy: 'manual-full-codebase-rescan',
+        status: 'pending',
+        errorMessage: null,
+        mergeKey: null,
+        attemptCount: 0,
+        createdAt: now,
+        updatedAt: now,
+        startedAt: null,
+        completedAt: null
+      }
+      state.wikiAutomationReportsByProject ??= {}
+      state.wikiAutomationReportsByProject[projectId] ??= []
+      state.wikiAutomationReportsByProject[projectId].unshift({ job, artifacts: [], handoffs: [] })
+      saveState(state)
+      return clone(job)
+    },
+    retry: async (projectId, jobId) => {
+      requireProject(loadState(), projectId)
+      throw new Error(`Wiki automation job ${jobId} was not found.`)
+    }
+  },
+  knowledgeChat: {
+    listSessions: async (projectId) => {
+      const state = loadState()
+      requireProject(state, projectId)
+      return clone(state.chatSessionsByProject[projectId] ?? [])
+    },
+    createSession: async (projectId) => {
+      const state = loadState()
+      requireProject(state, projectId)
+      const now = new Date().toISOString()
+      const session: KnowledgeChatSession = { id: crypto.randomUUID(), projectId, title: 'Project chat', status: 'open', createdAt: now, updatedAt: now }
+      state.chatSessionsByProject[projectId] ??= []
+      state.chatSessionsByProject[projectId].unshift(session)
+      state.chatMessagesBySession[session.id] = []
+      state.chatToolCallsBySession[session.id] = []
+      state.chatPendingActionsBySession[session.id] = []
+      saveState(state)
+      return clone(session)
+    },
+    listMessages: async (projectId, sessionId) => {
+      const state = loadState()
+      requireChatSession(state, projectId, sessionId)
+      return clone(state.chatMessagesBySession[sessionId] ?? [])
+    },
+    listToolCalls: async (projectId, sessionId) => {
+      const state = loadState()
+      requireChatSession(state, projectId, sessionId)
+      return clone(state.chatToolCallsBySession[sessionId] ?? [])
+    },
+    sendMessage: async (projectId, sessionId, contentMarkdown) => {
+      const state = loadState()
+      requireChatSession(state, projectId, sessionId)
+      state.chatMessagesBySession[sessionId] ??= []
+      state.chatMessagesBySession[sessionId].push(browserChatMessage(sessionId, 'user', contentMarkdown))
+      const lower = contentMarkdown.toLowerCase()
+      if (/\b(create|add)\b/.test(lower) && /\b(feature|bug|chore|work item|task)\b/.test(lower)) {
+        const type = lower.includes('bug') ? 'bug' : lower.includes('chore') ? 'chore' : 'feature'
+        const action: KnowledgeChatPendingAction = {
+          id: crypto.randomUUID(),
+          sessionId,
+          kind: 'create_work_item',
+          payload: {
+            type,
+            title: titleFromChatRequest(contentMarkdown, type),
+            descriptionMarkdown: contentMarkdown,
+            priority: 'normal'
+          },
+          status: 'pending',
+          createdAt: new Date().toISOString(),
+          resolvedAt: null
+        }
+        state.chatPendingActionsBySession[sessionId] ??= []
+        state.chatPendingActionsBySession[sessionId].push(action)
+        state.chatMessagesBySession[sessionId].push(browserChatMessage(sessionId, 'assistant', `I drafted a ${type} work item, but I need your approval before adding it to the backlog.`))
+      } else {
+        const retrieval = browserKnowledgeRetrieval(state, projectId, contentMarkdown, 5)
+        state.chatToolCallsBySession[sessionId] ??= []
+        const toolCall: KnowledgeChatToolCall = {
+          id: crypto.randomUUID(),
+          sessionId,
+          toolName: 'search_knowledge',
+          arguments: { query: contentMarkdown, limit: 5 },
+          result: { results: retrieval.results },
+          status: 'completed',
+          errorMessage: null,
+          createdAt: new Date().toISOString(),
+          completedAt: new Date().toISOString()
+        }
+        state.chatToolCallsBySession[sessionId].push(toolCall)
+        state.chatMessagesBySession[sessionId].push({
+          ...browserChatMessage(sessionId, 'tool', JSON.stringify({ results: retrieval.results }, null, 2)),
+          toolCallId: toolCall.id
+        })
+        const answer = retrieval.results.length
+          ? `I found ${retrieval.results.length} relevant project records. ${retrieval.results[0].excerpt}`
+          : 'I searched the project knowledge but did not find a matching record yet.'
+        const codeExample = /\b(code|snippet|example)\b/.test(lower)
+          ? '\n\n   ```bash\nnpm run dev\n   ```'
+          : ''
+        state.chatMessagesBySession[sessionId].push(browserChatMessage(sessionId, 'assistant', `${answer}${codeExample}`))
+      }
+      saveState(state)
+      return browserChatTurn(state, projectId, sessionId)
+    },
+    listPendingActions: async (projectId, sessionId) => {
+      const state = loadState()
+      requireChatSession(state, projectId, sessionId)
+      return clone(state.chatPendingActionsBySession[sessionId] ?? [])
+    },
+    approvePendingAction: async (projectId, sessionId, actionId) => {
+      const state = loadState()
+      requireChatSession(state, projectId, sessionId)
+      const action = requirePendingAction(state, sessionId, actionId)
+      if (action.status !== 'pending') throw new Error('This action has already been resolved.')
+      action.status = 'approved'
+      action.resolvedAt = new Date().toISOString()
+      saveState(state)
+      const item = await browserDesktopApi.workItems.create(projectId, { ...action.payload, source: 'ai_plan', createdBy: 'knowledge-chat-agent' })
+      const nextState = loadState()
+      nextState.chatMessagesBySession[sessionId].push(browserChatMessage(sessionId, 'system', `Approved and created ${item.displayId}: ${item.title}.`))
+      saveState(nextState)
+      return browserChatTurn(nextState, projectId, sessionId)
+    },
+    rejectPendingAction: async (projectId, sessionId, actionId) => {
+      const state = loadState()
+      requireChatSession(state, projectId, sessionId)
+      const action = requirePendingAction(state, sessionId, actionId)
+      if (action.status !== 'pending') throw new Error('This action has already been resolved.')
+      action.status = 'rejected'
+      action.resolvedAt = new Date().toISOString()
+      state.chatMessagesBySession[sessionId].push(browserChatMessage(sessionId, 'system', `Rejected proposed ${action.payload.type ?? 'feature'}: ${action.payload.title}.`))
+      saveState(state)
+      return browserChatTurn(state, projectId, sessionId)
     }
   },
   planning: {
@@ -416,11 +643,15 @@ const browserDesktopApi: DesktopApi = {
 function loadState(): BrowserState {
   const stored = window.localStorage.getItem(browserStorageKey)
   if (!stored) {
-    return { projects: [], workItemsByProject: {}, claimsByWorkItem: {}, knowledgeByProject: {}, planningByProject: {}, planningMessagesBySession: {}, wikiByProject: {}, attachmentsByWorkItem: {}, attachmentsByPlanningSession: {}, completionsByWorkItem: {}, activityByProject: {} }
+    return { projects: [], workItemsByProject: {}, claimsByWorkItem: {}, knowledgeByProject: {}, chatSessionsByProject: {}, chatMessagesBySession: {}, chatToolCallsBySession: {}, chatPendingActionsBySession: {}, planningByProject: {}, planningMessagesBySession: {}, wikiByProject: {}, wikiAutomationReportsByProject: {}, attachmentsByWorkItem: {}, attachmentsByPlanningSession: {}, completionsByWorkItem: {}, activityByProject: {} }
   }
   const state = JSON.parse(stored) as BrowserState
   state.claimsByWorkItem ??= {}
   state.knowledgeByProject ??= {}
+  state.chatSessionsByProject ??= {}
+  state.chatMessagesBySession ??= {}
+  state.chatToolCallsBySession ??= {}
+  state.chatPendingActionsBySession ??= {}
   state.planningByProject ??= {}
   state.planningMessagesBySession ??= {}
   state.wikiByProject ??= {}
@@ -460,6 +691,48 @@ function requireProject(state: BrowserState, projectId: string): ProjectMetadata
     throw new Error('Project not found.')
   }
   return project
+}
+
+function requireChatSession(state: BrowserState, projectId: string, sessionId: string): KnowledgeChatSession {
+  requireProject(state, projectId)
+  const session = (state.chatSessionsByProject[projectId] ?? []).find((candidate) => candidate.id === sessionId)
+  if (!session) throw new Error('Knowledge chat session not found.')
+  return session
+}
+
+function requirePendingAction(state: BrowserState, sessionId: string, actionId: string): KnowledgeChatPendingAction {
+  const action = (state.chatPendingActionsBySession[sessionId] ?? []).find((candidate) => candidate.id === actionId)
+  if (!action) throw new Error('Pending action not found.')
+  return action
+}
+
+function browserChatMessage(sessionId: string, role: KnowledgeChatMessage['role'], contentMarkdown: string): KnowledgeChatMessage {
+  return {
+    id: crypto.randomUUID(),
+    sessionId,
+    role,
+    contentMarkdown,
+    toolCallId: null,
+    metadata: {},
+    createdAt: new Date().toISOString()
+  }
+}
+
+function browserChatTurn(state: BrowserState, projectId: string, sessionId: string): KnowledgeChatTurn {
+  return {
+    session: requireChatSession(state, projectId, sessionId),
+    messages: clone(state.chatMessagesBySession[sessionId] ?? []),
+    toolCalls: clone(state.chatToolCallsBySession[sessionId] ?? []),
+    pendingActions: clone(state.chatPendingActionsBySession[sessionId] ?? [])
+  }
+}
+
+function titleFromChatRequest(content: string, type: string): string {
+  const cleaned = content
+    .replace(new RegExp(`\\b(create|add|a|an|new|${type}|work item|task)\\b`, 'gi'), ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return cleaned ? cleaned.slice(0, 80) : `New ${type}`
 }
 
 function requireWorkItem(state: BrowserState, projectId: string, workItemId: string): WorkItem {
@@ -685,7 +958,8 @@ function defaultSettings(workItemPrefix: string): ProjectSettings {
     defaultLeaseSeconds: 1800,
     heartbeatSeconds: 300,
     autoReleaseExpiredClaims: true,
-    autoUpdateKnowledgeOnCompletion: true
+    autoUpdateKnowledgeOnCompletion: true,
+    copilotLaunchPrompt: DEFAULT_COPILOT_LAUNCH_PROMPT
   }
 }
 

@@ -80,6 +80,16 @@ describe('KnowledgeRepository', () => {
     expect(knowledge.listWikiArticles()).toEqual(expect.arrayContaining([
       expect.objectContaining({ slug: 'architecture', content: '# Architecture\n\nUser-authored design.' })
     ]))
+    knowledge.saveGeneratedWikiArticle('generated-overview', '# Generated overview\n\nAutomation-owned documentation.')
+    expect(() => knowledge.saveWikiArticle('generated-overview', '# Manual overwrite')).toThrow(
+      'Generated wiki articles are reserved for automation.'
+    )
+    expect(knowledge.listWikiArticles()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ slug: 'generated-overview', content: '# Generated overview\n\nAutomation-owned documentation.' })
+    ]))
+    expect(() => knowledge.saveGeneratedWikiArticle('architecture', '# Invalid generated article')).toThrow(
+      'only accepts reserved generated article slugs'
+    )
     expect(knowledge.search('user-authored')).toMatchObject([{ sourceId: 'wiki:architecture', title: 'Wiki: architecture' }])
     knowledge.saveWikiArticle('lease-design', '# Lease design\n\nAtomic lease recovery is documented here.')
     const workItems = new WorkItemRepository(store)

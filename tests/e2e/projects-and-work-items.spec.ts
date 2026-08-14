@@ -1,16 +1,35 @@
 import { expect, test } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
 
-test('selects a project folder from the native picker flow @a11y', async ({ page }) => {
+test('selects a project folder through the desktop picker bridge @a11y', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.workstack = {
+      projects: {
+        list: async () => [],
+        chooseFolder: async () => '/Users/example/selected-project'
+      }
+    } as unknown as typeof window.workstack
+  })
   await page.goto('/')
   await page.getByRole('button', { name: '+ New Project' }).first().click()
   const dialog = page.getByRole('dialog', { name: 'New Project' })
 
   await dialog.getByRole('button', { name: 'Choose...' }).click()
 
-  await expect(dialog.getByLabel('Project folder')).toHaveValue('/tmp/workstack-project')
+  await expect(dialog.getByLabel('Project folder')).toHaveValue('/Users/example/selected-project')
   await expect(dialog.getByRole('alert')).toHaveCount(0)
   await expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+})
+
+test('does not fill a fake folder path when the desktop picker bridge is unavailable', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '+ New Project' }).first().click()
+  const dialog = page.getByRole('dialog', { name: 'New Project' })
+
+  await dialog.getByRole('button', { name: 'Choose...' }).click()
+
+  await expect(dialog.getByLabel('Project folder')).toHaveValue('')
+  await expect(dialog.getByRole('alert')).toContainText('Folder selection is only available in the Workstack desktop app.')
 })
 
 test('creates, reopens, and safely detaches a project @a11y @visual', async ({ page }) => {
@@ -68,15 +87,31 @@ test('creates, finds, edits, and retains a work item after reload @a11y @visual'
   await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project name').fill('Product Work')
   await page.getByRole('dialog', { name: 'New Project' }).getByLabel('Project folder').fill('/tmp/product-work')
   await page.getByRole('dialog', { name: 'New Project' }).getByRole('button', { name: 'Create Project' }).click()
+  await page.getByRole('button', { name: 'PRs', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'PRs' })).toBeVisible()
   await page.getByRole('button', { name: 'Backlog', exact: true }).click()
   await page.getByRole('button', { name: '+ New Work Item' }).click()
-  await page.getByRole('dialog', { name: 'New Work Item' }).getByLabel('Work item title').fill('Support pasted screenshots')
-  await page.getByRole('dialog', { name: 'New Work Item' }).getByLabel('Work item description').fill('Users can paste images directly into the editor.')
-  await page.getByRole('dialog', { name: 'New Work Item' }).getByLabel('Work item acceptance criteria').fill('Image persists after restart.')
-  await page.getByRole('dialog', { name: 'New Work Item' }).getByLabel('Work item priority').selectOption('high')
-  await page.getByRole('dialog', { name: 'New Work Item' }).getByRole('button', { name: 'Add to Backlog' }).click()
+  const workItemDialog = page.getByRole('dialog', { name: 'New Work Item' })
+  await workItemDialog.getByLabel('Work item title').fill('Support pasted screenshots')
+  await workItemDialog.getByLabel('Work item description').fill('Users can paste images directly into the editor.')
+  await workItemDialog.getByLabel('Paste screenshots here').evaluate((element) => {
+    const transfer = new DataTransfer()
+    transfer.items.add(new File(['screenshot'], 'pasted-screenshot.png', { type: 'image/png' }))
+    element.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }))
+  })
+  await expect(workItemDialog.getByText('pasted-screenshot.png', { exact: true })).toBeVisible()
+  await workItemDialog.getByLabel('Work item acceptance criteria').fill('Image persists after restart.')
+  await workItemDialog.getByLabel('Work item priority').selectOption('high')
+  await workItemDialog.getByRole('button', { name: 'Add to Backlog' }).click()
 
   await expect(page.getByRole('table', { name: 'Backlog work items' }).getByText('Support pasted screenshots')).toBeVisible()
+  await expect(page.getByLabel('1 attachments')).toBeVisible()
+  await page.getByRole('button', { name: /Start Copilot for/ }).click()
+  const launchDialog = page.getByRole('dialog', { name: /Start Copilot for/ })
+  await launchDialog.getByLabel('Initial Copilot prompt').fill('Claim this backlog item and run its tests.')
+  await launchDialog.getByRole('button', { name: 'Start Copilot', exact: true }).click()
+  await expect(launchDialog).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /Start Copilot for/ })).toBeDisabled()
   await page.getByPlaceholder('Search backlog').fill('screenshots')
   await page.getByText('Support pasted screenshots', { exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Support pasted screenshots' })).toBeVisible()

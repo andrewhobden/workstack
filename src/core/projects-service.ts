@@ -12,6 +12,8 @@ import {
   type WikiArticle
 } from './knowledge'
 import { PlanningRepository } from './planning'
+import { KnowledgeChatAgent, KnowledgeChatRepository, type AgentChatProvider } from './knowledge-chat'
+import { WikiAutomationRepository } from './wiki-automation'
 import { WorkstackError } from './errors'
 import type {
   CreateWorkItemInput,
@@ -35,7 +37,14 @@ import type {
   UpdateWorkItemInput,
   WorkItem,
   WorkItemFilters,
-  WorkClaim
+  WorkClaim,
+  KnowledgeChatSession,
+  KnowledgeChatMessage,
+  KnowledgeChatToolCall,
+  KnowledgeChatTurn,
+  KnowledgeChatPendingAction,
+  WikiAutomationJob,
+  WikiAutomationJobReport
 } from './types'
 
 interface CountRow {
@@ -240,8 +249,44 @@ export class ProjectsService {
     return this.withStore(projectId, (store) => new ClaimsRepository(store).complete(workItemId, claimToken, input))
   }
 
+  async finalizeMergedPullRequestWorkItem(projectId: string, workItemId: string): Promise<CompletionRecord> {
+    return this.withStore(projectId, (store) => new ClaimsRepository(store).finalizeMergedPullRequest(workItemId))
+  }
+
+  async reconcileSubmittedPullRequest(
+    projectId: string,
+    workItemId: string,
+    input: { branch: string; prUrl: string; merged: boolean }
+  ): Promise<CompletionRecord> {
+    return this.withStore(projectId, (store) => {
+      const claims = new ClaimsRepository(store)
+      const workItem = new WorkItemRepository(store).get(workItemId)
+      if (workItem.status !== 'backlog') {
+        throw new WorkstackError('INVALID_STATE_TRANSITION', 'The work item is no longer in the backlog.')
+      }
+      const claim = claims.claim(workItemId, {
+        agentId: 'workstack-pr-reconciler',
+        agentDisplayName: 'Workstack PR reconciler'
+      })
+      const completion = claims.complete(workItemId, claim.claimToken, {
+        summaryMarkdown: `A submitted pull request was found for this work item: ${input.prUrl}`,
+        branch: input.branch,
+        prUrl: input.prUrl
+      })
+      return input.merged ? claims.finalizeMergedPullRequest(workItemId) : completion
+    })
+  }
+
   async getCompletion(projectId: string, workItemId: string): Promise<CompletionRecord | undefined> {
     return this.withStore(projectId, (store) => new ClaimsRepository(store).getCompletion(workItemId))
+  }
+
+  async updateWorkerHandoff(
+    projectId: string,
+    workItemId: string,
+    input: { sessionSummaryMarkdown: string }
+  ): Promise<CompletionRecord> {
+    return this.withStore(projectId, (store) => new ClaimsRepository(store).updateWorkerHandoff(workItemId, input))
   }
 
   async addKnowledgeSource(
@@ -280,6 +325,66 @@ export class ProjectsService {
 
   async saveWikiArticle(projectId: string, slug: string, content: string): Promise<WikiArticle> {
     return this.withStore(projectId, (store) => new KnowledgeRepository(store).saveWikiArticle(slug, content))
+  }
+
+  async saveGeneratedWikiArticle(projectId: string, slug: string, content: string): Promise<WikiArticle> {
+    return this.withStore(projectId, (store) => new KnowledgeRepository(store).saveGeneratedWikiArticle(slug, content))
+  }
+
+  async listWikiAutomationReports(projectId: string): Promise<WikiAutomationJobReport[]> {
+    return this.withStore(projectId, (store) => {
+      const repository = new WikiAutomationRepository(store)
+      return repository.listJobs().map((job) => repository.getJobReport(job.id))
+    })
+  }
+
+  async retryWikiAutomationJob(projectId: string, jobId: string): Promise<WikiAutomationJob> {
+    return this.withStore(projectId, (store) => new WikiAutomationRepository(store).retryJob(jobId))
+  }
+
+  async listKnowledgeChatSessions(projectId: string): Promise<KnowledgeChatSession[]> {
+    return this.withStore(projectId, (store) => new KnowledgeChatRepository(store).listSessions())
+  }
+
+  async createKnowledgeChatSession(projectId: string): Promise<KnowledgeChatSession> {
+    return this.withStore(projectId, (store) => new KnowledgeChatRepository(store).createSession())
+  }
+
+  async listKnowledgeChatMessages(projectId: string, sessionId: string): Promise<KnowledgeChatMessage[]> {
+    return this.withStore(projectId, (store) => new KnowledgeChatRepository(store).listMessages(sessionId))
+  }
+
+  async listKnowledgeChatToolCalls(projectId: string, sessionId: string): Promise<KnowledgeChatToolCall[]> {
+    return this.withStore(projectId, (store) => new KnowledgeChatRepository(store).listToolCalls(sessionId))
+  }
+
+  async sendKnowledgeChatMessage(
+    projectId: string,
+    sessionId: string,
+    contentMarkdown: string,
+    provider: AgentChatProvider
+  ): Promise<KnowledgeChatTurn> {
+    return this.withStore(projectId, (store) => new KnowledgeChatAgent(store, provider).sendMessage(sessionId, contentMarkdown))
+  }
+
+  async listKnowledgeChatPendingActions(projectId: string, sessionId: string): Promise<KnowledgeChatPendingAction[]> {
+    return this.withStore(projectId, (store) => new KnowledgeChatRepository(store).listPendingActions(sessionId))
+  }
+
+  async approveKnowledgeChatPendingAction(projectId: string, sessionId: string, actionId: string): Promise<KnowledgeChatTurn> {
+    return this.withStore(projectId, (store) => {
+      const repository = new KnowledgeChatRepository(store)
+      repository.approvePendingAction(sessionId, actionId)
+      return repository.turn(sessionId)
+    })
+  }
+
+  async rejectKnowledgeChatPendingAction(projectId: string, sessionId: string, actionId: string): Promise<KnowledgeChatTurn> {
+    return this.withStore(projectId, (store) => {
+      const repository = new KnowledgeChatRepository(store)
+      repository.rejectPendingAction(sessionId, actionId)
+      return repository.turn(sessionId)
+    })
   }
 
   async createPlanningSession(projectId: string): Promise<PlanningProposal> {

@@ -6,6 +6,10 @@ import {
   deleteProjectInputSchema,
   createWorkItemInputSchema,
   forceReleaseWorkItemInputSchema,
+  launchCopilotInputSchema,
+  knowledgeChatMessageInputSchema,
+  knowledgeChatPendingActionReferenceSchema,
+  knowledgeChatSessionReferenceSchema,
   knowledgeRetrievalInputSchema,
   knowledgeSourceInputSchema,
   planningProposalInputSchema,
@@ -14,14 +18,26 @@ import {
   projectIdSchema,
   updateProjectInputSchema,
   updateWorkItemInputSchema,
+  updateWorkerHandoffInputSchema,
+  wikiAutomationRescanInputSchema,
+  wikiAutomationJobReferenceSchema,
   workItemFiltersSchema,
   workItemReferenceSchema
 } from '../contracts/desktop'
 import { WorkstackError } from '../core/errors'
 import { ProjectsService } from '../core/projects-service'
 import { OpenAiCompatibleProvider } from './ai-provider'
+import { CopilotLauncher, worktreeSlug } from './copilot-launcher'
+import { PullRequestService } from './pull-requests'
+import type { WikiAutomationService } from './wiki-automation-service'
 
-export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompatibleProvider): void {
+export function registerIpcHandlers(
+  projects: ProjectsService,
+  ai: OpenAiCompatibleProvider,
+  copilot: CopilotLauncher,
+  pullRequests: PullRequestService,
+  wikiAutomation: WikiAutomationService
+): void {
   ipcMain.handle('system:app-version', () => process.env.npm_package_version ?? '0.1.0')
   ipcMain.handle('projects:list', () => projects.listProjects())
   ipcMain.handle('projects:create', (_event, input) => projects.createProject(createProjectInputSchema.parse(input)))
@@ -80,7 +96,55 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
     const parsed = workItemReferenceSchema.parse({ projectId, workItemId })
     await projects.deleteWorkItem(parsed.projectId, parsed.workItemId)
   })
+  ipcMain.handle('work-items:launch-copilot', async (_event, projectId, workItemId, prompt) => {
+    const parsed = launchCopilotInputSchema.parse({ projectId, workItemId, prompt })
+    const [project, workItem] = await Promise.all([
+      projects.getProject(parsed.projectId),
+      projects.getWorkItem(parsed.projectId, parsed.workItemId),
+      projects.verifyProjectRoot(parsed.projectId)
+    ])
+    await projects.updateProject(parsed.projectId, { settings: { copilotLaunchPrompt: parsed.prompt } })
+    const result = await copilot.launch(project, workItem, parsed.prompt)
+    if (!result.pullRequest) {
+      return { started: true }
+    }
+    await projects.reconcileSubmittedPullRequest(parsed.projectId, parsed.workItemId, {
+      branch: `anhobden/${worktreeSlug(workItem.title, workItem.displayId)}`,
+      prUrl: result.pullRequest.url,
+      merged: result.pullRequest.state === 'MERGED'
+    })
+    return { started: false, pullRequestUrl: result.pullRequest.url }
+  })
+  ipcMain.handle('work-items:restack', async (_event, projectId, workItemId) => {
+    const parsed = workItemReferenceSchema.parse({ projectId, workItemId })
+    const [project, workItem] = await Promise.all([
+      projects.getProject(parsed.projectId),
+      projects.getWorkItem(parsed.projectId, parsed.workItemId)
+    ])
+    await copilot.restack(project, workItem)
+    await projects.forceReleaseWorkItem(parsed.projectId, parsed.workItemId, {
+      reason: 'Restacked by Workstack after stopping the Copilot session.'
+    })
+  })
+  ipcMain.handle('work-items:restart', async (_event, projectId, workItemId) => {
+    const parsed = workItemReferenceSchema.parse({ projectId, workItemId })
+    const [project, workItem] = await Promise.all([
+      projects.getProject(parsed.projectId),
+      projects.getWorkItem(parsed.projectId, parsed.workItemId)
+    ])
+    await projects.forceReleaseWorkItem(parsed.projectId, parsed.workItemId, {
+      reason: 'Restarting the Copilot session from the existing worktree.'
+    })
+    await copilot.restart(project, workItem)
+  })
   ipcMain.handle('activity:list', (_event, projectId) => projects.listActivity(projectIdSchema.parse(projectId)))
+  ipcMain.handle('pull-requests:list', (_event, projectId) => pullRequests.list(projectIdSchema.parse(projectId)))
+  ipcMain.handle('pull-requests:open', async (_event, url) => {
+    await shell.openExternal(z.string().url().parse(url))
+  })
+  ipcMain.handle('pull-requests:merge', (_event, projectId, urls) =>
+    pullRequests.merge(projectIdSchema.parse(projectId), z.array(z.string().url()).min(1).parse(urls))
+  )
   ipcMain.handle('claims:list', (_event, projectId) => projects.listActiveClaims(projectIdSchema.parse(projectId)))
   ipcMain.handle('claims:get', (_event, projectId, workItemId) => {
     const parsed = workItemReferenceSchema.parse({ projectId, workItemId })
@@ -93,6 +157,12 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
   ipcMain.handle('claims:get-completion', (_event, projectId, workItemId) => {
     const parsed = workItemReferenceSchema.parse({ projectId, workItemId })
     return projects.getCompletion(parsed.projectId, parsed.workItemId)
+  })
+  ipcMain.handle('claims:update-worker-handoff', (_event, projectId, workItemId, input) => {
+    const parsed = updateWorkerHandoffInputSchema.parse({ projectId, workItemId, ...(input ?? {}) })
+    return projects.updateWorkerHandoff(parsed.projectId, parsed.workItemId, {
+      sessionSummaryMarkdown: parsed.sessionSummaryMarkdown
+    })
   })
   ipcMain.handle('knowledge:list-sources', (_event, projectId) => projects.listKnowledgeSources(projectIdSchema.parse(projectId)))
   ipcMain.handle('knowledge:add-source', (_event, projectId, input) => {
@@ -116,6 +186,46 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
   ipcMain.handle('knowledge:save-wiki', (_event, projectId, slug, content) =>
     projects.saveWikiArticle(projectIdSchema.parse(projectId), z.string().trim().min(1).parse(slug), z.string().parse(content))
   )
+  ipcMain.handle('wiki-automation:list-reports', (_event, projectId) =>
+    projects.listWikiAutomationReports(projectIdSchema.parse(projectId))
+  )
+  ipcMain.handle('wiki-automation:rescan', (_event, projectId) =>
+    wikiAutomation.requestFullCodebaseRescan(wikiAutomationRescanInputSchema.parse({ projectId }).projectId)
+  )
+  ipcMain.handle('wiki-automation:retry', (_event, projectId, jobId) => {
+    const parsed = wikiAutomationJobReferenceSchema.parse({ projectId, jobId })
+    return projects.retryWikiAutomationJob(parsed.projectId, parsed.jobId)
+  })
+  ipcMain.handle('knowledge-chat:list-sessions', (_event, projectId) =>
+    projects.listKnowledgeChatSessions(projectIdSchema.parse(projectId))
+  )
+  ipcMain.handle('knowledge-chat:create-session', (_event, projectId) =>
+    projects.createKnowledgeChatSession(projectIdSchema.parse(projectId))
+  )
+  ipcMain.handle('knowledge-chat:list-messages', (_event, projectId, sessionId) => {
+    const parsed = knowledgeChatSessionReferenceSchema.parse({ projectId, sessionId })
+    return projects.listKnowledgeChatMessages(parsed.projectId, parsed.sessionId)
+  })
+  ipcMain.handle('knowledge-chat:list-tool-calls', (_event, projectId, sessionId) => {
+    const parsed = knowledgeChatSessionReferenceSchema.parse({ projectId, sessionId })
+    return projects.listKnowledgeChatToolCalls(parsed.projectId, parsed.sessionId)
+  })
+  ipcMain.handle('knowledge-chat:send-message', (_event, projectId, sessionId, contentMarkdown) => {
+    const parsed = knowledgeChatMessageInputSchema.parse({ projectId, sessionId, contentMarkdown })
+    return projects.sendKnowledgeChatMessage(parsed.projectId, parsed.sessionId, parsed.contentMarkdown, ai)
+  })
+  ipcMain.handle('knowledge-chat:list-pending-actions', (_event, projectId, sessionId) => {
+    const parsed = knowledgeChatSessionReferenceSchema.parse({ projectId, sessionId })
+    return projects.listKnowledgeChatPendingActions(parsed.projectId, parsed.sessionId)
+  })
+  ipcMain.handle('knowledge-chat:approve-pending-action', (_event, projectId, sessionId, actionId) => {
+    const parsed = knowledgeChatPendingActionReferenceSchema.parse({ projectId, sessionId, actionId })
+    return projects.approveKnowledgeChatPendingAction(parsed.projectId, parsed.sessionId, parsed.actionId)
+  })
+  ipcMain.handle('knowledge-chat:reject-pending-action', (_event, projectId, sessionId, actionId) => {
+    const parsed = knowledgeChatPendingActionReferenceSchema.parse({ projectId, sessionId, actionId })
+    return projects.rejectKnowledgeChatPendingAction(parsed.projectId, parsed.sessionId, parsed.actionId)
+  })
   ipcMain.handle('planning:create', (_event, projectId) => projects.createPlanningSession(projectIdSchema.parse(projectId)))
   ipcMain.handle('planning:get', (_event, projectId, sessionId) =>
     projects.getPlanningProposal(projectIdSchema.parse(projectId), z.string().uuid().parse(sessionId))
@@ -170,6 +280,11 @@ export function registerIpcHandlers(projects: ProjectsService, ai: OpenAiCompati
   ipcMain.handle('ai:configure', (_event, input) => ai.configure(z.object({
     baseUrl: z.string().url(),
     model: z.string().trim().min(1),
+    apiMode: z.enum(['chat_completions', 'responses', 'messages']).optional(),
+    apiKey: z.string().trim().min(1).optional()
+  }).strict().parse(input)))
+  ipcMain.handle('ai:list-models', (_event, input) => ai.listModels(z.object({
+    baseUrl: z.string().url(),
     apiKey: z.string().trim().min(1).optional()
   }).strict().parse(input)))
   ipcMain.handle('ai:propose', (_event, prompt) => ai.propose(z.string().trim().min(1).parse(prompt)))
