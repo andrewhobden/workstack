@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { WorkstackError } from './errors'
@@ -34,7 +34,8 @@ export class ArtifactStore {
     return this.persist({ kind: 'work_item', id: workItemId }, {
       originalFilename,
       mimeType: input.mimeType ?? 'application/octet-stream',
-      write: (destination) => copyFileSync(input.sourcePath, destination)
+      data: readFileSync(input.sourcePath),
+      requestId: input.requestId
     })
   }
 
@@ -46,7 +47,8 @@ export class ArtifactStore {
     return this.persist({ kind: 'work_item', id: workItemId }, {
       originalFilename: input.originalFilename,
       mimeType: input.mimeType ?? 'application/octet-stream',
-      write: (destination) => writeFileSync(destination, input.data)
+      data: input.data,
+      requestId: input.requestId
     })
   }
 
@@ -57,13 +59,14 @@ export class ArtifactStore {
 
     const attachment = this.attachBytes(workItemId, {
       data: input.data,
+      requestId: input.requestId,
       originalFilename: input.originalFilename ?? 'screenshot.png',
       mimeType: input.mimeType ?? 'image/png'
     })
     const workItem = new WorkItemRepository(this.store).get(workItemId)
     const markdown = `![${attachment.originalFilename}](attachments/${path.basename(attachment.storedRelativePath)})`
     new WorkItemRepository(this.store).update(workItemId, {
-      descriptionMarkdown: appendMarkdown(workItem.descriptionMarkdown, markdown)
+      descriptionMarkdown: workItem.descriptionMarkdown.includes(markdown) ? workItem.descriptionMarkdown : appendMarkdown(workItem.descriptionMarkdown, markdown)
     })
     return attachment
   }
@@ -83,7 +86,8 @@ export class ArtifactStore {
     return this.persist({ kind: 'planning_session', id: sessionId }, {
       originalFilename: input.originalFilename,
       mimeType: input.mimeType ?? 'application/octet-stream',
-      write: (destination) => writeFileSync(destination, input.data)
+      data: input.data,
+      requestId: input.requestId
     })
   }
 
@@ -93,6 +97,7 @@ export class ArtifactStore {
     }
     return this.attachPlanningBytes(sessionId, {
       data: input.data,
+      requestId: input.requestId,
       originalFilename: input.originalFilename ?? 'screenshot.png',
       mimeType: input.mimeType ?? 'image/png'
     })
@@ -149,63 +154,69 @@ export class ArtifactStore {
   remove(workItemId: string, attachmentId: string): void {
     const pathToRemove = this.resolvePath(workItemId, attachmentId)
     this.store.database.prepare('DELETE FROM attachments WHERE id = ? AND work_item_id = ?').run(attachmentId, workItemId)
-    rmSync(pathToRemove, { force: true })
+    if (!this.store.database.prepare('SELECT id FROM attachments WHERE stored_relative_path = ?').get(path.relative(this.store.paths.workstackPath, pathToRemove).split(path.sep).join('/'))) rmSync(pathToRemove, { force: true })
   }
 
   removePlanning(sessionId: string, attachmentId: string): void {
     const pathToRemove = this.resolvePlanningPath(sessionId, attachmentId)
     this.store.database.prepare('DELETE FROM attachments WHERE id = ? AND planning_session_id = ?').run(attachmentId, sessionId)
-    rmSync(pathToRemove, { force: true })
+    if (!this.store.database.prepare('SELECT id FROM attachments WHERE stored_relative_path = ?').get(path.relative(this.store.paths.workstackPath, pathToRemove).split(path.sep).join('/'))) rmSync(pathToRemove, { force: true })
   }
 
   resolvePlanningPath(sessionId: string, attachmentId: string): string {
     return this.resolveAttachmentPath(this.getPlanning(sessionId, attachmentId))
   }
 
+  linkPlanningToWorkItem(sessionId: string, workItemId: string): Attachment[] {
+    this.requirePlanningSession(sessionId)
+    new WorkItemRepository(this.store).get(workItemId)
+    const original = this.listPlanning(sessionId)
+    for (const attachment of original) {
+      const linked = this.store.database.prepare('SELECT id FROM attachments WHERE work_item_id = ? AND stored_relative_path = ?').get(workItemId, attachment.storedRelativePath)
+      if (!linked) this.store.database.prepare(`INSERT INTO attachments
+        (id, work_item_id, planning_session_id, original_filename, stored_relative_path, mime_type, size_bytes, sha256, created_at)
+        VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)`)
+        .run(this.createId(), workItemId, attachment.originalFilename, attachment.storedRelativePath, attachment.mimeType, attachment.sizeBytes, attachment.sha256, attachment.createdAt)
+    }
+    return this.list(workItemId)
+  }
+
   private persist(
     owner: { kind: 'work_item' | 'planning_session'; id: string },
-    input: { originalFilename: string; mimeType: string; write(destination: string): void }
+    input: { originalFilename: string; mimeType: string; data: Buffer; requestId?: string }
   ): Attachment {
-    if (owner.kind === 'work_item') {
-      new WorkItemRepository(this.store).get(owner.id)
-    } else {
-      this.requirePlanningSession(owner.id)
-    }
-    const id = this.createId()
     const originalFilename = input.originalFilename.trim()
-    if (!originalFilename) {
-      throw new WorkstackError('VALIDATION_ERROR', 'Attachment filename is required.')
-    }
-
-    const storedFilename = `${id}-${safeFilename(originalFilename)}`
-    const directory = owner.kind === 'work_item'
-      ? path.join(this.store.paths.workItemsPath, owner.id, 'attachments')
-      : path.join(this.store.paths.workstackPath, 'planning-sessions', owner.id, 'attachments')
-    const destination = path.join(directory, storedFilename)
-    const storedRelativePath = path.relative(this.store.paths.workstackPath, destination).split(path.sep).join('/')
-    mkdirSync(directory, { recursive: true })
-    input.write(destination)
-    const contents = readFileSync(destination)
-    const attachment: Attachment = {
-      id,
-      workItemId: owner.kind === 'work_item' ? owner.id : null,
-      planningSessionId: owner.kind === 'planning_session' ? owner.id : null,
-      originalFilename,
-      storedRelativePath,
-      mimeType: input.mimeType,
-      sizeBytes: contents.byteLength,
-      sha256: createHash('sha256').update(contents).digest('hex'),
-      createdAt: new Date().toISOString()
-    }
-
-    this.store.database
-      .prepare(
-        `INSERT INTO attachments (
-          id, work_item_id, planning_session_id, original_filename, stored_relative_path, mime_type, size_bytes, sha256, created_at
-        ) VALUES (@id, @workItemId, @planningSessionId, @originalFilename, @storedRelativePath, @mimeType, @sizeBytes, @sha256, @createdAt)`
-      )
-      .run(attachment)
-    return attachment
+    if (!originalFilename) throw new WorkstackError('VALIDATION_ERROR', 'Attachment filename is required.')
+    if (input.requestId !== undefined && (!input.requestId.trim() || input.requestId.length > 200)) throw new WorkstackError('VALIDATION_ERROR', 'Invalid attachment request ID.')
+    const sha256 = createHash('sha256').update(input.data).digest('hex')
+    return this.store.database.transaction(() => {
+      if (owner.kind === 'work_item') new WorkItemRepository(this.store).get(owner.id)
+      else this.requirePlanningSession(owner.id)
+      if (input.requestId) {
+        const previous = this.store.database.prepare('SELECT * FROM attachments WHERE request_id = ?').get(input.requestId) as AttachmentRow | undefined
+        if (previous) {
+          if ((owner.kind === 'work_item' ? previous.work_item_id : previous.planning_session_id) !== owner.id || previous.sha256 !== sha256 || previous.original_filename !== originalFilename || previous.mime_type !== input.mimeType) throw new WorkstackError('VALIDATION_ERROR', 'This attachment request ID was already used with different content.')
+          return toAttachment(previous)
+        }
+      }
+      const id = this.createId()
+      const directory = owner.kind === 'work_item' ? path.join(this.store.paths.workItemsPath, owner.id, 'attachments') : path.join(this.store.paths.workstackPath, 'planning-sessions', owner.id, 'attachments')
+      const destination = path.join(directory, `${id}-${safeFilename(originalFilename)}`)
+      const attachment: Attachment = { id, workItemId: owner.kind === 'work_item' ? owner.id : null, planningSessionId: owner.kind === 'planning_session' ? owner.id : null,
+        originalFilename, storedRelativePath: path.relative(this.store.paths.workstackPath, destination).split(path.sep).join('/'), mimeType: input.mimeType,
+        sizeBytes: input.data.byteLength, sha256, createdAt: new Date().toISOString() }
+      mkdirSync(directory, { recursive: true })
+      let created = false
+      try {
+        writeFileSync(destination, input.data, { flag: 'wx' })
+        created = true
+        this.store.database.prepare(`INSERT INTO attachments
+          (id, work_item_id, planning_session_id, original_filename, stored_relative_path, mime_type, size_bytes, sha256, created_at, request_id)
+          VALUES (@id, @workItemId, @planningSessionId, @originalFilename, @storedRelativePath, @mimeType, @sizeBytes, @sha256, @createdAt, @requestId)`)
+          .run({ ...attachment, requestId: input.requestId ?? null })
+      } catch (error) { if (created) rmSync(destination, { force: true }); throw error }
+      return attachment
+    }).immediate()
   }
 
   private resolveAttachmentPath(attachment: Attachment): string {

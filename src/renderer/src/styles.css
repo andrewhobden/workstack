@@ -1999,6 +1999,7 @@ nav {
 
   .toolbar,
   .work-table-header {
+    color: #b8c2d3;
     background: #1c222e;
     border-color: #303847;
   }
@@ -2009,7 +2010,8 @@ nav {
   .page-content h1,
   .document-panel h1,
   .project-card-title,
-  .work-title {
+  .work-title,
+  .work-title button {
     color: #f2f5fb;
   }
 
@@ -2049,6 +2051,15 @@ nav {
     background: #202733;
     border-color: #394454;
   }
+
+  .work-table-row,
+  .priority-normal,
+  .status {
+    color: #c8d3e5;
+  }
+
+  .priority-high { color: #ffb4ac; }
+  .priority-low { color: #94d7aa; }
 
   .active-work-heading {
     color: #f2f5fb;
@@ -2203,3 +2214,103 @@ nav {
     background: #273755;
   }
 }
+
+.wiki-reader { width: min(900px, calc(100vw - 48px)); max-height: calc(100vh - 64px); overflow-y: auto; display: block; }
+.markdown-document { line-height: 1.65; overflow-wrap: anywhere; }
+.markdown-document h1, .markdown-document h2, .markdown-document h3 { margin-top: 1.2em; }
+.markdown-document pre { padding: 16px; overflow-x: auto; background: var(--surface-secondary, #f3f4f6); border-radius: 8px; }
+.markdown-document code { font-family: ui-monospace, monospace; font-size: 0.9em; }
+.markdown-document p, .markdown-document blockquote { white-space: pre-wrap; }
+.markdown-document blockquote { border-left: 3px solid #9ca3af; padding-left: 16px; margin-left: 0; }
+
+@media (prefers-color-scheme: dark) {
+  .markdown-document pre { color: #e5e9f1; background: #151922; }
+  .markdown-document a { color: #9cc4ff; }
+  .knowledge-sources h2, .retrieval-group h2, .inline-empty h2 { color: #e5e9f1; }
+  .knowledge-sources li span, .knowledge-sources li small, .inline-empty p { color: #b8c2d3; }
+  .retrieval-provenance, .provenance-type { color: #9cc4ff; }
+  .knowledge-automation, .retrieval-result, .provenance-preview { background: #202733; border-color: #394454; }
+  .knowledge-automation h2, .retrieval-result, .knowledge-page .icon-button { color: #e5e9f1; }
+  .knowledge-automation p, .wiki-automation-job small, .retrieval-result-excerpt, .retrieval-summary { color: #b8c2d3; }
+  .knowledge-automation .inline-error { color: #ffb4ab; }
+  .knowledge-sources li, .wiki-automation-reports > li { border-color: #394454; }
+  .retrieval-result:hover { background: #273755; }
+}
+
+.source-job-list { grid-column: 1 / -1; width: 100%; margin: 0; padding: 0; list-style: none; display: grid; gap: 12px; }
+.source-job-list li { display: grid; gap: 5px; padding: 12px 0; border-top: 1px solid #d8dfe8; overflow-wrap: anywhere; }
+.source-job-list button { justify-self: start; }
+
+.source-catalog { margin: 24px 0; padding: 20px; border: 1px solid #d8dfe8; border-radius: 10px; background: #fff; }
+.source-catalog h2 { margin: 0; font-size: 17px; }
+.source-section-heading { display: flex; align-items: start; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
+.source-section-heading p { margin: 6px 0 0; font-size: 13px; }
+.source-catalog-list, .source-passage-results > ul, .source-revision-list { display: grid; gap: 12px; list-style: none; margin: 16px 0 0; padding: 0; }
+.source-catalog-list > li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 14px; padding: 14px 0; border-top: 1px solid #d8dfe8; }
+.source-catalog-list small { color: #526174; grid-column: 1 / -1; overflow-wrap: anywhere; }
+.source-title-button { padding: 0; color: #24446e; background: transparent; border: 0; text-align: left; font-weight: 700; font-size: 15px; }
+.source-title-button:hover { text-decoration: underline; }
+.source-readiness { display: inline-block; width: fit-content; padding: 2px 8px; background: #eef2f6; color: #374960; border-radius: 99px; font-size: 12px; font-weight: 600; }
+.source-readiness-ready { background: #e7f6ed; color: #13612e; }
+.source-readiness-stale, .source-readiness-refresh_pending { background: #fff4ce; color: #6c4d00; }
+.source-readiness-unavailable { background: #fff0ef; color: #98291c; }
+.source-state-reason { grid-column: 1 / -1; margin: 0; color: #815313; font-size: 13px; }
+.source-excerpt { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; font-size: 13px; line-height: 1.5; }
+.source-detail-dialog { display: block; width: min(1000px, calc(100vw - 48px)); max-height: calc(100vh - 64px); overflow-y: auto; }
+.source-detail-dialog header { margin-bottom: 16px; }
+.source-detail-dialog h3 { margin-top: 24px; font-size: 15px; }
+.source-detail-dialog details { margin: 16px 0; }
+.source-detail-dialog summary { cursor: pointer; font-weight: 600; }
+.source-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; font-size: 13px; }
+.source-facts dt { font-weight: 700; }
+.source-facts dd { margin: 0; overflow-wrap: anywhere; }
+.source-facts > div { display: contents; }
+.knowledge-filter-row { display: flex; flex-wrap: wrap; gap: 16px; }
+.knowledge-context-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0 24px; }
+.knowledge-filter-row > label { flex: 1; min-width: 180px; }
+.knowledge-reference-fields { border: 1px solid #d4ddec; border-radius: 8px; padding: 16px; margin: 16px 0; }
+.knowledge-reference-fields legend { padding: 0 6px; font-weight: 600; }
+.knowledge-reference-list { list-style: none; padding: 0; }
+.knowledge-reference-list li { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin: 8px 0; overflow-wrap: anywhere; }
+.knowledge-reference-list li > span { min-width: 0; }
+.knowledge-reference-list .source-title-button { white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.directory-split-selections { display: grid; gap: 8px; margin: 12px 0; }
+.directory-split-selections label { display: flex; align-items: center; gap: 8px; }
+.context-policy-categories { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.task-context-preview { border-top: 1px solid #d4ddec; border-bottom: 1px solid #d4ddec; padding: 16px 0; margin: 20px 0; }
+.context-section-list { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.context-section-list > li { display: flex; flex-direction: column; align-items: start; gap: 8px; border: 1px solid #d4ddec; border-radius: 8px; padding: 12px; }
+.context-section-list > li span { font-size: 13px; }
+.context-full-section { margin: 20px 0; }
+.source-notice { padding: 12px 14px; border: 1px solid #ead092; border-radius: 6px; background: #fff9e8; color: #6c4d00; font-size: 13px; line-height: 1.5; }
+.source-policy-form { margin: 24px 0; padding: 16px; border: 1px solid #d8dfe8; border-radius: 8px; }
+.source-revision-list > li { display: grid; gap: 7px; padding: 14px; border: 1px solid #d8dfe8; border-radius: 8px; overflow-wrap: anywhere; }
+.source-revision-list button { justify-self: start; }
+.source-revision-list code { font-size: 12px; }
+.source-passage { margin: 20px 0; border-left: 3px solid #c5cedb; padding-left: 14px; }
+.source-passage-cited { border-left-color: #2464da; }
+.source-passage h3 small { font-weight: 400; }
+.source-passage-text { overflow-wrap: anywhere; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; line-height: 1.6; padding: 14px; color: inherit; background: #f5f7fa; border-radius: 6px; max-height: 55vh; overflow-y: auto; }
+.wiki-source-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.wiki-source-comparison > section { min-width: 0; }
+.source-detail-dialog .toolbar-actions { flex-wrap: wrap; align-items: center; margin: 12px 0; }
+@media (max-width: 800px) { .wiki-source-comparison { grid-template-columns: 1fr; } .source-section-heading { flex-wrap: wrap; } .source-facts { grid-template-columns: 1fr; gap: 4px; } .source-facts dd { margin-bottom: 8px; } }
+@media (prefers-color-scheme: dark) {
+  .source-catalog { background: #202733; border-color: #394454; }
+  .source-title-button { color: #b2d0ff; }
+  .source-catalog-list small { color: #b8c2d3; }
+  .source-state-reason { color: #efc77a; }
+  .source-passage-text { background: #151922; }
+  .source-policy-form, .source-catalog-list > li, .source-revision-list > li, .source-job-list li { border-color: #394454; }
+  .source-notice { color: #efc77a; border-color: #755f2a; background: #342b1e; }
+  .source-detail-dialog .inline-error { color: #ffb4ab; }
+}
+.source-import-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.source-inventory-list { max-height: 300px; overflow-y: auto; margin: 12px 0; padding: 0; border: 1px solid #d8dfe8; border-radius: 6px; list-style: none; }
+.source-inventory-list li { padding: 10px 12px; border-bottom: 1px solid #e5e9ef; }
+.source-inventory-list label { display: flex; align-items: start; gap: 10px; cursor: pointer; }
+.source-inventory-list label > span { display: grid; gap: 5px; overflow-wrap: anywhere; min-width: 0; }
+.source-inventory-list input { flex-shrink: 0; margin-top: 3px; }
+.source-inventory-list small { color: #526174; }
+.source-origin { overflow-wrap: anywhere; }
+@media (prefers-color-scheme: dark) { .source-inventory-list, .source-inventory-list li { border-color: #394454; } .source-inventory-list small { color: #b8c2d3; } }

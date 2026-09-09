@@ -28,7 +28,7 @@ test('supports keyboard-led recovery, durable operational settings, and dark app
 
   await page.keyboard.press('Meta+5')
   await expect(page.getByRole('heading', { name: 'Knowledge', exact: true })).toBeVisible()
-  await expect(page.getByText('Build your project knowledge. Add existing documentation or let Workstack accumulate knowledge as work is completed.')).toBeVisible()
+  await expect(page.getByText('Import selected repository documentation or GitHub discussions to build reusable context.')).toBeVisible()
 
   await page.keyboard.press('Meta+k')
   const palette = page.getByRole('dialog', { name: 'Command Palette' })

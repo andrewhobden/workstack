@@ -1,0 +1,17 @@
+.task-dependencies-panel {
+  border-top: 1px solid #c8d1df;
+  margin-top: 20px;
+  padding-top: 16px;
+  overflow-wrap: anywhere;
+}
+
+.task-dependencies-panel h3,
+.task-dependencies-panel h4 { margin: 0 0 10px; }
+.task-dependencies-panel li { margin-bottom: 10px; }
+.task-dependencies-panel p { line-height: 1.5; }
+.task-outcome-text { white-space: pre-wrap; }
+.task-dependency-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.task-dependency-fields label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; }
+.task-dependency-fields textarea { width: 100%; min-width: 0; padding: 8px; border: 1px solid #899ab1; border-radius: 8px; color: inherit; background: transparent; font-weight: 400; }
+.task-dependency-fields textarea::placeholder { color: #536278; }
+[data-theme='dark'] .task-dependency-fields textarea::placeholder { color: #b4c1d5; }

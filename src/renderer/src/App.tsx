@@ -1,5 +1,19 @@
+import { SemanticSettingsPanel } from './SemanticSettingsPanel'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 import { getDesktopApi } from './api'
+import { useProjectSnapshot } from './useProjectSnapshot'
+import { MarkdownDocument } from './MarkdownDocument'
+import { Modal } from './Modal'
+import { KnowledgeDeliveryPanel } from './KnowledgeDeliveryPanel'
+import { WikiReviewPanel } from './WikiReviewPanel'
+import { SourceCatalogPanel, SourceCitationReader } from './SourceCatalogPanel'
+import { KnowledgeRecordsPanel } from './KnowledgeRecordsPanel'
+import { ProjectDirectoryPanel } from './ProjectDirectoryPanel'
+import { TaskContextDialog } from './TaskContextDialog'
+import { ContextPolicyPanel } from './ContextPolicyPanel'
+import type { ContextApproval } from '../../core/context-packet-contracts'
+import { SourceImportSheet } from './SourceImportSheet'
+import { TaskDependenciesPanel } from './TaskDependenciesPanel'
 import type { DesktopApi, ProjectPullRequest } from '../../shared/desktop-api'
 import type {
   Attachment,
@@ -19,6 +33,7 @@ import type {
 import { DEFAULT_COPILOT_LAUNCH_PROMPT } from '../../core/types'
 import type { PlanningContext, PlanningProposal } from '../../core/types'
 import type { KnowledgeSource } from '../../core/knowledge'
+import type { SourceCitation } from '../../core/source-catalog'
 import type { KnowledgeRetrievalResult, ProjectKnowledgeRetrieval } from '../../core/knowledge'
 
 type ProjectView = 'projects' | 'overview' | 'agent' | 'backlog' | 'in-progress' | 'prs' | 'completed' | 'knowledge' | 'activity' | 'settings'
@@ -41,29 +56,44 @@ export function App(): JSX.Element {
   const api = useMemo(getDesktopApi, [])
   const [projects, setProjects] = useState<ProjectSummary[]>([])
   const [selectedProjectId, setSelectedProjectId] = useState<string>()
-  const [selectedProject, setSelectedProject] = useState<ProjectMetadata>()
-  const [workItems, setWorkItems] = useState<WorkItem[]>([])
-  const [claims, setClaims] = useState<WorkClaim[]>([])
-  const [knowledgeSources, setKnowledgeSources] = useState<KnowledgeSource[]>([])
   const [planningProposal, setPlanningProposal] = useState<PlanningProposal>()
+  const [planningSessions, setPlanningSessions] = useState<PlanningProposal[]>()
+  const selectedProjectRef = useRef(selectedProjectId)
+  selectedProjectRef.current = selectedProjectId
   const [view, setView] = useState<ProjectView>('projects')
   const [showProjectSheet, setShowProjectSheet] = useState(false)
   const [showProjectDeletionSheet, setShowProjectDeletionSheet] = useState(false)
   const [showWorkItemSheet, setShowWorkItemSheet] = useState(false)
   const [showCommandPalette, setShowCommandPalette] = useState(false)
-  const [selectedWorkItem, setSelectedWorkItem] = useState<WorkItem>()
+  const [selectedWorkItemId, setSelectedWorkItemId] = useState<string>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [knowledgeSourceRequest, setKnowledgeSourceRequest] = useState(0)
+  const unavailableProject = projects.find((project) => project.id === selectedProjectId && project.availability && project.availability !== 'available')
+  const projectSnapshot = useProjectSnapshot(api, unavailableProject ? undefined : selectedProjectId, setError)
+  const { metadata: selectedProject, workItems, claims, knowledgeSources, updateItem } = projectSnapshot
+  const selectedWorkItem = workItems.find((item) => item.id === selectedWorkItemId)
+  const setSelectedWorkItem = useCallback((item: WorkItem | undefined): void => {
+    if (item) updateItem(item)
+    setSelectedWorkItemId(item?.id)
+  }, [updateItem])
 
   const startPlanning = useCallback(async (): Promise<void> => {
     if (!selectedProjectId) return
     try {
-      setPlanningProposal(await api.planning.create(selectedProjectId))
+      const sessions = await api.planning.listSessions(selectedProjectId)
+      if (selectedProjectRef.current !== selectedProjectId) return
+      if (sessions.length) setPlanningSessions(sessions)
+      else {
+        const proposal = await api.planning.create(selectedProjectId)
+        if (selectedProjectRef.current === selectedProjectId) setPlanningProposal(proposal)
+      }
     } catch (reason) {
       setError(messageFor(reason))
     }
   }, [api, selectedProjectId])
+
+  useEffect(() => { setPlanningProposal(undefined); setPlanningSessions(undefined); setSelectedWorkItemId(undefined) }, [selectedProjectId])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
@@ -109,7 +139,7 @@ export function App(): JSX.Element {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [selectedProjectId, startPlanning])
+  }, [selectedProjectId, startPlanning, setSelectedWorkItem])
 
   const refreshProjects = useCallback(async () => {
     try {
@@ -119,116 +149,28 @@ export function App(): JSX.Element {
     }
   }, [api])
 
-  const refreshWorkItems = useCallback(
-    async (projectId: string) => {
-      try {
-        setWorkItems(await api.workItems.list(projectId))
-      } catch (reason) {
-        setError(messageFor(reason))
-      }
-    },
-    [api]
-  )
-  const refreshClaims = useCallback(
-    async (projectId: string) => {
-      try {
-        setClaims(await api.claims.list(projectId))
-      } catch (reason) {
-        setError(messageFor(reason))
-      }
-    },
-    [api]
-  )
-  const refreshKnowledge = useCallback(async (projectId: string) => {
-    try {
-      setKnowledgeSources(await api.knowledge.listSources(projectId))
-    } catch (reason) {
-      setError(messageFor(reason))
-    }
-  }, [api])
+  const refreshWorkItems = projectSnapshot.refresh
+  const refreshClaims = projectSnapshot.refresh
+  const refreshKnowledge = projectSnapshot.refresh
 
+  useEffect(() => { void refreshProjects() }, [refreshProjects])
   useEffect(() => {
-    void refreshProjects()
-  }, [refreshProjects])
-
-  useEffect(() => {
-    if (!selectedProjectId && projects[0]) {
-      setSelectedProjectId(projects[0].id)
+    const firstAvailable = projects.find((project) => !project.availability || project.availability === 'available')
+    if (!selectedProjectId && firstAvailable) {
+      setSelectedProjectId(firstAvailable.id)
       setView('overview')
     }
   }, [projects, selectedProjectId])
-
   useEffect(() => {
-    let isCurrent = true
-
-    if (!selectedProjectId) {
-      setSelectedProject(undefined)
-      setWorkItems([])
-      setClaims([])
-      setKnowledgeSources([])
-      return () => {
-        isCurrent = false
-      }
+    let active = true
+    let timer: number | undefined
+    const poll = async (): Promise<void> => {
+      await refreshProjects()
+      if (active) timer = window.setTimeout(() => void poll(), 5_000)
     }
-
-    void api.projects
-      .get(selectedProjectId)
-      .then((project) => {
-        if (isCurrent) {
-          setSelectedProject(project)
-        }
-      })
-      .catch((reason: unknown) => {
-        if (isCurrent) {
-          setError(messageFor(reason))
-        }
-      })
-    void api.workItems
-      .list(selectedProjectId)
-      .then((items) => {
-        if (isCurrent) {
-          setWorkItems(items)
-        }
-      })
-    void api.claims
-      .list(selectedProjectId)
-      .then((nextClaims) => {
-        if (isCurrent) {
-          setClaims(nextClaims)
-        }
-      })
-    void api.knowledge
-      .listSources(selectedProjectId)
-      .then((sources) => {
-        if (isCurrent) {
-          setKnowledgeSources(sources)
-        }
-      })
-      .catch((reason: unknown) => {
-        if (isCurrent) {
-          setError(messageFor(reason))
-        }
-      })
-      .catch((reason: unknown) => {
-        if (isCurrent) {
-          setError(messageFor(reason))
-        }
-      })
-
-    return () => {
-      isCurrent = false
-    }
-  }, [api, selectedProjectId])
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      return
-    }
-    const timer = window.setInterval(() => {
-      void Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId), refreshClaims(selectedProjectId), refreshKnowledge(selectedProjectId)])
-    }, 5_000)
-    return () => window.clearInterval(timer)
-  }, [refreshClaims, refreshKnowledge, refreshProjects, refreshWorkItems, selectedProjectId])
+    timer = window.setTimeout(() => void poll(), 5_000)
+    return () => { active = false; window.clearTimeout(timer) }
+  }, [refreshProjects])
 
   const activeProject = projects.find((project) => project.id === selectedProjectId)
   const openProjectSheet = (): void => {
@@ -253,21 +195,9 @@ export function App(): JSX.Element {
     }
   }
 
-  const createWorkItem = async (input: CreateWorkItemInput, screenshots: File[]): Promise<void> => {
-    if (!selectedProjectId) {
-      return
-    }
-
-    try {
-      const workItem = await api.workItems.create(selectedProjectId, input)
-      for (const screenshot of screenshots) {
-        await api.attachments.pasteImage(selectedProjectId, workItem.id, await toAttachmentPayload(screenshot))
-      }
-      setShowWorkItemSheet(false)
-      await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId)])
-    } catch (reason) {
-      setError(messageFor(reason))
-    }
+  const createWorkItem = async (): Promise<void> => {
+    setShowWorkItemSheet(false)
+    if (selectedProjectId) await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId)])
   }
 
   const updateWorkItem = async (workItemId: string, patch: UpdateWorkItemInput): Promise<void> => {
@@ -275,13 +205,9 @@ export function App(): JSX.Element {
       return
     }
 
-    try {
-      const updated = await api.workItems.update(selectedProjectId, workItemId, patch)
-      setSelectedWorkItem(updated)
-      await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId)])
-    } catch (reason) {
-      setError(messageFor(reason))
-    }
+    const updated = await api.workItems.update(selectedProjectId, workItemId, patch)
+    setSelectedWorkItem(updated)
+    await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId)])
   }
 
   const detachProject = async (): Promise<void> => {
@@ -328,13 +254,13 @@ export function App(): JSX.Element {
     try {
       await api.projects.update(selectedProjectId, input)
       await refreshProjects()
-      setSelectedProject(await api.projects.get(selectedProjectId))
+      await projectSnapshot.refresh(selectedProjectId)
     } catch (reason) {
       setError(messageFor(reason))
     }
   }
 
-  const launchCopilot = async (workItem: WorkItem, prompt: string): Promise<boolean> => {
+  const launchCopilot = async (workItem: WorkItem, prompt: string, approval?: ContextApproval): Promise<boolean> => {
     if (!selectedProjectId) {
       return false
     }
@@ -343,22 +269,17 @@ export function App(): JSX.Element {
       return false
     }
 
-    try {
-      const result = await api.workItems.launchCopilot(selectedProjectId, workItem.id, prompt)
-      await Promise.all([
-        refreshProjects(),
-        refreshWorkItems(selectedProjectId),
-        refreshClaims(selectedProjectId),
-        api.projects.get(selectedProjectId).then(setSelectedProject)
-      ])
-      setNotice(result.started
-        ? `Opened Copilot for ${workItem.displayId} in Terminal.`
-        : `Found an existing pull request for ${workItem.displayId}; it was moved out of the backlog.`)
-      return true
-    } catch (reason) {
-      setError(messageFor(reason))
-      return false
-    }
+    const result = await api.workItems.launchCopilot(selectedProjectId, workItem.id, prompt, approval)
+    await Promise.all([
+      refreshProjects(),
+      refreshWorkItems(selectedProjectId),
+      refreshClaims(selectedProjectId),
+      projectSnapshot.refresh(selectedProjectId)
+    ])
+    setNotice(result.started
+      ? `Opened Copilot for ${workItem.displayId} in Terminal.`
+      : `Found an existing pull request for ${workItem.displayId}; it was moved out of the backlog.`)
+    return true
   }
 
   const forceReleaseWorkItem = async (workItemId: string, reason: string): Promise<void> => {
@@ -395,7 +316,7 @@ export function App(): JSX.Element {
     }
   }
 
-  const restartWorkItem = async (workItem: WorkItem): Promise<void> => {
+  const restartWorkItem = async (workItem: WorkItem, approval?: ContextApproval): Promise<void> => {
     if (!selectedProjectId) {
       return
     }
@@ -405,7 +326,7 @@ export function App(): JSX.Element {
     }
 
     try {
-      await api.workItems.restart(selectedProjectId, workItem.id)
+      await api.workItems.restart(selectedProjectId, workItem.id, approval)
       setNotice(`Restarted Copilot for ${workItem.displayId} in Terminal.`)
       await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId), refreshClaims(selectedProjectId)])
     } catch (reason) {
@@ -436,17 +357,13 @@ export function App(): JSX.Element {
 
   const convertPlanning = async (patch?: Parameters<DesktopApi['planning']['update']>[2]): Promise<void> => {
     if (!selectedProjectId || !planningProposal) return
-    try {
-      if (patch) {
-        await api.planning.update(selectedProjectId, planningProposal.planningSessionId, patch)
-      }
-      await api.planning.convert(selectedProjectId, planningProposal.planningSessionId)
-      setPlanningProposal(undefined)
-      await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId)])
-      setView('backlog')
-    } catch (reason) {
-      setError(messageFor(reason))
+    if (patch) {
+      await api.planning.update(selectedProjectId, planningProposal.planningSessionId, patch)
     }
+    await api.planning.convert(selectedProjectId, planningProposal.planningSessionId)
+    setPlanningProposal(undefined)
+    await Promise.all([refreshProjects(), refreshWorkItems(selectedProjectId)])
+    setView('backlog')
   }
 
   return (
@@ -488,8 +405,11 @@ export function App(): JSX.Element {
             setSelectedProjectId(projectId)
             setView('overview')
           }} />
+        ) : unavailableProject ? (
+          <UnavailableProject api={api} project={unavailableProject} onChanged={refreshProjects} onDetached={() => { setSelectedProjectId(undefined); setView('projects'); void refreshProjects() }} />
         ) : selectedWorkItem ? (
           <WorkItemDetail
+            key={`${activeProject.id}:${selectedWorkItem.id}`}
             api={api}
             item={selectedWorkItem}
             onBack={() => setSelectedWorkItem(undefined)}
@@ -505,6 +425,7 @@ export function App(): JSX.Element {
           />
         ) : (
           <ProjectViewContent
+            key={activeProject.id}
             activeProject={activeProject}
             claims={claims}
             knowledgeSources={knowledgeSources}
@@ -540,10 +461,11 @@ export function App(): JSX.Element {
           onConfirm={deleteProject}
         />
       ) : null}
-      {showWorkItemSheet ? (
-        <WorkItemSheet onCancel={() => setShowWorkItemSheet(false)} onSubmit={createWorkItem} />
+      {showWorkItemSheet && selectedProjectId ? (
+        <WorkItemSheet key={selectedProjectId} api={api} projectId={selectedProjectId} onCancel={() => { setShowWorkItemSheet(false); void refreshWorkItems(selectedProjectId) }} onSubmit={createWorkItem} />
       ) : null}
-      {planningProposal && selectedProjectId ? <PlanningSheet api={api} projectId={selectedProjectId} proposal={planningProposal} onCancel={() => setPlanningProposal(undefined)} onConvert={convertPlanning} onSave={savePlanning} /> : null}
+      {planningSessions && selectedProjectId ? <Modal title="Resume a plan" onCancel={() => setPlanningSessions(undefined)}><ul>{planningSessions.map((proposal) => <li key={proposal.planningSessionId}><button type="button" onClick={() => { setPlanningProposal(proposal); setPlanningSessions(undefined) }}>{proposal.title || 'Untitled plan'} · {formatDateTime(proposal.updatedAt)}</button></li>)}</ul><button className="primary-button" type="button" onClick={() => { const projectId = selectedProjectId; void api.planning.create(projectId).then((proposal) => { if (selectedProjectRef.current === projectId) { setPlanningProposal(proposal); setPlanningSessions(undefined) } }).catch((reason) => setError(messageFor(reason))) }}>Start a new plan</button></Modal> : null}
+      {planningProposal && selectedProjectId ? <PlanningSheet key={planningProposal.planningSessionId} api={api} projectId={selectedProjectId} proposal={planningProposal} onCancel={() => setPlanningProposal(undefined)} onConvert={convertPlanning} onSave={savePlanning} /> : null}
       {showCommandPalette ? (
         <CommandPalette
           activeProject={activeProject}
@@ -758,6 +680,7 @@ function ProjectsHome({
               <button className="project-card" key={project.id} type="button" onClick={() => onOpenProject(project.id)}>
                 <span className="project-card-title">{project.name}</span>
                 <span className="project-card-description">{project.description || 'No project description yet.'}</span>
+                {project.availability && project.availability !== 'available' ? <span className="inline-error">Folder {project.availability} · Open to reconnect or detach</span> : null}
                 <span className="project-counts" aria-label={`${project.backlogCount} backlog, ${project.inProgressCount} active, ${project.completedCount} completed`}>
                   <strong>{project.backlogCount}</strong> Backlog
                   <strong>{project.inProgressCount}</strong> Active
@@ -770,6 +693,21 @@ function ProjectsHome({
       )}
     </>
   )
+}
+
+function UnavailableProject({ api, project, onChanged, onDetached }: { api: DesktopApi; project: ProjectSummary; onChanged(): Promise<void>; onDetached(): void }): JSX.Element {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  return <section className="page-content"><p className="eyebrow">PROJECT UNAVAILABLE</p><h1>{project.name}</h1><p role="status">{project.availabilityError ?? `The project folder is ${project.availability}.`}</p><p>{project.rootPath}</p>
+    {error ? <p className="inline-error" role="alert">{error}</p> : null}
+    <div className="toolbar-actions"><button className="primary-button" disabled={busy || project.availability === 'deleting'} type="button" onClick={() => {
+      setBusy(true); setError(undefined)
+      void api.projects.chooseFolder().then(async (rootPath) => { if (rootPath) { await api.projects.reconnect(project.id, rootPath); await onChanged() } }).catch((reason) => setError(messageFor(reason))).finally(() => setBusy(false))
+    }}>Reconnect folder</button><button className="secondary-button" disabled={busy || project.availability === 'deleting'} type="button" onClick={() => {
+      setBusy(true); setError(undefined)
+      void api.projects.detach(project.id).then(onDetached).catch((reason) => setError(messageFor(reason))).finally(() => setBusy(false))
+    }}>Detach project</button><button className="secondary-button" disabled={busy} type="button" onClick={() => void onChanged()}>Check again</button></div>
+  </section>
 }
 
 function ProjectViewContent({
@@ -803,8 +741,8 @@ function ProjectViewContent({
   onDeleteProject(): void
   onAddKnowledgeSource(input: { displayName: string; filename: string; content: string }): Promise<void>
   onKnowledgeSourceRequestHandled(): void
-  onLaunchCopilot(workItem: WorkItem, prompt: string): Promise<boolean>
-  onRestartWorkItem(workItem: WorkItem): Promise<void>
+  onLaunchCopilot(workItem: WorkItem, prompt: string, approval?: ContextApproval): Promise<boolean>
+  onRestartWorkItem(workItem: WorkItem, approval?: ContextApproval): Promise<void>
   onRestackWorkItem(workItem: WorkItem): Promise<void>
   knowledgeSourceRequest: number
   onOpenFolder(): void
@@ -817,7 +755,7 @@ function ProjectViewContent({
     return <Overview claims={claims} project={activeProject} workItems={workItems} onOpenWorkItem={onOpenWorkItem} />
   }
   if (view === 'agent') {
-    return <AgentPage api={getDesktopApi()} projectId={activeProject.id} />
+    return <AgentPage api={getDesktopApi()} projectId={activeProject.id} projectSettings={metadata?.settings} rootPath={metadata?.rootPath ?? activeProject.rootPath} />
   }
   if (view === 'backlog') {
     return <Backlog api={getDesktopApi()} initialCopilotPrompt={metadata?.settings.copilotLaunchPrompt ?? DEFAULT_COPILOT_LAUNCH_PROMPT} projectId={activeProject.id} workItems={workItems} onCreateWorkItem={onCreateWorkItem} onLaunchCopilot={onLaunchCopilot} onPlanWork={onPlanWork} onOpenWorkItem={onOpenWorkItem} />
@@ -839,6 +777,7 @@ function ProjectViewContent({
   }
   return (
     <ProjectSettings
+      projectId={activeProject.id}
       description={metadata?.description ?? activeProject.description}
       name={metadata?.name ?? activeProject.name}
       projectSettings={metadata?.settings}
@@ -960,7 +899,7 @@ function Backlog({
   api: DesktopApi
   initialCopilotPrompt: string
   onCreateWorkItem(): void
-  onLaunchCopilot(workItem: WorkItem, prompt: string): Promise<boolean>
+  onLaunchCopilot(workItem: WorkItem, prompt: string, approval?: ContextApproval): Promise<boolean>
   onPlanWork(): void
   onOpenWorkItem(workItem: WorkItem): void
   projectId: string
@@ -976,7 +915,7 @@ function Backlog({
   const [attachmentCounts, setAttachmentCounts] = useState<Record<string, number>>({})
   const [copilotWorkItem, setCopilotWorkItem] = useState<WorkItem>()
   const [copilotPrompt, setCopilotPrompt] = useState(initialCopilotPrompt)
-  const [launchingCopilot, setLaunchingCopilot] = useState(false)
+  const [, setLaunchingCopilot] = useState(false)
   const [launchedCopilotWorkItemIds, setLaunchedCopilotWorkItemIds] = useState<Set<string>>(new Set())
   const backlogItems = useMemo(() => workItems.filter((item) => item.status === 'backlog'), [workItems])
 
@@ -1099,15 +1038,16 @@ function Backlog({
       )}
       {copilotWorkItem ? (
         <CopilotLaunchSheet
-          busy={launchingCopilot}
+          api={api}
+          projectId={projectId}
           prompt={copilotPrompt}
           workItem={copilotWorkItem}
           onCancel={() => setCopilotWorkItem(undefined)}
           onPromptChange={setCopilotPrompt}
-          onSubmit={async () => {
+          onSubmit={async (approval) => {
             setLaunchingCopilot(true)
             try {
-              const launched = await onLaunchCopilot(copilotWorkItem, copilotPrompt)
+              const launched = await onLaunchCopilot(copilotWorkItem, copilotPrompt, approval)
               if (launched) {
                 setLaunchedCopilotWorkItemIds((current) => new Set(current).add(copilotWorkItem.id))
                 setCopilotWorkItem(undefined)
@@ -1123,34 +1063,8 @@ function Backlog({
   )
 }
 
-function CopilotLaunchSheet({
-  busy,
-  onCancel,
-  onPromptChange,
-  onSubmit,
-  prompt,
-  workItem
-}: {
-  busy: boolean
-  onCancel(): void
-  onPromptChange(value: string): void
-  onSubmit(): Promise<boolean>
-  prompt: string
-  workItem: WorkItem
-}): JSX.Element {
-  return (
-    <Modal title={`Start Copilot for ${workItem.displayId}`} onCancel={onCancel}>
-      <form className="copilot-launch-form" onSubmit={(event) => { event.preventDefault(); void onSubmit() }}>
-        <p>Copilot will open in a new Terminal session for <strong>{workItem.displayId} - {workItem.title}</strong>. Workstack MCP will be available for this session.</p>
-        <label className="field-label">Initial prompt<textarea aria-label="Initial Copilot prompt" required value={prompt} onChange={(event) => onPromptChange(event.target.value)} /></label>
-        <p className="muted">Changes become this project&apos;s default prompt when you start Copilot.</p>
-        <div className="modal-actions">
-          <button className="secondary-button" disabled={busy} type="button" onClick={onCancel}>Cancel</button>
-          <button className="primary-button" disabled={busy || !prompt.trim()} type="submit">{busy ? 'Opening...' : 'Start Copilot'}</button>
-        </div>
-      </form>
-    </Modal>
-  )
+function CopilotLaunchSheet({ api, projectId, onCancel, onPromptChange, onSubmit, prompt, workItem }: { api: DesktopApi; projectId: string; onCancel(): void; onPromptChange(value: string): void; onSubmit(approval: ContextApproval): Promise<boolean>; prompt: string; workItem: WorkItem }): JSX.Element {
+  return <TaskContextDialog api={api} projectId={projectId} workItem={workItem} mode="start" prompt={prompt} onPromptChange={onPromptChange} onExecute={onSubmit} onClose={onCancel} />
 }
 
 function WorkItemHistory({
@@ -1236,11 +1150,12 @@ function ActiveWorkPage({
   claims: WorkClaim[]
   items: WorkItem[]
   onOpenWorkItem(workItem: WorkItem): void
-  onRestart(workItem: WorkItem): Promise<void>
+  onRestart(workItem: WorkItem, approval?: ContextApproval): Promise<void>
   onRestack(workItem: WorkItem): Promise<void>
   projectId: string
 }): JSX.Element {
   const [agentDetail, setAgentDetail] = useState<{ claim: WorkClaim; item: WorkItem }>()
+  const [restartPreview, setRestartPreview] = useState<WorkItem>()
   const [restartingWorkItemId, setRestartingWorkItemId] = useState<string>()
   const [restackingWorkItemId, setRestackingWorkItemId] = useState<string>()
   return (
@@ -1252,10 +1167,7 @@ function ActiveWorkPage({
         claims={claims}
         items={items}
         onOpenWorkItem={onOpenWorkItem}
-        onRestart={(item) => {
-          setRestartingWorkItemId(item.id)
-          void onRestart(item).catch(() => undefined).finally(() => setRestartingWorkItemId(undefined))
-        }}
+        onRestart={setRestartPreview}
         restartingWorkItemId={restartingWorkItemId}
         onRestack={(item) => {
           setRestackingWorkItemId(item.id)
@@ -1265,6 +1177,7 @@ function ActiveWorkPage({
         onViewAgentDetails={(claim, item) => setAgentDetail({ claim, item })}
       />
       {agentDetail ? <AgentDetailSheet api={api} claim={agentDetail.claim} item={agentDetail.item} projectId={projectId} onCancel={() => setAgentDetail(undefined)} /> : null}
+      {restartPreview ? <TaskContextDialog api={api} projectId={projectId} workItem={restartPreview} mode="restart" onClose={() => setRestartPreview(undefined)} onExecute={async (approval) => { setRestartingWorkItemId(restartPreview.id); try { await onRestart(restartPreview, approval) } finally { setRestartingWorkItemId(undefined) } }} /> : null}
     </section>
   )
 }
@@ -1462,7 +1375,16 @@ function KnowledgePage({
   workItems: WorkItem[]
   onOpenWorkItem(workItem: WorkItem): void
 }): JSX.Element {
+  const [showProjectImport, setShowProjectImport] = useState(false)
+  const [showKnowledgeRecords, setShowKnowledgeRecords] = useState(false)
+  const [showProjectDirectory, setShowProjectDirectory] = useState(false)
+  const [selectedKnowledgeRecord, setSelectedKnowledgeRecord] = useState<string>()
+  const [selectedDirectoryEntity, setSelectedDirectoryEntity] = useState<string>()
+  const [catalogSourceIds, setCatalogSourceIds] = useState<string[]>([])
+  const [catalogKey, setCatalogKey] = useState(0)
+  const [exactCitation, setExactCitation] = useState<SourceCitation>()
   const [query, setQuery] = useState('')
+  const searchGeneration = useRef(0)
   const [retrieval, setRetrieval] = useState<ProjectKnowledgeRetrieval>()
   const [preview, setPreview] = useState<KnowledgeRetrievalResult>()
   const [showSourceSheet, setShowSourceSheet] = useState(false)
@@ -1470,6 +1392,7 @@ function KnowledgePage({
   const [displaySources, setDisplaySources] = useState(sources)
   const [articles, setArticles] = useState<import('../../core/knowledge').WikiArticle[]>([])
   const [editingArticle, setEditingArticle] = useState<import('../../core/knowledge').WikiArticle>()
+  const [readingArticle, setReadingArticle] = useState<import('../../core/knowledge').WikiArticle>()
   const [automationMessage, setAutomationMessage] = useState<string>()
   const [automationError, setAutomationError] = useState<string>()
   const [wikiReports, setWikiReports] = useState<WikiAutomationJobReport[]>([])
@@ -1480,6 +1403,7 @@ function KnowledgePage({
   const wikiAutomation = api.wikiAutomation as Partial<DesktopApi['wikiAutomation']>
   const supportsKnowledgeAutomation = typeof knowledgeAutomation.processNext === 'function'
     && typeof knowledgeAutomation.retryFailed === 'function'
+  const originalSources = displaySources.filter((source) => !catalogSourceIds.includes(source.id))
   const pendingSourceCount = displaySources.filter((source) => source.status === 'pending').length
   const failedSourceCount = displaySources.filter((source) => source.status === 'failed').length
   const hasActiveCodebaseRescan = wikiReports.some((report) =>
@@ -1521,11 +1445,12 @@ function KnowledgePage({
 
   const search = (value: string): void => {
     setQuery(value)
-    if (!value.trim()) {
-      setRetrieval(undefined)
-      return
-    }
-    void api.knowledge.retrieve(projectId, value).then(setRetrieval)
+    const generation = ++searchGeneration.current
+    setRetrieval(undefined)
+    if (!value.trim()) return
+    void api.knowledge.retrieve(projectId, value)
+      .then((result) => { if (generation === searchGeneration.current) setRetrieval(result) })
+      .catch((reason) => { if (generation === searchGeneration.current) setAutomationError(messageFor(reason)) })
   }
 
   const refreshSources = async (): Promise<void> => {
@@ -1594,7 +1519,52 @@ function KnowledgePage({
           <button className="primary-button" type="button" onClick={() => setShowSourceSheet(true)}>+ Add Source</button>
         </div>
       </div>
-      <p className="page-intro">Keep source evidence durable and searchable. Manual sources are preserved separately from future maintained wiki articles.</p>
+      <p className="page-intro">Keep source evidence durable and searchable. Inspect source readiness and exact revisions before using them as task context.</p>
+      <div className="toolbar-actions knowledge-context-actions">
+        {api.knowledgeRecords ? <button className="secondary-button" type="button" onClick={() => setShowKnowledgeRecords(true)}>Decisions, requirements and risks</button> : null}
+        {api.projectDirectory ? <button className="secondary-button" type="button" onClick={() => setShowProjectDirectory(true)}>Components and glossary</button> : null}
+      </div>
+      <label className="search-field">
+        <span className="sr-only">Search knowledge</span>
+        <input aria-label="Search knowledge" placeholder="Search knowledge" type="search" value={query} onChange={(event) => search(event.target.value)} />
+      </label>
+      {query ? (
+        <section className="knowledge-results" aria-label="Knowledge retrieval results">
+          {retrieval?.results.length ? (
+            <>
+              <p className="retrieval-summary" role="status">{retrieval.results.length} project records · {retrieval.mode === 'hybrid' ? 'hybrid lexical and semantic' : 'lexical'} retrieval.{retrieval.fallbackReason ? ` ${retrieval.fallbackReason}` : ''}{retrieval.truncated ? ' Result limits reached; narrow the search for additional evidence.' : ''}</p>
+              {retrieval.groups.map((group) => group.results.length ? (
+                <section className="retrieval-group" key={group.sourceType} aria-labelledby={`retrieval-${group.sourceType}`}>
+                  <h2 id={`retrieval-${group.sourceType}`}>{group.label}</h2>
+                  <ul>
+                    {group.results.map((result) => (
+                      <li key={result.sourceId}>
+                        <button type="button" className="retrieval-result" onClick={() => {
+                          if (result.recordId && api.knowledgeRecords) { setSelectedKnowledgeRecord(result.recordId); setShowKnowledgeRecords(true); return }
+                          if (result.entityId && api.projectDirectory) { setSelectedDirectoryEntity(result.entityId); setShowProjectDirectory(true); return }
+                          if ('citation' in result && result.citation && api.sourceCatalog) { setExactCitation(result.citation as SourceCitation); return }
+                          const article = articles.find((entry) => `wiki:${entry.slug}` === result.sourceId)
+                          if (article) setReadingArticle(article)
+                          else setPreview(result)
+                          if (result.workItemId) {
+                            const item = workItems.find((candidate) => candidate.id === result.workItemId)
+                            if (item) onOpenWorkItem(item)
+                          }
+                        }}>
+                          <span className="retrieval-result-title">{result.title}</span>
+                          <span className="retrieval-result-excerpt">{result.excerpt}</span>
+                          <span className="retrieval-provenance">{sourceTypeLabel(result.sourceType)} · {result.location}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null)}
+            </>
+          ) : <p className="muted">No project records match this search.</p>}
+        </section>
+      ) : null}
+      {api.sourceCatalog ? <SourceCatalogPanel key={catalogKey} api={api} projectId={projectId} onSourcesChanged={setCatalogSourceIds} onImport={() => setShowProjectImport(true)} /> : null}
       {supportsKnowledgeAutomation ? (
         <section className="knowledge-automation" aria-labelledby="knowledge-automation-heading">
           <div>
@@ -1609,6 +1579,7 @@ function KnowledgePage({
           {automationError ? <p className="inline-error" role="alert">{automationError}</p> : null}
         </section>
       ) : null}
+      {api.knowledgeDelivery ? <KnowledgeDeliveryPanel api={api} projectId={projectId} workItems={workItems} /> : null}
       {wikiAutomation.listReports ? (
         <section className="knowledge-automation wiki-automation" aria-labelledby="wiki-automation-heading">
           <div>
@@ -1634,69 +1605,42 @@ function KnowledgePage({
           ))}</ul> : <p className="muted">No wiki automation jobs yet.</p>}
         </section>
       ) : null}
-      <label className="search-field">
-        <span className="sr-only">Search knowledge</span>
-        <input aria-label="Search knowledge" placeholder="Search knowledge" type="search" value={query} onChange={(event) => search(event.target.value)} />
-      </label>
-      {query ? (
-        <section className="knowledge-results" aria-label="Knowledge retrieval results">
-          {retrieval?.results.length ? (
-            <>
-              <p className="retrieval-summary" role="status">{retrieval.results.length} project records, ranked by lexical relevance.</p>
-              {retrieval.groups.map((group) => group.results.length ? (
-                <section className="retrieval-group" key={group.sourceType} aria-labelledby={`retrieval-${group.sourceType}`}>
-                  <h2 id={`retrieval-${group.sourceType}`}>{group.label}</h2>
-                  <ul>
-                    {group.results.map((result) => (
-                      <li key={result.sourceId}>
-                        <button type="button" className="retrieval-result" onClick={() => {
-                          setPreview(result)
-                          if (result.workItemId) {
-                            const item = workItems.find((candidate) => candidate.id === result.workItemId)
-                            if (item) onOpenWorkItem(item)
-                          }
-                        }}>
-                          <span className="retrieval-result-title">{result.title}</span>
-                          <span className="retrieval-result-excerpt">{result.excerpt}</span>
-                          <span className="retrieval-provenance">{sourceTypeLabel(result.sourceType)} · {result.location}</span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              ) : null)}
-            </>
-          ) : <p className="muted">No project records match this search.</p>}
-        </section>
-      ) : (
+      {api.wikiRevisions ? <WikiReviewPanel api={api} projectId={projectId} onPublished={() => { void api.knowledge.listWiki(projectId).then(setArticles).catch((reason) => setAutomationError(messageFor(reason))) }} /> : null}
+      {!query ? (
         <>
-        <section className="knowledge-sources" aria-labelledby="sources-heading">
-          <h2 id="sources-heading">Sources</h2>
-          {displaySources.length ? <ul>{displaySources.map((source) => <li key={source.id}><strong>{source.displayName}</strong><span>{source.kind} · {source.status}</span><small>{source.relativeOrExternalLocation}</small></li>)}</ul> : <div className="inline-empty"><h2>Your knowledge base is empty</h2><p>Build your project knowledge. Add existing documentation or let Workstack accumulate knowledge as work is completed.</p><button className="primary-button" type="button" onClick={() => setShowSourceSheet(true)}>Add Knowledge Source</button></div>}
-        </section>
+        {originalSources.length || !api.sourceCatalog ? <section className="knowledge-sources" aria-labelledby="sources-heading">
+          <h2 id="sources-heading">Original imports</h2>
+          {originalSources.length ? <ul>{originalSources.map((source) => <li key={source.id}><strong>{source.displayName}</strong><span>{source.kind} · {source.status}</span><small>{source.relativeOrExternalLocation}</small></li>)}</ul> : <div className="inline-empty"><h2>Your knowledge base is empty</h2><p>Build your project knowledge. Add existing documentation or let Workstack accumulate knowledge as work is completed.</p><button className="primary-button" type="button" onClick={() => setShowSourceSheet(true)}>Add Knowledge Source</button></div>}
+        </section> : null}
         <section className="knowledge-sources" aria-labelledby="wiki-heading">
           <h2 id="wiki-heading">Maintained wiki</h2>
           {articles.length ? <ul>{articles.map((article) => {
             const generated = article.slug.startsWith('generated-')
-            return <li key={article.slug}>{generated ? <span>{article.slug}</span> : <button type="button" onClick={() => setEditingArticle(article)}>{article.slug}</button>}<small>{generated ? 'Generated by automation · read-only' : 'Manual · editable'}</small></li>
+            return <li key={article.slug}><button type="button" onClick={() => setReadingArticle(article)}>{article.slug}</button><small>{generated ? 'Generated by automation · read-only' : 'Manual · editable'}</small></li>
           })}</ul> : <p className="muted">No maintained articles yet.</p>}
         </section>
         </>
-      )}
+      ) : null}
+      {showProjectImport ? <SourceImportSheet api={api} projectId={projectId} workItems={workItems} onClose={() => setShowProjectImport(false)} onImported={() => { setShowProjectImport(false); setCatalogKey((value) => value + 1) }} /> : null}
+      {showKnowledgeRecords ? <KnowledgeRecordsPanel api={api} projectId={projectId} workItems={workItems} initialRecordId={selectedKnowledgeRecord} onClose={() => { setShowKnowledgeRecords(false); setSelectedKnowledgeRecord(undefined) }} /> : null}
+      {showProjectDirectory ? <ProjectDirectoryPanel api={api} projectId={projectId} workItems={workItems} initialEntityId={selectedDirectoryEntity} onClose={() => { setShowProjectDirectory(false); setSelectedDirectoryEntity(undefined) }} /> : null}
+      {exactCitation ? <SourceCitationReader api={api} projectId={projectId} citation={exactCitation} onClose={() => setExactCitation(undefined)} /> : null}
       {preview && !preview.workItemId ? <KnowledgeProvenancePreview result={preview} onClose={() => setPreview(undefined)} /> : null}
       {showSourceSheet ? <KnowledgeSourceSheet onCancel={() => setShowSourceSheet(false)} onSubmit={async (input) => { await onAddSource(input); setShowSourceSheet(false) }} /> : null}
+      {readingArticle ? <WikiArticleReader article={readingArticle} onClose={() => setReadingArticle(undefined)} onEdit={() => { setEditingArticle(readingArticle); setReadingArticle(undefined) }} /> : null}
       {editingArticle ? <WikiArticleSheet article={editingArticle} onCancel={() => setEditingArticle(undefined)} onSave={async (article) => { const saved = await api.knowledge.saveWiki(projectId, article.slug, article.content); setArticles(await api.knowledge.listWiki(projectId)); setEditingArticle(saved) }} /> : null}
     </section>
   )
 }
 
-function AgentPage({ api, projectId }: { api: DesktopApi; projectId: string }): JSX.Element {
+function AgentPage({ api, projectId, projectSettings, rootPath }: { api: DesktopApi; projectId: string; projectSettings?: ProjectMetadata['settings']; rootPath: string }): JSX.Element {
   const [chatSession, setChatSession] = useState<KnowledgeChatSession>()
   const [chatMessages, setChatMessages] = useState<KnowledgeChatMessage[]>([])
   const [chatToolCalls, setChatToolCalls] = useState<KnowledgeChatToolCall[]>([])
   const [chatPendingActions, setChatPendingActions] = useState<KnowledgeChatPendingAction[]>([])
   const [chatInput, setChatInput] = useState('')
   const [chatBusy, setChatBusy] = useState(false)
+  const chatRequest = useRef<string>()
   const [chatError, setChatError] = useState<string>()
   const [conversationReady, setConversationReady] = useState(false)
 
@@ -1736,18 +1680,26 @@ function AgentPage({ api, projectId }: { api: DesktopApi; projectId: string }): 
     setChatPendingActions(turn.pendingActions)
   }
   const sendChatMessage = async (): Promise<void> => {
-    if (!chatSession || !chatInput.trim()) return
+    if (!chatSession || !chatInput.trim() || chatRequest.current) return
+    const requestId = crypto.randomUUID()
+    chatRequest.current = requestId
     setChatBusy(true)
     setChatError(undefined)
     try {
-      applyChatTurn(await api.knowledgeChat.sendMessage(projectId, chatSession.id, chatInput))
+      applyChatTurn(await api.knowledgeChat.sendMessage(projectId, chatSession.id, chatInput, requestId))
       setChatInput('')
     } catch (reason) {
       setChatError(messageFor(reason))
+      try {
+        setChatMessages(await api.knowledgeChat.listMessages(projectId, chatSession.id))
+        setChatToolCalls(await api.knowledgeChat.listToolCalls(projectId, chatSession.id))
+      } catch { /* The original request error is more useful; retry can reload history. */ }
     } finally {
+      chatRequest.current = undefined
       setChatBusy(false)
     }
   }
+  useEffect(() => () => { if (chatRequest.current) void api.ai.cancel(chatRequest.current) }, [api])
   const approveChatAction = async (actionId: string): Promise<void> => {
     if (!chatSession) return
     setChatBusy(true)
@@ -1778,6 +1730,8 @@ function AgentPage({ api, projectId }: { api: DesktopApi; projectId: string }): 
       <div className="page-toolbar">
         <div><p className="eyebrow">PROJECT AGENT</p><h1 id="agent-heading">Agent</h1></div>
       </div>
+      <p className="muted">Agent profile: {projectSettings?.knowledgeChatProfile ?? 'inspection'} · Project: {rootPath}. {projectSettings?.knowledgeChatProfile === 'advanced' ? 'Shell commands can access your user account, files, network and processes.' : 'Bounded project reads and reviewed task proposals. Shell access is disabled.'}</p>
+      {chatRequest.current ? <button className="secondary-button" type="button" onClick={() => { if (chatRequest.current) void api.ai.cancel(chatRequest.current) }}>Cancel request</button> : null}
       <KnowledgeChatPanel
         busy={chatBusy}
         error={chatError}
@@ -2017,13 +1971,26 @@ function sourceTypeLabel(sourceType: KnowledgeRetrievalResult['sourceType']): st
   return sourceType.replace('_', ' ')
 }
 
+function WikiArticleReader({ article, onClose, onEdit }: { article: import('../../core/knowledge').WikiArticle; onClose(): void; onEdit(): void }): JSX.Element {
+  const generated = article.slug.startsWith('generated-')
+  return <Modal className="wiki-reader" title={article.slug} onCancel={onClose}>
+    <p className="muted">{generated ? 'Generated by automation · read-only' : 'Manual article'}</p>
+    <p className="retrieval-provenance">Source: wiki:{article.slug} · knowledge/wiki/{article.slug}.md</p>
+    <MarkdownDocument content={article.content} />
+    <div className="modal-actions"><button className="secondary-button" type="button" onClick={onClose}>Back to knowledge</button>{!generated ? <button className="primary-button" type="button" onClick={onEdit}>Edit article</button> : null}</div>
+  </Modal>
+}
+
 function WikiArticleSheet({ article, onCancel, onSave }: { article: import('../../core/knowledge').WikiArticle; onCancel(): void; onSave(article: import('../../core/knowledge').WikiArticle): Promise<void> }): JSX.Element {
   const [slug, setSlug] = useState(article.slug)
   const [content, setContent] = useState(article.content)
-  return <Modal title="Wiki Article" onCancel={onCancel}><form onKeyDown={submitOnMetaEnter} onSubmit={(event) => { event.preventDefault(); void onSave({ slug, content }) }}>
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string>()
+  return <Modal title="Wiki Article" onCancel={onCancel}><form onKeyDown={submitOnMetaEnter} onSubmit={(event) => { event.preventDefault(); if (saving) return; setSaving(true); setError(undefined); void onSave({ slug, content }).catch((reason) => setError(messageFor(reason))).finally(() => setSaving(false)) }}>
+    {error ? <p className="inline-error" role="alert">{error}</p> : null}
     <label className="field-label">Article name<input aria-label="Article name" required value={slug} onChange={(event) => setSlug(event.target.value)} /></label>
     <label className="field-label">Article content<textarea aria-label="Article content" value={content} onChange={(event) => setContent(event.target.value)} /></label>
-    <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Close</button><button className="primary-button" type="submit">Save article</button></div>
+    <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Close</button><button className="primary-button" disabled={saving} type="submit">{saving ? 'Saving article...' : 'Save article'}</button></div>
   </form></Modal>
 }
 
@@ -2037,13 +2004,17 @@ function KnowledgeSourceSheet({
   const [displayName, setDisplayName] = useState('')
   const [filename, setFilename] = useState('notes.md')
   const [content, setContent] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string>()
+  const submitting = useRef(false)
   return (
     <Modal title="Add Knowledge Source" onCancel={onCancel}>
-      <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => { event.preventDefault(); void onSubmit({ displayName, filename, content }) }}>
+      <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => { event.preventDefault(); if (submitting.current) return; submitting.current = true; setSaving(true); setError(undefined); void onSubmit({ displayName, filename, content }).catch((reason) => setError(messageFor(reason))).finally(() => { submitting.current = false; setSaving(false) }) }}>
+        {error ? <p className="inline-error" role="alert">{error}</p> : null}
         <label className="field-label">Source name<input required aria-label="Source name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
         <label className="field-label">Filename<input required aria-label="Source filename" value={filename} onChange={(event) => setFilename(event.target.value)} /></label>
         <label className="field-label">Source content<textarea required aria-label="Source content" value={content} onChange={(event) => setContent(event.target.value)} /></label>
-        <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button><button className="primary-button" type="submit">Add Source</button></div>
+        <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button><button className="primary-button" disabled={saving} type="submit">{saving ? 'Saving source…' : 'Add Source'}</button></div>
       </form>
     </Modal>
   )
@@ -2073,33 +2044,59 @@ function WorkItemDetail({
   const [editing, setEditing] = useState(false)
   const [showReleaseSheet, setShowReleaseSheet] = useState(false)
   const [showAgentDetails, setShowAgentDetails] = useState(false)
+  const [showContext, setShowContext] = useState(false)
   const [title, setTitle] = useState(item.title)
   const [description, setDescription] = useState(item.descriptionMarkdown)
   const [criteria, setCriteria] = useState(item.acceptanceCriteriaMarkdown)
   const [priority, setPriority] = useState(item.priority)
   const [completion, setCompletion] = useState<CompletionRecord>()
+  const [history, setHistory] = useState<CompletionRecord[]>([])
+  const [checkpoints, setCheckpoints] = useState<import('../../core/types').WorkCheckpoint[]>([])
+  const [recoveryReason, setRecoveryReason] = useState('')
+  const [recovering, setRecovering] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string>()
+  const saveInFlight = useRef(false)
   const { attachments, attachFiles, pasteImage, previewUrls, removeAttachment } = useWorkItemAttachments(
     api,
     projectId,
     item.id,
     onError,
-    onItemChanged
+    onItemChanged,
+    (attachment) => {
+      if (!editing) return
+      const markdown = `![${attachment.originalFilename}](attachments/${attachment.storedRelativePath.split('/').at(-1)})`
+      setDescription((current) => current.includes(markdown) ? current : [current, markdown].filter(Boolean).join('\n\n'))
+    }
   )
 
   useEffect(() => {
+    if (editing) return
     setTitle(item.title)
     setDescription(item.descriptionMarkdown)
     setCriteria(item.acceptanceCriteriaMarkdown)
     setPriority(item.priority)
-  }, [item])
+  }, [editing, item.title, item.descriptionMarkdown, item.acceptanceCriteriaMarkdown, item.priority])
 
   useEffect(() => {
     if (item.status !== 'completed') {
       setCompletion(undefined)
       return
     }
-    void api.claims.getCompletion(projectId, item.id).then(setCompletion).catch((reason) => onError(messageFor(reason)))
-  }, [api, item.id, item.status, onError, projectId])
+    let active = true
+    void api.claims.getCompletion(projectId, item.id)
+      .then((result) => { if (active) setCompletion(result) })
+      .catch((reason) => { if (active) onError(messageFor(reason)) })
+    return () => { active = false }
+  }, [api, item.id, item.status, item.updatedAt, onError, projectId])
+
+  useEffect(() => {
+    let active = true
+    void Promise.all([api.workItems.checkpoints(projectId, item.id), api.workItems.completionHistory(projectId, item.id)])
+      .then(([entries, attempts]) => { if (active) { setCheckpoints(entries); setHistory(attempts) } })
+      .catch((reason) => { if (active) onError(messageFor(reason)) })
+    return () => { active = false }
+  }, [api, item.id, item.updatedAt, projectId, onError])
 
   const handleEditorPaste = (event: ClipboardEvent<HTMLTextAreaElement>): void => {
     const image = Array.from(event.clipboardData.files).find((file) => file.type.startsWith('image/'))
@@ -2116,7 +2113,8 @@ function WorkItemDetail({
         <div className="detail-actions">
           <TypeBadge type={item.type} />
           <StatusBadge status={item.status} />
-          <button className="secondary-button" type="button" onClick={() => setEditing((value) => !value)}>
+          {api.contextPackets ? <button className="secondary-button" type="button" onClick={() => setShowContext(true)}>Inspect task context</button> : null}
+          <button className="secondary-button" disabled={saving} type="button" onClick={() => { setSaveError(undefined); setEditing((value) => !value) }}>
             {editing ? 'Cancel edit' : 'Edit'}
           </button>
         </div>
@@ -2130,13 +2128,26 @@ function WorkItemDetail({
               <label className="field-label">Description<textarea aria-label="Work item description" value={description} onChange={(event) => setDescription(event.target.value)} onPaste={handleEditorPaste} /></label>
               <label className="field-label">Acceptance criteria<textarea aria-label="Work item acceptance criteria" value={criteria} onChange={(event) => setCriteria(event.target.value)} /></label>
               <label className="field-label">Priority<select aria-label="Work item priority" value={priority} onChange={(event) => setPriority(event.target.value as WorkItem['priority'])}><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
-              <button className="primary-button" type="button" onClick={() => {
-                void onSave({ title, descriptionMarkdown: description, acceptanceCriteriaMarkdown: criteria, priority }).then(() => setEditing(false))
-              }}>Save changes</button>
+              {saveError ? <p className="inline-error" role="alert">{saveError}</p> : null}
+              <button className="primary-button" disabled={saving || !title.trim()} type="button" onClick={() => {
+                if (saveInFlight.current) return
+                saveInFlight.current = true
+                setSaving(true)
+                setSaveError(undefined)
+                void onSave({ title, descriptionMarkdown: description, acceptanceCriteriaMarkdown: criteria, priority })
+                  .then(() => setEditing(false))
+                  .catch((reason) => setSaveError(messageFor(reason)))
+                  .finally(() => { saveInFlight.current = false; setSaving(false) })
+              }}>{saving ? 'Saving changes...' : 'Save changes'}</button>
             </>
           ) : (
             <>
               <h1 id="work-item-heading">{item.title}</h1>
+              {item.attentionReason ? <p className="inline-error" role="status">Attention: {item.attentionReason}</p> : null}
+              {item.status === 'in_progress' && !claim ? <form onSubmit={(event) => {
+                event.preventDefault(); if (recovering) return; setRecovering(true)
+                void api.workItems.recover(projectId, item.id, { reason: recoveryReason }).then(onItemChanged).catch((reason) => onError(messageFor(reason))).finally(() => setRecovering(false))
+              }}><label className="field-label">Recovery reason<input required aria-label="Recovery reason" value={recoveryReason} onChange={(event) => setRecoveryReason(event.target.value)} /></label><button className="secondary-button" disabled={recovering || !recoveryReason.trim()} type="submit">Return to backlog</button></form> : null}
               {claim ? (
                 <ClaimStatusStrip claim={claim} onForceRelease={() => setShowReleaseSheet(true)} onViewAgentDetails={() => setShowAgentDetails(true)} />
               ) : null}
@@ -2151,6 +2162,9 @@ function WorkItemDetail({
               ) : null}
             </>
           )}
+          {api.taskDependencies ? <TaskDependenciesPanel key={`${projectId}:${item.id}`} api={api} projectId={projectId} workItem={item} onOpenTask={(id) => { void api.workItems.get(projectId, id).then(onItemChanged).catch((reason) => onError(messageFor(reason))) }} /> : null}
+          {checkpoints.length ? <section className="document-section"><h2>Agent checkpoints</h2>{checkpoints.map((entry) => <details key={entry.id}><summary>{formatDateTime(entry.createdAt)} · {entry.agentId ?? 'Agent'}</summary><MarkdownDocument content={entry.progressMarkdown} />{entry.validationMarkdown ? <DocumentSection title="Validation">{entry.validationMarkdown}</DocumentSection> : null}{entry.nextActionsMarkdown ? <DocumentSection title="Next actions">{entry.nextActionsMarkdown}</DocumentSection> : null}{entry.questionsMarkdown ? <DocumentSection title="Questions">{entry.questionsMarkdown}</DocumentSection> : null}</details>)}</section> : null}
+          {history.length > 1 ? <section className="document-section"><h2>Completion history</h2>{history.map((entry, index) => <details key={`${entry.createdAt}:${index}`}><summary>{formatDateTime(entry.createdAt)} · {entry.completedByAgentId ?? 'Agent'}</summary><MarkdownDocument content={entry.summaryMarkdown} /><DocumentSection title="Validation">{entry.validationMarkdown}</DocumentSection></details>)}</section> : null}
           <AttachmentPanel
             attachments={attachments}
             onAttachFiles={attachFiles}
@@ -2163,6 +2177,7 @@ function WorkItemDetail({
           <p className="eyebrow">DETAILS</p>
           <dl>
             <dt>Status</dt><dd><StatusBadge status={item.status} /></dd>
+            {item.deliveryState ? <><dt>Delivery</dt><dd>{item.deliveryState === 'awaiting_review' ? 'Awaiting review' : item.deliveryState === 'merged' ? 'Merged' : 'Pull request closed'}</dd></> : null}
             <dt>Priority</dt><dd><PriorityBadge priority={item.priority} /></dd>
             <dt>Type</dt><dd><TypeBadge type={item.type} /></dd>
             <dt>Created</dt><dd>{formatDate(item.createdAt)}</dd>
@@ -2179,6 +2194,7 @@ function WorkItemDetail({
         </aside>
       </div>
       {showAgentDetails && claim ? <AgentDetailSheet api={api} claim={claim} item={item} projectId={projectId} onCancel={() => setShowAgentDetails(false)} /> : null}
+      {showContext ? <TaskContextDialog api={api} projectId={projectId} workItem={item} onClose={() => setShowContext(false)} /> : null}
       {showReleaseSheet && claim ? (
         <ReleaseClaimSheet
           claim={claim}
@@ -2267,7 +2283,8 @@ function useWorkItemAttachments(
   projectId: string,
   workItemId: string,
   onError: (message: string) => void,
-  onItemChanged: (item: WorkItem) => void
+  onItemChanged: (item: WorkItem) => void,
+  onPastedImage: (attachment: Attachment) => void
 ): {
   attachments: Attachment[]
   attachFiles(files: File[]): Promise<void>
@@ -2315,14 +2332,15 @@ function useWorkItemAttachments(
   const pasteImage = useCallback(
     async (file: File) => {
       try {
-        await api.attachments.pasteImage(projectId, workItemId, await toAttachmentPayload(file))
+        const attachment = await api.attachments.pasteImage(projectId, workItemId, await toAttachmentPayload(file))
+        onPastedImage(attachment)
         onItemChanged(await api.workItems.get(projectId, workItemId))
         await reload()
       } catch (reason) {
         onError(messageFor(reason))
       }
     },
-    [api, onError, onItemChanged, projectId, reload, workItemId]
+    [api, onError, onItemChanged, onPastedImage, projectId, reload, workItemId]
   )
 
   const removeAttachment = useCallback(
@@ -2499,6 +2517,7 @@ function renderMarkdownContent(
 
 function ProjectSettings({
   description,
+  projectId,
   name,
   onDetach,
   onDelete,
@@ -2508,6 +2527,7 @@ function ProjectSettings({
   rootPath
 }: {
   description: string
+  projectId: string
   name: string
   onDetach(): void
   onDelete(): void
@@ -2522,7 +2542,9 @@ function ProjectSettings({
     defaultLeaseSeconds: projectSettings?.defaultLeaseSeconds ?? 1800,
     heartbeatSeconds: projectSettings?.heartbeatSeconds ?? 300,
     autoReleaseExpiredClaims: projectSettings?.autoReleaseExpiredClaims ?? true,
-    autoUpdateKnowledgeOnCompletion: projectSettings?.autoUpdateKnowledgeOnCompletion ?? true
+    autoUpdateKnowledgeOnCompletion: projectSettings?.autoUpdateKnowledgeOnCompletion ?? true,
+    agentExecutionProfile: projectSettings?.agentExecutionProfile ?? 'inspection',
+    knowledgeChatProfile: projectSettings?.knowledgeChatProfile ?? 'inspection'
   })
   useEffect(() => {
     if (projectSettings) {
@@ -2530,7 +2552,9 @@ function ProjectSettings({
         defaultLeaseSeconds: projectSettings.defaultLeaseSeconds,
         heartbeatSeconds: projectSettings.heartbeatSeconds,
         autoReleaseExpiredClaims: projectSettings.autoReleaseExpiredClaims,
-        autoUpdateKnowledgeOnCompletion: projectSettings.autoUpdateKnowledgeOnCompletion
+        autoUpdateKnowledgeOnCompletion: projectSettings.autoUpdateKnowledgeOnCompletion,
+        agentExecutionProfile: projectSettings.agentExecutionProfile ?? 'inspection',
+        knowledgeChatProfile: projectSettings.knowledgeChatProfile ?? 'inspection'
       })
     }
   }, [projectSettings])
@@ -2552,6 +2576,9 @@ function ProjectSettings({
         </section>
         <section className="settings-section" aria-labelledby="agent-settings-heading">
           <h2 id="agent-settings-heading">Agents</h2>
+          <label className="field-label">Copilot execution profile<select aria-label="Copilot execution profile" value={draftSettings.agentExecutionProfile} onChange={(event) => setDraftSettings((current) => ({ ...current, agentExecutionProfile: event.target.value as 'inspection' | 'implementation' | 'advanced' }))}><option value="inspection">Inspection</option><option value="implementation">Implementation</option><option value="advanced">Advanced — full user access</option></select></label>
+          <p className="muted">Inspection and Implementation require enforceable runtime limits. Workstack checks support before launch. Advanced permits files outside the workspace, writes, network access and external processes.</p>
+          <label className="field-label">Project chat profile<select aria-label="Project chat profile" value={draftSettings.knowledgeChatProfile} onChange={(event) => setDraftSettings((current) => ({ ...current, knowledgeChatProfile: event.target.value as 'inspection' | 'advanced' }))}><option value="inspection">Inspection — bounded project reads</option><option value="advanced">Advanced — enable shell commands</option></select></label>
           <label className="field-label">Default lease duration (seconds)<input aria-label="Default lease duration" min={60} required type="number" value={draftSettings.defaultLeaseSeconds} onChange={(event) => setDraftSettings((current) => ({ ...current, defaultLeaseSeconds: Number(event.target.value) }))} /></label>
           <label className="field-label">Expected heartbeat interval (seconds)<input aria-label="Expected heartbeat interval" min={30} required type="number" value={draftSettings.heartbeatSeconds} onChange={(event) => setDraftSettings((current) => ({ ...current, heartbeatSeconds: Number(event.target.value) }))} /></label>
           <label className="check-label"><input aria-label="Auto-release expired claims" checked={draftSettings.autoReleaseExpiredClaims} type="checkbox" onChange={(event) => setDraftSettings((current) => ({ ...current, autoReleaseExpiredClaims: event.target.checked }))} />Auto-release expired claims</label>
@@ -2559,6 +2586,8 @@ function ProjectSettings({
         <div className="settings-actions"><button className="secondary-button" type="button" onClick={onOpenFolder}>Open Project Folder</button><button className="primary-button" type="submit">Save</button></div>
       </form>
       <AiProviderSettingsForm api={getDesktopApi()} />
+      {getDesktopApi().semantic ? <SemanticSettingsPanel api={getDesktopApi()} projectId={projectId} /> : null}
+      {getDesktopApi().contextPackets ? <ContextPolicyPanel api={getDesktopApi()} projectId={projectId} /> : null}
       <McpDiagnostics />
       <section className="danger-zone">
         <h2>Detach Project</h2>
@@ -2636,7 +2665,7 @@ function McpDiagnostics(): JSX.Element {
       <label className="field-label">Launch command<input aria-label="MCP launch command" readOnly value={command} /></label>
       <dl className="diagnostic-list">
         <dt>Transport</dt><dd>stdio</dd>
-        <dt>Tools</dt><dd>13 registered</dd>
+        <dt>Tools</dt><dd>Available over stdio</dd>
         <dt>Safety</dt><dd>Claim tokens are never stored in diagnostics.</dd>
       </dl>
     </section>
@@ -2652,6 +2681,10 @@ function AiProviderSettingsForm({ api }: { api: DesktopApi }): JSX.Element {
   const [models, setModels] = useState<Array<{ id: string; label?: string }>>([])
   const [loadingModels, setLoadingModels] = useState(false)
   const [modelError, setModelError] = useState<string>()
+  const [savingProvider, setSavingProvider] = useState(false)
+  const [providerError, setProviderError] = useState<string>()
+  const sameEndpoint = settings?.baseUrl.replace(/\/+$/, '') === baseUrl.trim().replace(/\/+$/, '') && settings?.apiMode === apiMode
+  const hasSavedKey = Boolean(settings?.configured && sameEndpoint)
 
   useEffect(() => {
     void api.ai.settings().then((value) => {
@@ -2667,17 +2700,19 @@ function AiProviderSettingsForm({ api }: { api: DesktopApi }): JSX.Element {
     if (!trimmedUrl.endsWith('/v1')) {
       setModels([])
       setModelError(undefined)
+      setLoadingModels(false)
       return
     }
-    if (!apiKey && !settings?.configured && !isLoopbackUrl(trimmedUrl)) {
+    if (!apiKey && !hasSavedKey && !isLoopbackUrl(trimmedUrl)) {
       setModels([])
       setModelError(undefined)
+      setLoadingModels(false)
       return
     }
     let isCurrent = true
     setLoadingModels(true)
     setModelError(undefined)
-    void api.ai.listModels({ baseUrl: trimmedUrl, apiKey: apiKey || undefined })
+    void api.ai.listModels({ baseUrl: trimmedUrl, apiMode, apiKey: apiKey || undefined })
       .then((availableModels) => {
         if (!isCurrent) return
         setModels(availableModels)
@@ -2696,19 +2731,24 @@ function AiProviderSettingsForm({ api }: { api: DesktopApi }): JSX.Element {
     return () => {
       isCurrent = false
     }
-  }, [api, apiKey, baseUrl, model, settings?.configured])
+  }, [api, apiKey, apiMode, baseUrl, model, hasSavedKey])
 
   return (
     <section className="settings-section" aria-labelledby="ai-provider-heading">
       <h2 id="ai-provider-heading">AI provider</h2>
       <p>{settings?.configured ? 'A provider key is securely configured on this Mac.' : 'No provider key is configured. Planning remains available for manual editing.'}</p>
+      {!sameEndpoint && settings?.configured ? <p role="status">This URL and API style do not have a saved credential. Enter a key for this endpoint before saving.</p> : null}
+      {providerError ? <p className="inline-error" role="alert">{providerError}</p> : null}
       <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => {
         event.preventDefault()
+        if (savingProvider) return
+        setSavingProvider(true)
+        setProviderError(undefined)
         void api.ai.configure({ baseUrl, model, apiMode, apiKey: apiKey || undefined }).then((value) => {
           setSettings(value)
           setApiMode(value.apiMode)
           setApiKey('')
-        })
+        }).catch((reason) => setProviderError(messageFor(reason))).finally(() => setSavingProvider(false))
       }}>
         <label className="field-label">Provider URL<input aria-label="Provider URL" required type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
         <label className="field-label">API style<select aria-label="AI API style" value={apiMode} onChange={(event) => setApiMode(event.target.value as typeof apiMode)}>
@@ -2725,8 +2765,16 @@ function AiProviderSettingsForm({ api }: { api: DesktopApi }): JSX.Element {
         )}
         {loadingModels ? <p role="status">Loading models...</p> : null}
         {modelError ? <p role="alert">Model list unavailable: {modelError}</p> : null}
-        <label className="field-label">API key<input aria-label="AI API key" autoComplete="off" placeholder={settings?.configured ? 'Leave blank to retain the configured key' : 'Enter API key'} type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /></label>
-        <button className="secondary-button" type="submit">Save AI provider</button>
+        <label className="field-label">API key<input aria-label="AI API key" autoComplete="off" placeholder={hasSavedKey ? 'Leave blank to retain the configured key' : 'Enter API key for this endpoint'} type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /></label>
+        <button className="secondary-button" disabled={savingProvider} type="submit">Save AI provider</button>
+        {settings?.configured ? <button className="secondary-button" disabled={savingProvider} type="button" onClick={() => {
+          setSavingProvider(true)
+          setProviderError(undefined)
+          void api.ai.configure({ baseUrl: settings.baseUrl, model: settings.model, apiMode: settings.apiMode, removeApiKey: true })
+            .then((value) => { setSettings(value); setApiKey('') })
+            .catch((reason) => setProviderError(messageFor(reason)))
+            .finally(() => setSavingProvider(false))
+        }}>Remove saved API key</button> : null}
       </form>
     </section>
   )
@@ -2783,42 +2831,88 @@ function ProjectSheet({
   )
 }
 
-function WorkItemSheet({
-  onCancel,
-  onSubmit
-}: {
+interface DraftScreenshot {
+  file: File
+  requestId: string
+  status: 'pending' | 'uploading' | 'attached' | 'failed'
+  error?: string
+}
+
+function WorkItemSheet({ api, projectId, onCancel, onSubmit }: {
+  api: DesktopApi
+  projectId: string
   onCancel(): void
-  onSubmit(input: CreateWorkItemInput, screenshots: File[]): Promise<void>
+  onSubmit(): Promise<void>
 }): JSX.Element {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [criteria, setCriteria] = useState('')
   const [type, setType] = useState<WorkItem['type']>('feature')
   const [priority, setPriority] = useState<WorkItem['priority']>('normal')
-  const [screenshots, setScreenshots] = useState<File[]>([])
+  const [screenshots, setScreenshots] = useState<DraftScreenshot[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const [createdItem, setCreatedItem] = useState<WorkItem>()
+  const submission = useRef<{ requestId: string; input?: CreateWorkItemInput; item?: WorkItem; busy: boolean }>({ requestId: crypto.randomUUID(), busy: false })
+  const [started, setStarted] = useState(false)
+  const close = (): void => { if (!submission.current.busy) onCancel() }
   const handleScreenshotPaste = (event: ClipboardEvent<HTMLElement>): void => {
+    if (started) return
     const screenshot = Array.from(event.clipboardData.files).find((file) => file.type.startsWith('image/'))
     if (screenshot) {
       event.preventDefault()
-      setScreenshots((current) => [...current, screenshot])
+      setScreenshots((current) => [...current, { file: screenshot, requestId: crypto.randomUUID(), status: 'pending' }])
+    }
+  }
+  const submit = async (): Promise<void> => {
+    if (submission.current.busy) return
+    submission.current.busy = true
+    setBusy(true)
+    setStarted(true)
+    setError(undefined)
+    submission.current.input ??= { requestId: submission.current.requestId, title, descriptionMarkdown: description, acceptanceCriteriaMarkdown: criteria, type, priority }
+    try {
+      const item = submission.current.item ?? await api.workItems.create(projectId, submission.current.input)
+      submission.current.item = item
+      setCreatedItem(item)
+      for (const screenshot of screenshots) {
+        if (screenshot.status === 'attached') continue
+        const update = (status: DraftScreenshot['status'], error?: string): void => {
+          screenshot.status = status
+          setScreenshots((current) => current.map((entry) => entry.requestId === screenshot.requestId ? { ...entry, status, error } : entry))
+        }
+        update('uploading')
+        try {
+          await api.attachments.pasteImage(projectId, item.id, { ...await toAttachmentPayload(screenshot.file), requestId: screenshot.requestId })
+          update('attached')
+        } catch (reason) {
+          update('failed', messageFor(reason))
+          throw reason
+        }
+      }
+      await onSubmit()
+    } catch (reason) {
+      setError(messageFor(reason))
+    } finally {
+      submission.current.busy = false
+      setBusy(false)
     }
   }
   return (
-    <Modal title="New Work Item" onCancel={onCancel}>
-      <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => {
-        event.preventDefault()
-        void onSubmit({ title, descriptionMarkdown: description, acceptanceCriteriaMarkdown: criteria, type, priority }, screenshots)
-      }}>
-        <label className="field-label">Type<select aria-label="Work item type" value={type} onChange={(event) => setType(event.target.value as WorkItem['type'])}><option value="feature">Feature</option><option value="bug">Bug</option><option value="chore">Chore</option></select></label>
-        <label className="field-label">Title<input autoFocus required aria-label="Work item title" value={title} onChange={(event) => setTitle(event.target.value)} /></label>
-        <label className="field-label">Description<textarea aria-label="Work item description" value={description} onChange={(event) => setDescription(event.target.value)} onPaste={handleScreenshotPaste} /></label>
+    <Modal title="New Work Item" onCancel={close}>
+      <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => { event.preventDefault(); void submit() }}>
+        {createdItem ? <p role="status">{createdItem.displayId} is saved. Retry continues attaching evidence to this work item.</p> : null}
+        {error ? <p className="inline-error" role="alert">{error}</p> : null}
+        <label className="field-label">Type<select disabled={started} aria-label="Work item type" value={type} onChange={(event) => setType(event.target.value as WorkItem['type'])}><option value="feature">Feature</option><option value="bug">Bug</option><option value="chore">Chore</option></select></label>
+        <label className="field-label">Title<input autoFocus required readOnly={started} aria-label="Work item title" value={title} onChange={(event) => setTitle(event.target.value)} /></label>
+        <label className="field-label">Description<textarea readOnly={started} aria-label="Work item description" value={description} onChange={(event) => setDescription(event.target.value)} onPaste={handleScreenshotPaste} /></label>
         <div aria-label="Paste screenshots here" className="draft-screenshot-zone" role="region" tabIndex={0} onPaste={handleScreenshotPaste}>
           Paste a screenshot here or into the description. It will be attached when this work item is created.
-          {screenshots.length ? <ul>{screenshots.map((screenshot, index) => <li key={`${screenshot.name}-${index}`}><span>{screenshot.name}</span><button type="button" onClick={() => setScreenshots((current) => current.filter((_, currentIndex) => currentIndex !== index))}>Remove {screenshot.name}</button></li>)}</ul> : null}
+          {screenshots.length ? <ul>{screenshots.map((screenshot) => <li key={screenshot.requestId}><span>{screenshot.file.name}</span><span> · {screenshot.status}{screenshot.error ? `: ${screenshot.error}` : ''}</span>{screenshot.status !== 'attached' ? <button disabled={busy} type="button" onClick={() => setScreenshots((current) => current.filter((entry) => entry.requestId !== screenshot.requestId))}>Remove {screenshot.file.name}</button> : null}</li>)}</ul> : null}
         </div>
-        <label className="field-label">Acceptance criteria<textarea aria-label="Work item acceptance criteria" value={criteria} onChange={(event) => setCriteria(event.target.value)} /></label>
-        <label className="field-label">Priority<select aria-label="Work item priority" value={priority} onChange={(event) => setPriority(event.target.value as WorkItem['priority'])}><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
-        <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button><button className="primary-button" type="submit">Add to Backlog</button></div>
+        <label className="field-label">Acceptance criteria<textarea readOnly={started} aria-label="Work item acceptance criteria" value={criteria} onChange={(event) => setCriteria(event.target.value)} /></label>
+        <label className="field-label">Priority<select disabled={started} aria-label="Work item priority" value={priority} onChange={(event) => setPriority(event.target.value as WorkItem['priority'])}><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
+        <div className="modal-actions"><button className="secondary-button" disabled={busy} type="button" onClick={close}>{createdItem ? 'Keep work item and close' : 'Cancel'}</button><button className="primary-button" disabled={busy} type="submit">{busy ? 'Saving work item...' : started ? 'Retry and continue' : 'Add to Backlog'}</button></div>
       </form>
     </Modal>
   )
@@ -2851,6 +2945,10 @@ function PlanningSheet({
   const [contextVisible, setContextVisible] = useState(false)
   const [suggestion, setSuggestion] = useState<string>()
   const [suggestionError, setSuggestionError] = useState<string>()
+  const [busy, setBusy] = useState(false)
+  const requestRef = useRef<string>()
+  const saveQueue = useRef<Promise<void>>(Promise.resolve())
+  const savedDraft = useRef<string>()
   const [messages, setMessages] = useState<import('../../core/types').PlanningMessage[]>([])
   const { attachments, attachFiles, pasteImage, previewUrls, removeAttachment } = usePlanningAttachments(
     api,
@@ -2862,10 +2960,31 @@ function PlanningSheet({
   useEffect(() => {
     void api.planning.listMessages(projectId, proposal.planningSessionId).then(setMessages)
   }, [api, projectId, proposal.planningSessionId])
-  const contextQuery = `${title} ${description}`.trim()
+  const draft = useMemo(() => ({ title, type, descriptionMarkdown: description, requirementsMarkdown: requirements, acceptanceCriteriaMarkdown: criteria, implementationContextMarkdown: implementationContext, relatedReferences: relatedReferences.split('\n').map((reference) => reference.trim()).filter(Boolean), priority }), [title, type, description, requirements, criteria, implementationContext, relatedReferences, priority])
+  const persistDraft = useCallback(async (): Promise<void> => {
+    const serialized = JSON.stringify(draft)
+    const save = saveQueue.current.catch(() => {}).then(async () => {
+      if (savedDraft.current === serialized) return
+      await onSave(draft)
+      savedDraft.current = serialized
+    })
+    saveQueue.current = save
+    return save
+  }, [draft, onSave])
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void persistDraft().catch((reason) => setSuggestionError(messageFor(reason))) }, 600)
+    return () => window.clearTimeout(timer)
+  }, [persistDraft])
+  useEffect(() => () => { if (requestRef.current) void api.ai.cancel(requestRef.current) }, [api])
+  const close = (): void => {
+    if (requestRef.current) { void api.ai.cancel(requestRef.current); requestRef.current = undefined }
+    void persistDraft().then(onCancel).catch((reason) => setSuggestionError(messageFor(reason)))
+  }
+  const contextQuery = `${title} ${description}`.trim().slice(0, 500)
   const inspectContext = async (): Promise<PlanningContext | undefined> => {
     setContextVisible(true)
     try {
+      await persistDraft()
       const nextContext = await api.planning.context(projectId, proposal.planningSessionId, contextQuery)
       setContext(nextContext)
       return nextContext
@@ -2875,49 +2994,53 @@ function PlanningSheet({
     }
   }
   const requestSuggestion = async (): Promise<void> => {
+    if (requestRef.current) return
+    const requestId = crypto.randomUUID()
+    requestRef.current = requestId
+    setBusy(true)
     try {
       setSuggestionError(undefined)
       const planningContext = await inspectContext()
-      if (!planningContext) return
+      if (!planningContext || requestRef.current !== requestId) return
       const prompt = `Create a concise implementation suggestion for "${title}" while preserving all user-edited proposal fields. Objective: ${description}`
       await api.planning.addMessage(projectId, proposal.planningSessionId, 'user', prompt)
-      const response = await api.ai.proposePlanning(projectId, proposal.planningSessionId, prompt)
+      if (requestRef.current !== requestId) return
+      const response = await api.ai.proposePlanning(projectId, proposal.planningSessionId, prompt, planningContext.id, requestId)
+      if (requestRef.current !== requestId) return
       await api.planning.addMessage(projectId, proposal.planningSessionId, 'assistant', response)
       setSuggestion(response)
-      setMessages(await api.planning.listMessages(projectId, proposal.planningSessionId))
     } catch (reason) {
       setSuggestionError(messageFor(reason))
+    } finally {
+      if (requestRef.current === requestId) requestRef.current = undefined
+      try { setMessages(await api.planning.listMessages(projectId, proposal.planningSessionId)) }
+      catch (reason) { setSuggestionError(messageFor(reason)) }
+      setBusy(false)
     }
   }
+
   return (
-    <Modal className="planning-modal" title="Plan with AI" onCancel={onCancel}>
+    <Modal className="planning-modal" title="Plan with AI" onCancel={close}>
       <form onKeyDown={submitOnMetaEnter} onSubmit={(event) => {
         event.preventDefault()
-        void onConvert({
-          title,
-          type,
-          descriptionMarkdown: description,
-          requirementsMarkdown: requirements,
-          acceptanceCriteriaMarkdown: criteria,
-          implementationContextMarkdown: implementationContext,
-          relatedReferences: relatedReferences.split('\n').map((reference) => reference.trim()).filter(Boolean),
-          priority
-        })
+        if (busy) return
+        setBusy(true)
+        void persistDraft().then(() => onConvert(draft)).catch((reason) => setSuggestionError(messageFor(reason))).finally(() => setBusy(false))
       }}>
         <div className="planning-context-chip" role="status">
           Using project context — {context ? `${context.knowledge.length} knowledge · ${context.completedWork.length} completed · ${context.backlogOverlap.length} backlog · ${context.planningAttachments.length} attachments` : 'inspect evidence before asking'}
         </div>
         <p className="modal-copy">Draft the proposal directly. Suggestions are separate evidence-aware notes and never overwrite your edited fields.</p>
         <div className="planning-field-grid">
-          <label className="field-label">Type<select aria-label="Proposal type" value={type} onBlur={() => void onSave({ type })} onChange={(event) => setType(event.target.value as WorkItem['type'])}><option value="feature">Feature</option><option value="bug">Bug</option><option value="chore">Chore</option></select></label>
-          <label className="field-label">Priority<select aria-label="Proposal priority" value={priority} onBlur={() => void onSave({ priority })} onChange={(event) => setPriority(event.target.value as WorkItem['priority'])}><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
+          <label className="field-label">Type<select aria-label="Proposal type" value={type} onChange={(event) => setType(event.target.value as WorkItem['type'])}><option value="feature">Feature</option><option value="bug">Bug</option><option value="chore">Chore</option></select></label>
+          <label className="field-label">Priority<select aria-label="Proposal priority" value={priority} onChange={(event) => setPriority(event.target.value as WorkItem['priority'])}><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
         </div>
-        <label className="field-label">Proposal title<input required aria-label="Proposal title" value={title} onBlur={() => void onSave({ title })} onChange={(event) => setTitle(event.target.value)} /></label>
-        <label className="field-label">Objective<textarea aria-label="Proposal objective" value={description} onBlur={() => void onSave({ descriptionMarkdown: description })} onChange={(event) => setDescription(event.target.value)} /></label>
-        <label className="field-label">Requirements<textarea aria-label="Proposal requirements" value={requirements} onBlur={() => void onSave({ requirementsMarkdown: requirements })} onChange={(event) => setRequirements(event.target.value)} /></label>
-        <label className="field-label">Acceptance criteria<textarea aria-label="Proposal acceptance criteria" value={criteria} onBlur={() => void onSave({ acceptanceCriteriaMarkdown: criteria })} onChange={(event) => setCriteria(event.target.value)} /></label>
-        <label className="field-label">Implementation context<textarea aria-label="Proposal implementation context" value={implementationContext} onBlur={() => void onSave({ implementationContextMarkdown: implementationContext })} onChange={(event) => setImplementationContext(event.target.value)} /></label>
-        <label className="field-label">Related work and references<textarea aria-label="Proposal related references" placeholder="One work item ID, wiki article, or note per line" value={relatedReferences} onBlur={() => void onSave({ relatedReferences: relatedReferences.split('\n').map((reference) => reference.trim()).filter(Boolean) })} onChange={(event) => setRelatedReferences(event.target.value)} /></label>
+        <label className="field-label">Proposal title<input required aria-label="Proposal title" value={title} onChange={(event) => setTitle(event.target.value)} /></label>
+        <label className="field-label">Objective<textarea aria-label="Proposal objective" value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+        <label className="field-label">Requirements<textarea aria-label="Proposal requirements" value={requirements} onChange={(event) => setRequirements(event.target.value)} /></label>
+        <label className="field-label">Acceptance criteria<textarea aria-label="Proposal acceptance criteria" value={criteria} onChange={(event) => setCriteria(event.target.value)} /></label>
+        <label className="field-label">Implementation context<textarea aria-label="Proposal implementation context" value={implementationContext} onChange={(event) => setImplementationContext(event.target.value)} /></label>
+        <label className="field-label">Related work and references<textarea aria-label="Proposal related references" placeholder="One work item ID, wiki article, or note per line" value={relatedReferences} onChange={(event) => setRelatedReferences(event.target.value)} /></label>
         <section className="planning-attachments" aria-labelledby="planning-attachments-heading">
           <div className="section-heading"><h3 id="planning-attachments-heading">Planning evidence</h3><label className="secondary-button file-picker-label">Attach files<input aria-label="Attach planning files" multiple type="file" onChange={(event) => { void attachFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = '' }} /></label></div>
           <div aria-label="Drop planning evidence or paste screenshots here" className="attachment-drop-zone" role="region" tabIndex={0} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void attachFiles(Array.from(event.dataTransfer.files)) }} onPaste={(event) => { const image = Array.from(event.clipboardData.files).find((file) => file.type.startsWith('image/')); if (image) { event.preventDefault(); void pasteImage(image) } }}>
@@ -2926,17 +3049,17 @@ function PlanningSheet({
           {attachments.length ? <ul className="attachment-grid">{attachments.map((attachment) => <li key={attachment.id}>{attachment.mimeType?.startsWith('image/') && previewUrls[attachment.id] ? <img alt={`${attachment.originalFilename} preview`} src={previewUrls[attachment.id]} /> : <span className="file-thumbnail" aria-hidden="true">FILE</span>}<span className="attachment-name">{attachment.originalFilename}</span><span className="attachment-size">{formatSize(attachment.sizeBytes)}</span><button type="button" onClick={() => void removeAttachment(attachment)}>Remove {attachment.originalFilename}</button></li>)}</ul> : <p className="muted attachment-empty">No planning evidence attached yet.</p>}
         </section>
         <section className="planning-suggestion" aria-labelledby="planning-suggestion-heading">
-          <div className="section-heading"><h3 id="planning-suggestion-heading">AI suggestion</h3><button className="secondary-button" type="button" onClick={() => void requestSuggestion()}>Request suggestion</button></div>
+          <div className="section-heading"><h3 id="planning-suggestion-heading">AI suggestion</h3><button className="secondary-button" disabled={busy} type="button" onClick={() => void requestSuggestion()}>{busy ? 'Working...' : 'Request suggestion'}</button>{requestRef.current ? <button className="secondary-button" type="button" onClick={() => { const id = requestRef.current; requestRef.current = undefined; if (id) void api.ai.cancel(id); setSuggestionError('Suggestion cancelled. Your draft and conversation are saved.') }}>Cancel suggestion</button> : null}</div>
           <p className="muted">Suggestions never overwrite your proposal. Apply relevant details manually.</p>
           {suggestion ? <p>{suggestion}</p> : null}
           {suggestionError ? <p role="alert">{suggestionError}</p> : null}
           {messages.length ? <ol className="planning-messages" aria-label="Planning conversation">{messages.map((message) => <li key={message.id}><strong>{message.role}</strong><span>{message.contentMarkdown}</span></li>)}</ol> : null}
         </section>
         <section className="planning-context" aria-labelledby="planning-context-heading">
-          <div className="section-heading"><h3 id="planning-context-heading">Context inspector</h3><button className="secondary-button" type="button" onClick={() => void inspectContext()}>Inspect context</button></div>
-          {contextVisible ? context ? <ContextEvidence context={context} /> : <p className="muted">No matching project context was retrieved.</p> : <p className="muted">Inspect project identity, matching knowledge, completed work, backlog overlap, and attachment metadata.</p>}
+          <div className="section-heading"><h3 id="planning-context-heading">Context inspector</h3><button className="secondary-button" disabled={busy} type="button" onClick={() => void inspectContext()}>Inspect context</button></div>
+          {contextVisible ? context ? <><p>Context query: {context.query ?? contextQuery}</p>{context.id ? <p className="muted">Snapshot {context.id} · proposal revision {context.proposal.revision}</p> : null}<ContextEvidence context={context} /></> : <p className="muted">No matching project context was retrieved.</p> : <p className="muted">Inspect project identity, matching knowledge, completed work, backlog overlap, and attachment metadata.</p>}
         </section>
-        <div className="modal-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button><button className="primary-button" type="submit">Add to Backlog</button></div>
+        <div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>Save and close</button><button className="primary-button" disabled={busy} type="submit">Add to Backlog</button></div>
       </form>
     </Modal>
   )
@@ -3004,37 +3127,13 @@ function ContextEvidence({ context }: { context: PlanningContext }): JSX.Element
   return (
     <div className="context-evidence">
       <p><strong>{context.project.name}</strong>{context.project.description ? ` — ${context.project.description}` : ''}</p>
+      {context.omissions?.length ? <p className="muted">Omitted: {context.omissions.join('; ')}</p> : null}
       {sections.map((section) => section.items.length ? <section key={section.label}><h4>{section.label}</h4><ul>{section.items.map((item) => <li key={`${item.kind}-${item.sourceId}`}><strong>{item.title}</strong><span>{item.excerpt}</span>{item.metadata ? <small>{Object.entries(item.metadata).map(([key, value]) => `${key}: ${value ?? 'unknown'}`).join(' · ')}</small> : null}</li>)}</ul></section> : null)}
       {!sections.some((section) => section.items.length) ? <p className="muted">No matching project context was retrieved.</p> : null}
     </div>
   )
 }
 
-function Modal({ children, className, onCancel, title }: { children: ReactNode; className?: string; onCancel(): void; title: string }): JSX.Element {
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onCancel()
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onCancel])
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section aria-labelledby="modal-heading" aria-modal="true" className={`modal ${className ?? ''}`} role="dialog" onKeyDown={(event) => {
-        if (event.key === 'Escape') {
-          event.stopPropagation()
-          onCancel()
-        }
-      }}>
-        <header><h2 id="modal-heading">{title}</h2><button aria-label={`Close ${title}`} className="icon-button" type="button" onClick={onCancel}>x</button></header>
-        {children}
-      </section>
-    </div>
-  )
-}
 
 function ReleaseClaimSheet({
   claim,

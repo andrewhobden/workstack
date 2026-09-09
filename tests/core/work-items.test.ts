@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { ClaimsRepository } from '../../src/core/claims'
 import { FrozenClock } from '../../src/core/clock'
 import { ProjectStore, projectPaths } from '../../src/core/project-store'
 import { WorkItemRepository, renderWorkItemMirror } from '../../src/core/work-items'
@@ -163,6 +164,53 @@ describe('WorkItemRepository', () => {
     store.database.prepare("UPDATE work_items SET status = 'in_progress' WHERE id = ?").run(workItem.id)
     expectErrorCode(() => repository.delete(workItem.id), 'INVALID_STATE_TRANSITION')
     expectErrorCode(() => repository.update(workItem.id, { title: '   ' }), 'VALIDATION_ERROR')
+    store.close()
+  })
+
+  it('resolves old display IDs with more than 100 newer items and never reuses deleted IDs', async () => {
+    const { store } = await createRepository()
+    const repository = new WorkItemRepository(store)
+    const first = repository.create({ title: 'Old task' })
+    let newest = first
+    for (let index = 0; index < 110; index++) newest = repository.create({ title: `New task ${index}` })
+    expect(repository.resolve(first.displayId).id).toBe(first.id)
+    expect(repository.resolve(first.id).displayId).toBe(first.displayId)
+    expectErrorCode(() => repository.resolve('WS-0'), 'WORK_ITEM_NOT_FOUND')
+    repository.delete(newest.id)
+    const next = repository.create({ title: 'After deletion' })
+    expect(next.sequenceNumber).toBe(newest.sequenceNumber + 1)
+    store.close()
+  })
+
+  it('returns the original create receipt on retry even after later edits and rejects conflicting reuse', async () => {
+    const { store } = await createRepository()
+    const repository = new WorkItemRepository(store)
+    const payload = { title: 'Created exactly once', descriptionMarkdown: 'Original details', requestId: 'compose-1' }
+    const first = repository.create(payload)
+    expect(repository.create(payload)).toEqual(first)
+    repository.update(first.id, { title: 'Subsequently edited' })
+    expect(repository.create(payload).id).toBe(first.id)
+    expectErrorCode(() => repository.create({ ...payload, title: 'Different request' }), 'VALIDATION_ERROR')
+    expect(repository.list()).toHaveLength(1)
+    expect(repository.create({ title: 'Next' }).sequenceNumber).toBe(2)
+    store.close()
+  })
+
+  it('retains completion evidence after metadata edits and repairs a damaged search index', async () => {
+    const { store } = await createRepository()
+    const repository = new WorkItemRepository(store)
+    const claims = new ClaimsRepository(store)
+    const item = repository.create({ title: 'Completed parser' })
+    const claim = claims.claim(item.id, { agentId: 'test' })
+    claims.complete(item.id, claim.claimToken, { summaryMarkdown: 'Recovered quorum journal', validationMarkdown: 'Validated 17 edge cases', sessionSummaryMarkdown: 'resume-context-unique' })
+    repository.update(item.id, { title: 'Renamed parser', priority: 'high' })
+    for (const query of ['quorum journal', '17 edge cases', 'resume-context-unique']) {
+      expect(repository.list({ status: 'completed', query }).map((row) => row.id)).toEqual([item.id])
+    }
+    store.database.prepare('UPDATE completion_records SET files_changed_json = NULL, components_changed_json = NULL WHERE work_item_id = ?').run(item.id)
+    store.database.prepare('DELETE FROM work_item_search').run()
+    repository.reindexSearch()
+    expect(repository.list({ status: 'completed', query: 'quorum journal' }).map((row) => row.id)).toEqual([item.id])
     store.close()
   })
 

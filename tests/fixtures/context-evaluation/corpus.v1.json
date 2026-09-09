@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "revision": "workstack-context-eval-2026-09-v1",
+  "description": "Synthetic project tasks and expected evidence authored from behavioral requirements, independent of ranking scores.",
+  "review": { "status": "pending_human_review", "reviewer": null, "note": "A project maintainer must validate expected evidence before this corpus is described as human-reviewed." },
+  "largeCorpusDocuments": 768,
+  "sources": [
+    { "key": "purpose", "title": "Project purpose", "category": "purpose", "text": "# Purpose\nOrchard coordinates local coding tasks and keeps durable project context for every worker." },
+    { "key": "architecture", "title": "QueueService architecture", "category": "architecture", "text": "# QueueService architecture\nQueueService (QS) owns the durable job queue. SQLite transactions fence owner leases. A worker can publish only while its claim is current." },
+    { "key": "conventions", "title": "Engineering conventions", "category": "conventions", "text": "# Conventions\nRun the focused tests for every behavior change. Keep provider reference material untrusted. Preserve public APIs unless a migration is reviewed." },
+    { "key": "queue-api", "title": "Lease API", "category": "code", "path": "src/lease.ts", "text": "# Lease API\nexport function resumeClaimLease(token: string): boolean\nresumeClaimLease validates ownership before renewing the SQLite claim. Never accept an expired token." },
+    { "key": "recovery", "title": "Restart recovery protocol", "category": "architecture", "text": "# Crash recovery\nRecover unfinished jobs after a crash by reconciling persisted claims and reading the last durable checkpoint. Continuing from saved progress avoids repeating completed work." },
+    { "key": "old-design", "title": "Old queue decision", "category": "decisions", "text": "# Old queue guidance\nBefore the migration, RetryQueue used process memory. This document is historical and must never be governing context.", "state": "stale" },
+    { "key": "current-design", "title": "Current queue decision", "category": "decisions", "text": "# Accepted queue guidance\nRetryQueue uses persisted SQLite rows and fenced ownership. The current decision supersedes the old in-memory queue." },
+    { "key": "long-document", "title": "Deep recovery specification", "category": "architecture", "generatedPrefixParagraphs": 400, "text": "## Recovery after the appendix\nrecoverFencedOwnership requires a new claim token and validates the saved checkpoint before resuming." },
+    { "key": "offline", "title": "Offline operations policy", "category": "purpose", "text": "# Operations\nRead the operations policy before execution.", "state": "unavailable" },
+    { "key": "large-target", "title": "Rare scheduler implementation", "category": "code", "path": "src/rare-scheduler.ts", "text": "# Rare scheduler\nRareSchedulerKey_733 uses an immutable envelope to avoid duplicate dispatch." }
+  ],
+  "cases": [
+    { "id": "exact-identifier", "tags": ["identifier"], "query": "resumeClaimLease", "task": "Validate resumeClaimLease ownership before retry", "expectedSources": ["queue-api"], "mustRetrieve": ["queue-api"], "mandatoryCategories": ["task", "repository", "purpose", "conventions"], "expectedMissingCategories": [] },
+    { "id": "acronym", "tags": ["acronym", "component"], "query": "QS retry ownership", "task": "Explain QS retry ownership", "expectedSources": ["architecture"], "mustRetrieve": ["architecture"], "mandatoryCategories": ["task", "repository", "architecture"], "expectedMissingCategories": [] },
+    { "id": "paraphrase", "tags": ["paraphrase"], "query": "How can work resume after the application restarts?", "task": "Resume work after the application restarts", "expectedSources": ["recovery"], "mustRetrieve": [], "mandatoryCategories": ["task", "repository", "architecture"], "expectedMissingCategories": [] },
+    { "id": "deep-evidence", "tags": ["long_document"], "query": "recoverFencedOwnership", "task": "Implement recoverFencedOwnership from the recovery appendix", "expectedSources": ["long-document"], "mustRetrieve": ["long-document"], "mandatoryCategories": ["task", "repository", "architecture"], "expectedMissingCategories": [] },
+    { "id": "current-over-history", "tags": ["supersession"], "query": "RetryQueue persisted ownership", "task": "Update RetryQueue according to the accepted decision", "expectedSources": ["current-design"], "mustRetrieve": ["current-design"], "forbiddenSources": ["old-design"], "mandatoryCategories": ["task", "repository", "decisions"], "expectedMissingCategories": [] },
+    { "id": "interrupted-work", "tags": ["checkpoint", "recovery"], "query": "reconcile persisted claims checkpoint", "task": "Continue interrupted queue recovery", "expectedSources": ["recovery"], "mustRetrieve": ["recovery"], "checkpoint": true, "mandatoryCategories": ["task", "repository", "checkpoint"], "expectedMissingCategories": [] },
+    { "id": "offline-mandatory-source", "tags": ["offline", "missing"], "query": "operations policy", "task": "Execute the operations maintenance task", "expectedSources": [], "mustRetrieve": [], "forbiddenSources": ["offline"], "mandatoryCategories": ["task", "repository", "purpose"], "expectedMissingCategories": ["purpose"], "offlinePin": true },
+    { "id": "large-corpus", "tags": ["large_repository"], "query": "RareSchedulerKey_733", "task": "Repair RareSchedulerKey_733 dispatch", "expectedSources": ["large-target"], "mustRetrieve": ["large-target"], "mandatoryCategories": ["task", "repository", "code"], "expectedMissingCategories": [] },
+    { "id": "project-isolation", "tags": ["isolation"], "query": "ForeignProjectSentinel_8842", "task": "Look for ForeignProjectSentinel_8842 in this project", "expectedSources": [], "mustRetrieve": [], "forbiddenSources": ["foreign-only"], "mandatoryCategories": ["task", "repository"], "expectedMissingCategories": [] }
+  ]
+}

@@ -9,10 +9,14 @@ import { OpenAiCompatibleProvider } from './ai-provider'
 import { CopilotLauncher } from './copilot-launcher'
 import { PullRequestService } from './pull-requests'
 import { WikiAutomationService } from './wiki-automation-service'
+import { SourceIntakeService } from './source-intake-service'
 import { createWindowOptions } from './window-options'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const mcpMode = process.argv.includes('--mcp')
+
+// An explicit isolated profile supports local development and packaged smoke tests.
+if (process.env.WORKSTACK_USER_DATA_DIR) app.setPath('userData', path.resolve(process.env.WORKSTACK_USER_DATA_DIR))
 
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow(createWindowOptions(path.join(__dirname, '../preload/index.cjs')))
@@ -54,7 +58,9 @@ app.whenReady().then(() => {
     wikiAutomation
   )
   wikiAutomation.start()
-  app.once('before-quit', () => wikiAutomation.stop())
+  const sourceIntake = new SourceIntakeService(projects)
+  sourceIntake.start()
+  app.once('before-quit', () => { wikiAutomation.stop(); sourceIntake.stop() })
   createWindow()
 
   app.on('activate', () => {

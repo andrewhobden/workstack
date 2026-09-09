@@ -28,7 +28,8 @@ const createWorkItemSchema = z.object({
   acceptanceCriteriaMarkdown: z.string().default(''),
   priority: z.enum(WORK_ITEM_PRIORITIES).default('normal'),
   source: z.enum(WORK_ITEM_SOURCES).default('manual'),
-  createdBy: z.string().trim().min(1).optional()
+  createdBy: z.string().trim().min(1).optional(),
+  requestId: z.string().trim().min(1).max(200).optional()
 })
 
 const updateWorkItemSchema = z
@@ -52,7 +53,14 @@ const listFiltersSchema = z
   })
   .strict()
 
+const workItemSelection = `work_items.*,
+  (SELECT pr_state FROM completion_records WHERE work_item_id = work_items.id) AS pr_state`
+
 interface WorkItemRow {
+  attention_reason: string | null
+  pr_state: 'OPEN' | 'CLOSED' | 'MERGED' | null
+  origin_planning_session_id: string | null
+  origin_planning_revision: number | null
   id: string
   sequence_number: number
   display_id: string
@@ -88,18 +96,31 @@ export class WorkItemRepository {
   create(input: CreateWorkItemInput): WorkItem {
     const parsed = createWorkItemSchema.parse(input)
     const now = this.now()
-    const id = this.createId()
     const insert = this.store.database.prepare(
       `INSERT INTO work_items (
         id, sequence_number, display_id, type, title, description_markdown,
-        acceptance_criteria_markdown, priority, status, source, created_by, created_at, updated_at
+        acceptance_criteria_markdown, priority, status, source, created_by, created_at, updated_at, creation_request_id, creation_request_payload
       ) VALUES (
         @id, @sequenceNumber, @displayId, @type, @title, @descriptionMarkdown,
-        @acceptanceCriteriaMarkdown, @priority, 'backlog', @source, @createdBy, @createdAt, @updatedAt
+        @acceptanceCriteriaMarkdown, @priority, 'backlog', @source, @createdBy, @createdAt, @updatedAt, @requestId, @requestPayload
       )`
     )
 
     const transaction = this.store.database.transaction(() => {
+      const { requestId, ...payload } = parsed
+      const requestPayload = JSON.stringify(payload)
+      if (requestId) {
+        const existing = this.store.database.prepare(
+          'SELECT id, creation_request_payload FROM work_items WHERE creation_request_id = ?'
+        ).get(requestId) as { id: string; creation_request_payload: string | null } | undefined
+        if (existing) {
+          if (existing.creation_request_payload !== requestPayload) {
+            throw new WorkstackError('VALIDATION_ERROR', 'This creation request ID has already been used with a different payload.')
+          }
+          return this.get(existing.id)
+        }
+      }
+      const id = this.createId()
       const sequenceNumber = this.nextSequenceNumber()
       const workItem: WorkItem = {
         id,
@@ -115,11 +136,17 @@ export class WorkItemRepository {
         createdBy: parsed.createdBy ?? null,
         createdAt: now,
         updatedAt: now,
-        completedAt: null
+        completedAt: null,
+        attentionReason: null,
+        deliveryState: null,
+        originPlanningSessionId: null,
+        originPlanningRevision: null
       }
 
       insert.run({
         ...workItem,
+        requestId: requestId ?? null,
+        requestPayload: requestId ? requestPayload : null,
         sequenceNumber: workItem.sequenceNumber,
         displayId: workItem.displayId,
         descriptionMarkdown: workItem.descriptionMarkdown,
@@ -138,10 +165,18 @@ export class WorkItemRepository {
   }
 
   get(id: string): WorkItem {
-    const row = this.store.database.prepare('SELECT * FROM work_items WHERE id = ?').get(id) as WorkItemRow | undefined
+    const row = this.store.database.prepare(`SELECT ${workItemSelection} FROM work_items WHERE id = ?`).get(id) as WorkItemRow | undefined
     if (!row) {
       throw new WorkstackError('WORK_ITEM_NOT_FOUND', 'The requested work item does not exist.')
     }
+    return toWorkItem(row)
+  }
+
+  resolve(identifier: string): WorkItem {
+    const row = this.store.database.prepare(
+      `SELECT ${workItemSelection} FROM work_items WHERE id = ? OR display_id = ?`
+    ).get(identifier, identifier) as WorkItemRow | undefined
+    if (!row) throw new WorkstackError('WORK_ITEM_NOT_FOUND', 'The requested work item does not exist.')
     return toWorkItem(row)
   }
 
@@ -176,7 +211,7 @@ export class WorkItemRepository {
     }
 
     const rows = this.store.database
-      .prepare(`SELECT * FROM work_items ${where} ORDER BY sequence_number DESC ${limit}`)
+      .prepare(`SELECT ${workItemSelection} FROM work_items ${where} ORDER BY sequence_number DESC ${limit}`)
       .all(...values) as WorkItemRow[]
     return rows.map(toWorkItem)
   }
@@ -222,12 +257,14 @@ export class WorkItemRepository {
   }
 
   delete(id: string): void {
-    const workItem = this.get(id)
-    if (workItem.status !== 'backlog') {
-      throw new WorkstackError('INVALID_STATE_TRANSITION', 'Only backlog work items can be deleted.')
-    }
-
     const transaction = this.store.database.transaction(() => {
+      const workItem = this.get(id)
+      if (workItem.status !== 'backlog') {
+        throw new WorkstackError('INVALID_STATE_TRANSITION', 'Only backlog work items can be deleted.')
+      }
+      const dependent = this.store.database.prepare(`SELECT w.display_id FROM task_dependencies d JOIN work_items w ON w.id = d.work_item_id
+        WHERE d.prerequisite_id = ? ORDER BY w.sequence_number LIMIT 1`).get(id) as { display_id: string } | undefined
+      if (dependent) throw new WorkstackError('INVALID_STATE_TRANSITION', `Remove the prerequisite link from ${dependent.display_id} before deleting this task.`)
       this.store.database.prepare('DELETE FROM work_item_search WHERE work_item_id = ?').run(id)
       this.recordActivity('work_item_deleted', 'human', workItem.createdBy, id, { displayId: workItem.displayId })
       this.store.database.prepare('DELETE FROM work_items WHERE id = ?').run(id)
@@ -248,10 +285,10 @@ export class WorkItemRepository {
   }
 
   private nextSequenceNumber(): number {
-    const result = this.store.database
-      .prepare('SELECT COALESCE(MAX(sequence_number), 0) + 1 AS next_sequence_number FROM work_items')
-      .get() as { next_sequence_number: number }
-    return result.next_sequence_number
+    const result = this.store.database.prepare(
+      'UPDATE work_item_sequences SET high_watermark = high_watermark + 1 WHERE id = 1 RETURNING high_watermark'
+    ).get() as { high_watermark: number }
+    return result.high_watermark
   }
 
   private replaceSearchDocument(workItem: WorkItem): void {
@@ -260,14 +297,37 @@ export class WorkItemRepository {
       .prepare(
         `INSERT INTO work_item_search (
           work_item_id, title, description_markdown, acceptance_criteria_markdown, completion_markdown
-        ) VALUES (?, ?, ?, ?, '')`
+        ) VALUES (?, ?, ?, ?, ?)`
       )
       .run(
         workItem.id,
         workItem.title,
         workItem.descriptionMarkdown,
-        workItem.acceptanceCriteriaMarkdown
+        workItem.acceptanceCriteriaMarkdown,
+        this.completionSearchText(workItem.id)
       )
+  }
+
+  reindexSearch(): void {
+    this.store.database.transaction(() => {
+      this.store.database.prepare('DELETE FROM work_item_search').run()
+      for (const item of this.list()) this.replaceSearchDocument(item)
+    }).immediate()
+  }
+
+  private completionSearchText(workItemId: string): string {
+    const row = this.store.database.prepare(`SELECT summary_markdown, session_summary_markdown,
+      implementation_notes_markdown, validation_markdown, known_limitations_markdown,
+      files_changed_json, components_changed_json FROM completion_records WHERE work_item_id = ?`).get(workItemId) as {
+        summary_markdown: string; session_summary_markdown: string; implementation_notes_markdown: string;
+        validation_markdown: string; known_limitations_markdown: string;
+        files_changed_json: string | null; components_changed_json: string | null
+      } | undefined
+    if (!row) return ''
+    return [row.summary_markdown, row.session_summary_markdown, row.implementation_notes_markdown,
+      row.validation_markdown, row.known_limitations_markdown,
+      ...(JSON.parse(row.files_changed_json ?? '[]') as string[]),
+      ...(JSON.parse(row.components_changed_json ?? '[]') as string[])].join('\n')
   }
 
   recordActivity(
@@ -333,7 +393,11 @@ function toWorkItem(row: WorkItemRow): WorkItem {
     createdBy: row.created_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    completedAt: row.completed_at
+    completedAt: row.completed_at,
+    attentionReason: row.attention_reason,
+    deliveryState: row.pr_state === 'OPEN' ? 'awaiting_review' : row.pr_state === 'CLOSED' ? 'closed' : row.pr_state === 'MERGED' ? 'merged' : null,
+    originPlanningSessionId: row.origin_planning_session_id,
+    originPlanningRevision: row.origin_planning_revision
   }
 }
 

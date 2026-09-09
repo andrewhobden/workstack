@@ -15,11 +15,18 @@ import type {
   CompletionInput,
   CompletionRecord,
   ForceReleaseInput,
-  WorkClaim
+  WorkClaim,
+  WorkItem,
+  WorkCheckpoint,
+  WorkCheckpointInput
 } from './types'
 import { WorkItemRepository } from './work-items'
+import { TaskDependenciesRepository } from './task-dependencies'
+import { ContextPacketRepository } from './context-packets'
 
 const claimInputSchema = z.object({
+  contextPacketId: z.string().min(1).max(200).optional(),
+  contextOverrideReason: z.string().trim().min(1).max(2000).optional(),
   agentId: z.string().trim().min(1),
   agentDisplayName: z.string().trim().min(1).optional(),
   sessionId: z.string().trim().min(1).optional(),
@@ -49,6 +56,14 @@ const completionInputSchema = z.object({
   prUrl: z.string().url().nullable().optional()
 })
 
+const checkpointInputSchema = z.object({
+  progressMarkdown: z.string().trim().min(1).max(8_000),
+  filesChanged: z.array(z.string().trim().min(1).max(500)).max(100).default([]),
+  validationMarkdown: z.string().max(8_000).default(''),
+  questionsMarkdown: z.string().max(4_000).default(''),
+  nextActionsMarkdown: z.string().max(4_000).default('')
+}).strict()
+
 const workerHandoffInputSchema = z.object({
   sessionSummaryMarkdown: z.string().max(20_000)
 })
@@ -71,6 +86,7 @@ interface WorkClaimRow {
 }
 
 interface CompletionRecordRow {
+  pr_state: 'OPEN' | 'CLOSED' | 'MERGED' | null
   work_item_id: string
   summary_markdown: string
   session_summary_markdown: string
@@ -104,10 +120,14 @@ export class ClaimsRepository {
       this.workItems.get(workItemId)
       const now = this.now()
       this.expireClaimsAt(now)
+      new TaskDependenciesRepository(this.store, this.dependencies.clock).assertReady(workItemId)
+      const context = new ContextPacketRepository(this.store, { clock: this.dependencies.clock })
+      const packet = context.prepareLexical(workItemId, { packetId: parsed.contextPacketId, softOverrideReason: parsed.contextOverrideReason })
+      context.assertReady(packet)
       const transitioned = this.store.database
         .prepare(
           `UPDATE work_items
-           SET status = 'in_progress', updated_at = ?
+           SET status = 'in_progress', attention_reason = NULL, updated_at = ?
            WHERE id = ? AND status = 'backlog'`
         )
         .run(now, workItemId)
@@ -115,6 +135,14 @@ export class ClaimsRepository {
         throw new WorkstackError('WORK_ITEM_NOT_CLAIMABLE', 'The work item is not available to claim.')
       }
 
+      const priorCompletion = this.getCompletion(workItemId)
+      if (priorCompletion) {
+        if (priorCompletion.prState !== 'CLOSED') {
+          throw new WorkstackError('WORK_ITEM_NOT_CLAIMABLE', 'This work item has an unfinished pull request submission.')
+        }
+        this.archiveCompletion(priorCompletion, 'replacement_attempt')
+        this.store.database.prepare('DELETE FROM completion_records WHERE work_item_id = ?').run(workItemId)
+      }
       const leaseSeconds = Math.min(
         parsed.requestedLeaseSeconds ?? this.store.project.settings.defaultLeaseSeconds,
         this.store.project.settings.defaultLeaseSeconds
@@ -154,11 +182,13 @@ export class ClaimsRepository {
         leaseExpiresAt: claim.leaseExpiresAt
       })
       this.syncWorkItemMirror(workItemId)
+      context.recordUsage(packet.id, 'claim', claim.agentId, null, claim.id)
       return {
+        contextPacketId: packet.id,
         workItemId,
         claimToken: token,
         leaseExpiresAt: claim.leaseExpiresAt,
-        recommendedHeartbeatSeconds: this.store.project.settings.heartbeatSeconds,
+        recommendedHeartbeatSeconds: Math.min(this.store.project.settings.heartbeatSeconds, Math.max(1, Math.floor(leaseSeconds / 3))),
         claim
       }
     })
@@ -201,6 +231,59 @@ export class ClaimsRepository {
     return row ? toCompletionRecord(row) : undefined
   }
 
+  listCompletionHistory(workItemId: string): CompletionRecord[] {
+    this.workItems.get(workItemId)
+    return (this.store.database.prepare(
+      'SELECT completion_json FROM completion_history WHERE work_item_id = ? ORDER BY archived_at DESC, rowid DESC'
+    ).all(workItemId) as Array<{ completion_json: string }>).map((row) => JSON.parse(row.completion_json) as CompletionRecord)
+  }
+
+  saveCheckpoint(workItemId: string, claimToken: string, input: WorkCheckpointInput): WorkCheckpoint {
+    const payload = checkpointInputSchema.parse(input)
+    this.normalizeExpiredClaims()
+    return this.immediate(() => {
+      const claim = this.requireActiveClaimOwner(workItemId, claimToken)
+      const checkpoint: WorkCheckpoint = {
+        ...payload, id: this.createId(), workItemId, claimId: claim.id,
+        agentId: claim.agentId, sessionId: claim.sessionId, createdAt: this.now()
+      }
+      this.store.database.prepare(`INSERT INTO work_checkpoints
+        (id, work_item_id, claim_id, agent_id, session_id, created_at, payload_json)
+        VALUES (@id, @workItemId, @claimId, @agentId, @sessionId, @createdAt, @payloadJson)`)
+        .run({ ...checkpoint, payloadJson: JSON.stringify(payload) })
+      this.workItems.recordActivity('work_item_checkpoint_saved', 'agent', claim.agentId, workItemId, { checkpointId: checkpoint.id, claimId: claim.id })
+      return checkpoint
+    })
+  }
+
+  listCheckpoints(workItemId: string, limit = 20): WorkCheckpoint[] {
+    this.workItems.get(workItemId)
+    const boundedLimit = z.number().int().min(1).max(100).parse(limit)
+    const rows = this.store.database.prepare(`SELECT * FROM work_checkpoints
+      WHERE work_item_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(workItemId, boundedLimit) as Array<{
+        id: string; work_item_id: string; claim_id: string | null; agent_id: string | null;
+        session_id: string | null; created_at: string; payload_json: string
+      }>
+    return rows.map((row) => ({ ...JSON.parse(row.payload_json), id: row.id, workItemId: row.work_item_id,
+      claimId: row.claim_id, agentId: row.agent_id, sessionId: row.session_id, createdAt: row.created_at } as WorkCheckpoint))
+  }
+
+  recover(workItemId: string, input: ForceReleaseInput): WorkItem {
+    const parsed = forceReleaseInputSchema.parse(input)
+    this.normalizeExpiredClaims()
+    return this.immediate(() => {
+      const item = this.workItems.get(workItemId)
+      if (item.status === 'completed' || this.activeClaimFor(workItemId) || this.getCompletion(workItemId)?.prState === 'OPEN') {
+        throw new WorkstackError('INVALID_STATE_TRANSITION', 'Recovery requires unfinished work without an active owner or open pull request.')
+      }
+      this.store.database.prepare("UPDATE work_items SET status = 'backlog', attention_reason = NULL, updated_at = ? WHERE id = ?")
+        .run(this.now(), workItemId)
+      this.workItems.recordActivity('work_item_recovered', 'human', parsed.actorId ?? null, workItemId, { reason: parsed.reason })
+      this.syncWorkItemMirror(workItemId)
+      return this.workItems.get(workItemId)
+    })
+  }
+
   updateWorkerHandoff(workItemId: string, input: { sessionSummaryMarkdown: string }): CompletionRecord {
     const parsed = workerHandoffInputSchema.parse(input)
     const completion = this.immediate(() => {
@@ -223,7 +306,8 @@ export class ClaimsRepository {
     return this.immediate(() => {
       const now = this.now()
       const claim = this.requireActiveClaimOwner(workItemId, claimToken)
-      const leaseExpiresAt = addSeconds(now, this.store.project.settings.defaultLeaseSeconds)
+      const grantedSeconds = Math.max(1, Math.floor((Date.parse(claim.leaseExpiresAt) - Date.parse(claim.lastHeartbeatAt)) / 1000))
+      const leaseExpiresAt = addSeconds(now, Math.min(grantedSeconds, this.store.project.settings.defaultLeaseSeconds))
       this.store.database
         .prepare(
           `UPDATE work_claims
@@ -312,6 +396,7 @@ export class ClaimsRepository {
         commitSha: parsed.commitSha ?? null,
         branch: parsed.branch ?? null,
         prUrl: parsed.prUrl ?? null,
+        prState: parsed.prUrl ? 'OPEN' : null,
         completedByAgentId: claim.agentId,
         completedBySessionId: claim.sessionId,
         createdAt: now
@@ -321,11 +406,11 @@ export class ClaimsRepository {
           `INSERT INTO completion_records (
             work_item_id, summary_markdown, session_summary_markdown, implementation_notes_markdown, validation_markdown,
             known_limitations_markdown, files_changed_json, components_changed_json, commit_sha,
-            branch, pr_url, completed_by_agent_id, completed_by_session_id, created_at
+            branch, pr_url, pr_state, completed_by_agent_id, completed_by_session_id, created_at
           ) VALUES (
             @workItemId, @summaryMarkdown, @sessionSummaryMarkdown, @implementationNotesMarkdown, @validationMarkdown,
             @knownLimitationsMarkdown, @filesChangedJson, @componentsChangedJson, @commitSha,
-            @branch, @prUrl, @completedByAgentId, @completedBySessionId, @createdAt
+            @branch, @prUrl, @prState, @completedByAgentId, @completedBySessionId, @createdAt
           )`
         )
         .run({
@@ -339,13 +424,13 @@ export class ClaimsRepository {
       const finalized = !completion.prUrl
       if (finalized) {
         this.finalizeCompletion(completion, now)
+      } else {
+        this.workItems.recordActivity('work_item_submitted', 'agent', claim.agentId, workItemId, { prUrl: completion.prUrl })
       }
       this.syncWorkItemMirror(workItemId)
       return { completion, finalized }
     })
-    if (finalized) {
-      this.writeCompletionMirror(completion)
-    }
+    this.writeCompletionMirror(completion)
     if (finalized && this.store.project.settings.autoUpdateKnowledgeOnCompletion) {
       new KnowledgeRepository(this.store, { clock: this.clock() }).processNextJob()
     }
@@ -353,21 +438,39 @@ export class ClaimsRepository {
   }
 
   finalizeMergedPullRequest(workItemId: string): CompletionRecord {
-    const completion = this.immediate(() => {
-      const workItem = this.workItems.get(workItemId)
-      const row = this.store.database
-        .prepare('SELECT * FROM completion_records WHERE work_item_id = ?')
-        .get(workItemId) as CompletionRecordRow | undefined
-      const completion = row ? toCompletionRecord(row) : undefined
-      if (!completion?.prUrl || workItem.status !== 'in_progress') {
-        throw new WorkstackError('INVALID_STATE_TRANSITION', 'The work item is not awaiting a pull request merge.')
+    const item = this.workItems.get(workItemId)
+    const completion = this.getCompletion(workItemId)
+    if (item.status !== 'in_progress' || !completion?.prUrl) {
+      throw new WorkstackError('INVALID_STATE_TRANSITION', 'The work item is not awaiting a pull request merge.')
+    }
+    return this.reconcilePullRequest(workItemId, completion.prUrl, 'MERGED')
+  }
+
+  reconcilePullRequest(workItemId: string, prUrl: string, state: 'OPEN' | 'CLOSED' | 'MERGED'): CompletionRecord {
+    const { completion, finalized } = this.immediate(() => {
+      const item = this.workItems.get(workItemId)
+      const existing = this.getCompletion(workItemId)
+      if (!existing || existing.prUrl !== prUrl || this.activeClaimFor(workItemId)) {
+        throw new WorkstackError('INVALID_STATE_TRANSITION', 'The pull request is no longer the current submission for this task.')
       }
-      this.finalizeCompletion(completion, this.now())
+      if (existing.prState === state || item.status === 'completed') return { completion: existing, finalized: false }
+      const completion = { ...existing, prState: state }
+      const now = this.now()
+      this.store.database.prepare('UPDATE completion_records SET pr_state = ? WHERE work_item_id = ?').run(state, workItemId)
+      if (state === 'MERGED') {
+        // A closed submission can merge before a replacement claim starts.
+        this.store.database.prepare("UPDATE work_items SET status = 'in_progress' WHERE id = ? AND status = 'backlog'").run(workItemId)
+        this.finalizeCompletion(completion, now)
+      } else {
+        this.store.database.prepare('UPDATE work_items SET status = ?, attention_reason = ?, updated_at = ? WHERE id = ?')
+          .run(state === 'OPEN' ? 'in_progress' : 'backlog', state === 'CLOSED' ? 'Pull request closed without merging. Resume this task to create a new submission.' : null, now, workItemId)
+      }
+      this.workItems.recordActivity('work_item_pull_request_reconciled', 'system', null, workItemId, { prUrl, state })
       this.syncWorkItemMirror(workItemId)
-      return completion
+      return { completion, finalized: state === 'MERGED' }
     })
     this.writeCompletionMirror(completion)
-    if (this.store.project.settings.autoUpdateKnowledgeOnCompletion) {
+    if (finalized && this.store.project.settings.autoUpdateKnowledgeOnCompletion) {
       new KnowledgeRepository(this.store, { clock: this.clock() }).processNextJob()
     }
     return completion
@@ -394,6 +497,7 @@ export class ClaimsRepository {
         .prepare('SELECT claim_token_hash FROM work_claims WHERE id = ?')
         .get(claim.id) as { claim_token_hash: string }
       if (activeToken.claim_token_hash === tokenHash) {
+        if (claim.leaseExpiresAt <= this.now()) throw new WorkstackError('CLAIM_EXPIRED', 'This claim lease has expired.')
         return claim
       }
     }
@@ -431,7 +535,7 @@ export class ClaimsRepository {
     this.store.database
       .prepare(
         `UPDATE work_items
-         SET status = 'backlog', updated_at = ?
+         SET status = 'backlog', attention_reason = NULL, updated_at = ?
          WHERE id = ? AND status = 'in_progress'`
       )
       .run(now, claim.workItemId)
@@ -457,10 +561,11 @@ export class ClaimsRepository {
       this.store.database
         .prepare(
           `UPDATE work_items
-           SET status = 'backlog', updated_at = ?
+           SET status = ?, attention_reason = ?, updated_at = ?
            WHERE id = ? AND status = 'in_progress'`
         )
-        .run(now, claim.workItemId)
+        .run(this.store.project.settings.autoReleaseExpiredClaims ? 'backlog' : 'in_progress',
+          this.store.project.settings.autoReleaseExpiredClaims ? null : 'Claim expired. Manual recovery is required before this task can be claimed again.', now, claim.workItemId)
       this.workItems.recordActivity('work_item_claim_expired', 'system', null, claim.workItemId, {
         agentId: claim.agentId,
         leaseExpiresAt: claim.leaseExpiresAt
@@ -482,7 +587,7 @@ export class ClaimsRepository {
     const transitioned = this.store.database
       .prepare(
         `UPDATE work_items
-         SET status = 'completed', completed_at = ?, updated_at = ?
+         SET status = 'completed', attention_reason = NULL, completed_at = ?, updated_at = ?
          WHERE id = ? AND status = 'in_progress'`
       )
       .run(now, now, completion.workItemId)
@@ -493,6 +598,7 @@ export class ClaimsRepository {
       completion.workItemId,
       [
         completion.summaryMarkdown,
+        completion.sessionSummaryMarkdown,
         completion.implementationNotesMarkdown,
         completion.validationMarkdown,
         completion.knownLimitationsMarkdown,
@@ -500,6 +606,12 @@ export class ClaimsRepository {
         completion.componentsChanged.join('\n')
       ].join('\n')
     )
+    if (completion.prUrl && this.store.project.settings.autoUpdateKnowledgeOnCompletion) {
+      this.store.database.prepare(`INSERT OR IGNORE INTO knowledge_delivery_outbox
+        (event_key, work_item_id, pr_url, status, attempts, created_at, updated_at)
+        VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+        .run(`merge:${completion.workItemId}:${completion.prUrl}`, completion.workItemId, completion.prUrl, now, now)
+    }
     const sourceId = this.createId()
     this.store.database
       .prepare(
@@ -528,6 +640,11 @@ export class ClaimsRepository {
       branch: completion.branch,
       knowledgeSourceId: sourceId
     })
+  }
+
+  private archiveCompletion(completion: CompletionRecord, reason: string): void {
+    this.store.database.prepare('INSERT INTO completion_history (id, work_item_id, completion_json, archived_at, reason) VALUES (?, ?, ?, ?, ?)')
+      .run(this.createId(), completion.workItemId, JSON.stringify(completion), this.now(), reason)
   }
 
   private syncWorkItemMirror(workItemId: string): void {
@@ -592,7 +709,7 @@ function toCompletionRecord(row: CompletionRecordRow): CompletionRecord {
   return {
     workItemId: row.work_item_id,
     summaryMarkdown: row.summary_markdown,
-    sessionSummaryMarkdown: row.session_summary_markdown ?? '',
+    sessionSummaryMarkdown: row.session_summary_markdown,
     implementationNotesMarkdown: row.implementation_notes_markdown,
     validationMarkdown: row.validation_markdown,
     knownLimitationsMarkdown: row.known_limitations_markdown,
@@ -601,6 +718,7 @@ function toCompletionRecord(row: CompletionRecordRow): CompletionRecord {
     commitSha: row.commit_sha,
     branch: row.branch,
     prUrl: row.pr_url,
+    prState: row.pr_state,
     completedByAgentId: row.completed_by_agent_id,
     completedBySessionId: row.completed_by_session_id,
     createdAt: row.created_at

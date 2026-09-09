@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FrozenClock } from '../../src/core/clock'
 import { ClaimsRepository } from '../../src/core/claims'
 import { ProjectStore } from '../../src/core/project-store'
@@ -216,6 +216,74 @@ describe('ClaimsRepository', () => {
     store.close()
   })
 
+  it('keeps short requested leases renewable before expiry and honors manual recovery policy', async () => {
+    const { claims, clock, store, workItems } = await createClaimsRepository()
+    await store.updateMetadata({ settings: { autoReleaseExpiredClaims: false } })
+    const item = workItems.create({ title: 'Short lease with manual recovery' })
+    const claim = claims.claim(item.id, { agentId: 'first', requestedLeaseSeconds: 60 })
+    expect(claim.recommendedHeartbeatSeconds).toBe(20)
+    clock.advance(claim.recommendedHeartbeatSeconds * 1000)
+    expect(claims.heartbeat(item.id, claim.claimToken).leaseExpiresAt).toBe('2026-08-11T00:01:20.000Z')
+    clock.advance(60_000)
+    expect(claims.getActive(item.id)).toBeUndefined()
+    expect(workItems.get(item.id)).toMatchObject({ status: 'in_progress', attentionReason: expect.stringContaining('Manual recovery') })
+    expectErrorCode(() => claims.claim(item.id, { agentId: 'next' }), 'WORK_ITEM_NOT_CLAIMABLE')
+    expectErrorCode(() => claims.heartbeat(item.id, claim.claimToken), 'CLAIM_EXPIRED')
+    expect(claims.recover(item.id, { reason: 'Reviewed prior work' })).toMatchObject({ status: 'backlog', attentionReason: null })
+    expect(claims.claim(item.id, { agentId: 'next' }).claim.agentId).toBe('next')
+    store.close()
+  })
+
+  it('preserves owner checkpoints across expiry, release, and replacement claims', async () => {
+    const { claims, clock, store, workItems } = await createClaimsRepository()
+    const item = workItems.create({ title: 'Recover interrupted work' })
+    const original = claims.claim(item.id, { agentId: 'first', sessionId: 'session-1', requestedLeaseSeconds: 60 })
+    const first = claims.saveCheckpoint(item.id, original.claimToken, {
+      progressMarkdown: 'Parser updated', filesChanged: ['src/parser.ts'], validationMarkdown: 'Two parser cases pass',
+      questionsMarkdown: 'Confirm input limit', nextActionsMarkdown: 'Add boundary tests'
+    })
+    expect(first).toMatchObject({ claimId: original.claim.id, agentId: 'first', sessionId: 'session-1' })
+    clock.advance(60_000)
+    expectErrorCode(() => claims.saveCheckpoint(item.id, original.claimToken, { progressMarkdown: 'Stale write' }), 'CLAIM_EXPIRED')
+    const replacement = claims.claim(item.id, { agentId: 'second' })
+    const second = claims.saveCheckpoint(item.id, replacement.claimToken, { progressMarkdown: 'Boundary cases added' })
+    claims.release(item.id, replacement.claimToken, 'Paused for review')
+    expectErrorCode(() => claims.saveCheckpoint(item.id, replacement.claimToken, { progressMarkdown: 'Released write' }), 'CLAIM_TOKEN_INVALID')
+    expect(claims.listCheckpoints(item.id)).toEqual([second, first])
+    expect(claims.listCheckpoints(item.id, 1)).toEqual([second])
+    const rootPath = store.paths.rootPath
+    store.close()
+    const reopened = await ProjectStore.open(rootPath)
+    expect(new ClaimsRepository(reopened).listCheckpoints(item.id)).toEqual([second, first])
+    reopened.close()
+  })
+
+  it('recovers closed submissions, detects reopening, and preserves superseded evidence', async () => {
+    const { claims, clock, store, workItems } = await createClaimsRepository()
+    const item = workItems.create({ title: 'Submit a replacement PR' })
+    claims.claim(item.id, { agentId: 'first' })
+    const url = 'https://github.com/example/repo/pull/41'
+    const first = claims.complete(item.id, 'claim-token-one', { summaryMarkdown: 'Original implementation', prUrl: url })
+    claims.reconcilePullRequest(item.id, url, 'CLOSED')
+    expect(workItems.get(item.id)).toMatchObject({ status: 'backlog', deliveryState: 'closed' })
+    claims.reconcilePullRequest(item.id, url, 'OPEN')
+    expect(workItems.get(item.id)).toMatchObject({ status: 'in_progress', deliveryState: 'awaiting_review', attentionReason: null })
+    claims.reconcilePullRequest(item.id, url, 'CLOSED')
+    clock.advance(1000)
+    claims.claim(item.id, { agentId: 'second' })
+    expect(claims.listCompletionHistory(item.id)).toEqual([{ ...first, prState: 'CLOSED' }])
+    expectErrorCode(() => claims.reconcilePullRequest(item.id, url, 'OPEN'), 'INVALID_STATE_TRANSITION')
+    const nextUrl = 'https://github.com/example/repo/pull/42'
+    claims.complete(item.id, 'claim-token-two', { summaryMarkdown: 'Replacement implementation', prUrl: nextUrl })
+    expectErrorCode(() => claims.reconcilePullRequest(item.id, url, 'MERGED'), 'INVALID_STATE_TRANSITION')
+    claims.reconcilePullRequest(item.id, nextUrl, 'MERGED')
+    expect(workItems.get(item.id)).toMatchObject({ status: 'completed', deliveryState: 'merged' })
+    const count = store.database.prepare('SELECT COUNT(*) AS count FROM knowledge_sources').get()
+    claims.reconcilePullRequest(item.id, nextUrl, 'MERGED')
+    expect(store.database.prepare('SELECT COUNT(*) AS count FROM knowledge_sources').get()).toEqual(count)
+    store.close()
+  })
+
   it('uses secure production defaults when deterministic dependencies are not supplied', async () => {
     const rootPath = await mkdtemp(path.join(os.tmpdir(), 'workstack-default-claims-'))
     cleanupPaths.push(rootPath)
@@ -344,12 +412,11 @@ describe('ClaimsRepository', () => {
     expect(workItems.get(workItem.id)).toMatchObject({ status: 'in_progress', completedAt: null })
     expect(claims.listHistory(workItem.id)).toMatchObject([{ state: 'completed' }])
     expect(store.database.prepare('SELECT COUNT(*) AS count FROM knowledge_sources').get()).toEqual({ count: 0 })
-    await expect(readFile(path.join(store.paths.workItemsPath, workItem.id, 'completion.md'), 'utf8')).rejects.toMatchObject({
-      code: 'ENOENT'
-    })
+    await expect(readFile(path.join(store.paths.workItemsPath, workItem.id, 'completion.md'), 'utf8')).resolves.toContain('Ready for merge.')
+    expect(workItems.get(workItem.id).deliveryState).toBe('awaiting_review')
 
     clock.advance(60_000)
-    expect(claims.finalizeMergedPullRequest(workItem.id)).toEqual(completion)
+    expect(claims.finalizeMergedPullRequest(workItem.id)).toEqual({ ...completion, prState: 'MERGED' })
     expect(workItems.get(workItem.id)).toMatchObject({ status: 'completed', completedAt: '2026-08-11T00:01:00.000Z' })
     expect(store.database.prepare('SELECT status FROM knowledge_sources WHERE source_work_item_id = ?').get(workItem.id)).toEqual({
       status: 'indexed'
@@ -393,6 +460,48 @@ describe('ClaimsRepository', () => {
     await expect(readFile(path.join(store.paths.workItemsPath, minimal.id, 'completion.md'), 'utf8')).resolves.toContain(
       'session: \ncommit: '
     )
+    store.close()
+  })
+
+  it('rejects recovery of owned or delivered tasks and never overwrites an unfinished submission', async () => {
+    const { claims, store, workItems } = await createClaimsRepository()
+    const item = workItems.create({ title: 'Guard recovery transitions' })
+    expectErrorCode(() => claims.updateWorkerHandoff(item.id, { sessionSummaryMarkdown: 'Too early' }), 'INVALID_STATE_TRANSITION')
+    claims.claim(item.id, { agentId: 'first' })
+    expectErrorCode(() => claims.recover(item.id, { reason: 'Owned' }), 'INVALID_STATE_TRANSITION')
+    const url = 'https://github.com/example/repo/pull/42'
+    claims.complete(item.id, 'claim-token-one', { summaryMarkdown: 'Submitted', prUrl: url })
+    expectErrorCode(() => claims.recover(item.id, { reason: 'Awaiting review' }), 'INVALID_STATE_TRANSITION')
+    // A legacy inconsistent backlog row must not permit replacing open PR evidence.
+    store.database.prepare("UPDATE work_items SET status = 'backlog' WHERE id = ?").run(item.id)
+    expectErrorCode(() => claims.claim(item.id, { agentId: 'replacement' }), 'WORK_ITEM_NOT_CLAIMABLE')
+    expect(claims.getCompletion(item.id)?.summaryMarkdown).toBe('Submitted')
+    claims.reconcilePullRequest(item.id, url, 'MERGED')
+    expectErrorCode(() => claims.recover(item.id, { reason: 'Delivered' }), 'INVALID_STATE_TRANSITION')
+    store.close()
+  })
+
+  it('rechecks ownership when the lease expires between normalization and a checkpoint write', async () => {
+    const { claims, clock, store, workItems } = await createClaimsRepository()
+    const item = workItems.create({ title: 'Expire at the write boundary' })
+    const claim = claims.claim(item.id, { agentId: 'first', requestedLeaseSeconds: 60 })
+    const clockRead = vi.spyOn(clock, 'now')
+      .mockReturnValueOnce(new Date('2026-08-11T00:00:59.999Z'))
+      .mockReturnValue(new Date('2026-08-11T00:01:00.000Z'))
+    expectErrorCode(() => claims.saveCheckpoint(item.id, claim.claimToken, { progressMarkdown: 'Too late' }), 'CLAIM_EXPIRED')
+    expect(claims.listCheckpoints(item.id)).toEqual([])
+    clockRead.mockRestore()
+    store.close()
+  })
+
+  it('rolls back completion and ownership changes if stored task state is inconsistent', async () => {
+    const { claims, store, workItems } = await createClaimsRepository()
+    const item = workItems.create({ title: 'Recover inconsistent state' })
+    const claim = claims.claim(item.id, { agentId: 'first' })
+    store.database.prepare("UPDATE work_items SET status = 'backlog' WHERE id = ?").run(item.id)
+    expectErrorCode(() => claims.complete(item.id, claim.claimToken, { summaryMarkdown: 'Cannot transition' }), 'INVALID_STATE_TRANSITION')
+    expect(claims.getCompletion(item.id)).toBeUndefined()
+    expect(claims.getActive(item.id)?.state).toBe('active')
     store.close()
   })
 

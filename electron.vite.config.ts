@@ -17,6 +17,7 @@ export default defineConfig({
     }
   },
   renderer: {
+    define: { 'import.meta.env.VITE_WORKSTACK_BROWSER_DEMO': JSON.stringify('false') },
     plugins: [react()]
   }
 })

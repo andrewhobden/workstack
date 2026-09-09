@@ -18,7 +18,7 @@ If in the course of this work you discover a bug in another part of the codebase
 If the feature being asked to work on is huge then it is ok that instead of working on implementation you instead work on architectural design, break down the project into phases, with each phase having a list of feature work. Use workstack_create_feature to add workitems for all the individual tasks.`
 
 export const DEFAULT_COPILOT_LAUNCH_PROMPT = `Get the details of the feature/bug from workstack and claim it as active work.
-Workstack has already created an isolated Git worktree and branch in the form 'anhobden/{feature name}' for this work item. Work only in the current worktree; do not create or check out another branch.
+Workstack has prepared an isolated task worktree and branch. Work only in the current worktree; do not create or check out another branch.
 Before doing any work on the item, in addition to the details of the feature/bug, you can do searches of the knowledge with workstack_search_completed and workstack_search_knowledge to get more context about the application.
 If working on a bug, you should first implement one or more unit/UX tests to reproduce the issue. Then you should resolve the problem. Keep iterating on the problem until all the initial tests are green.
 If working on a feature, before you work on the feature, you should perform some planning to break the task down into small tasks that can each be individually tested. All components should be built in a way that makes it suitable for both unit testing and UX testing with Playwright, everything you write or update MUST BE TESTED! Build the tests in parallel with writing the code. For all code with a UX component, after completion of a feature, perform a visual inspection of the running UX. Send a screenshot of the Playwright test to a multi-modal LLM to analyze and look for cut off/overlapped/clipped regions and other visual anomalies.
@@ -37,6 +37,8 @@ export type WikiAutomationArtifactKind = (typeof WIKI_AUTOMATION_ARTIFACT_KINDS)
 export type WikiAutomationHandoffStatus = (typeof WIKI_AUTOMATION_HANDOFF_STATUSES)[number]
 
 export interface ProjectSettings {
+  agentExecutionProfile?: 'inspection' | 'implementation' | 'advanced'
+  knowledgeChatProfile?: 'inspection' | 'advanced'
   workItemPrefix: string
   defaultLeaseSeconds: number
   heartbeatSeconds: number
@@ -64,6 +66,8 @@ export interface ProjectRegistryRecord {
 }
 
 export interface ProjectSummary extends ProjectRegistryRecord {
+  availability?: 'available' | 'missing' | 'invalid' | 'unreadable' | 'deleting'
+  availabilityError?: string
   backlogCount: number
   inProgressCount: number
   completedCount: number
@@ -87,6 +91,10 @@ export interface InitializeProjectInput {
 }
 
 export interface WorkItem {
+  attentionReason?: string | null
+  deliveryState?: 'awaiting_review' | 'closed' | 'merged' | null
+  originPlanningSessionId?: string | null
+  originPlanningRevision?: number | null
   id: string
   sequenceNumber: number
   displayId: string
@@ -120,6 +128,8 @@ export interface WorkClaim {
 }
 
 export interface ClaimWorkItemInput {
+  contextPacketId?: string
+  contextOverrideReason?: string
   agentId: string
   agentDisplayName?: string
   sessionId?: string
@@ -127,6 +137,7 @@ export interface ClaimWorkItemInput {
 }
 
 export interface ClaimWorkItemResult {
+  contextPacketId: string
   workItemId: string
   claimToken: string
   leaseExpiresAt: string
@@ -158,6 +169,7 @@ export interface CompletionInput {
 }
 
 export interface CompletionRecord {
+  prState?: 'OPEN' | 'CLOSED' | 'MERGED' | null
   workItemId: string
   summaryMarkdown: string
   sessionSummaryMarkdown: string
@@ -171,6 +183,23 @@ export interface CompletionRecord {
   prUrl: string | null
   completedByAgentId: string | null
   completedBySessionId: string | null
+  createdAt: string
+}
+
+export interface WorkCheckpointInput {
+  progressMarkdown: string
+  filesChanged?: string[]
+  validationMarkdown?: string
+  questionsMarkdown?: string
+  nextActionsMarkdown?: string
+}
+
+export interface WorkCheckpoint extends Required<WorkCheckpointInput> {
+  id: string
+  workItemId: string
+  claimId: string | null
+  agentId: string | null
+  sessionId: string | null
   createdAt: string
 }
 
@@ -326,6 +355,7 @@ export interface PlanningMessage {
 export type ClaimHealth = 'healthy' | 'attention'
 
 export interface CreateWorkItemInput {
+  requestId?: string
   type?: WorkItemType
   title: string
   descriptionMarkdown?: string
@@ -375,18 +405,21 @@ export interface Attachment {
 }
 
 export interface FileAttachmentInput {
+  requestId?: string
   sourcePath: string
   originalFilename?: string
   mimeType?: string
 }
 
 export interface BinaryAttachmentInput {
+  requestId?: string
   data: Buffer
   originalFilename: string
   mimeType?: string
 }
 
 export interface PastedImageInput {
+  requestId?: string
   data: Buffer
   originalFilename?: string
   mimeType?: string
@@ -398,9 +431,15 @@ export interface PlanningContextEvidence {
   title: string
   excerpt: string
   metadata?: Record<string, string | number | null>
+  image?: { mimeType: string; dataBase64: string }
 }
 
 export interface PlanningContext {
+  id?: string
+  query?: string
+  assembledAt?: string
+  messages?: PlanningMessage[]
+  omissions?: string[]
   project: Pick<ProjectMetadata, 'id' | 'name' | 'description' | 'rootPath'>
   proposal: PlanningProposal
   knowledge: PlanningContextEvidence[]
@@ -429,6 +468,7 @@ export interface KnowledgeChatMessage {
 }
 
 export interface KnowledgeChatToolCall {
+  providerCallId?: string | null
   id: string
   sessionId: string
   toolName: string

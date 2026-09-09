@@ -1,8 +1,9 @@
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import { systemClock, type Clock } from './clock'
 import { WorkstackError } from './errors'
+import { atomicWriteText, withProcessLock } from './project-lifecycle'
 import type { ProjectMetadata, ProjectRegistryRecord } from './types'
 
 const projectRegistryRecordSchema = z.object({
@@ -10,7 +11,8 @@ const projectRegistryRecordSchema = z.object({
   name: z.string().min(1),
   description: z.string(),
   rootPath: z.string().min(1),
-  lastOpenedAt: z.string().datetime()
+  lastOpenedAt: z.string().datetime(),
+  metadataUpdatedAt: z.string().datetime().optional()
 })
 
 const registrySchema = z.object({
@@ -34,56 +36,74 @@ export class ProjectRegistry {
     const registry = await this.read()
     return [...registry.projects]
       .sort((left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt))
-      .map((project) => structuredClone(project))
+      .map(publicRecord)
   }
 
   async find(id: string): Promise<ProjectRegistryRecord | undefined> {
     const project = (await this.read()).projects.find((candidate) => candidate.id === id)
-    return project ? structuredClone(project) : undefined
+    return project ? publicRecord(project) : undefined
   }
 
   async register(project: ProjectMetadata): Promise<ProjectRegistryRecord> {
-    const registry = await this.read()
-    const record = toRegistryRecord(project, this.clock.now().toISOString())
-    const existingByIdIndex = registry.projects.findIndex((candidate) => candidate.id === record.id)
-    const conflictingRoot = registry.projects.find(
-      (candidate) => candidate.rootPath === record.rootPath && candidate.id !== record.id
-    )
+    return this.mutateRegistration(project, false)
+  }
 
-    if (conflictingRoot) {
-      throw new WorkstackError('VALIDATION_ERROR', 'This project folder is already registered.')
-    }
+  /** Updating a projection must never resurrect a concurrently detached project. */
+  async refresh(project: ProjectMetadata): Promise<ProjectRegistryRecord> {
+    return this.mutateRegistration(project, true)
+  }
 
-    if (existingByIdIndex === -1) {
-      registry.projects.push(record)
-    } else {
-      registry.projects[existingByIdIndex] = record
-    }
+  private async mutateRegistration(project: ProjectMetadata, requireExisting: boolean): Promise<ProjectRegistryRecord> {
+    return withProcessLock(`${this.filePath}.lock.sqlite`, 'registry', async () => {
+      const registry = await this.read()
+      const record = { ...toRegistryRecord(project, this.clock.now().toISOString()), metadataUpdatedAt: project.updatedAt }
+      const existingByIdIndex = registry.projects.findIndex((candidate) => candidate.id === record.id)
+      if (requireExisting && existingByIdIndex === -1) {
+        throw new WorkstackError('PROJECT_NOT_FOUND', 'The project was detached while its metadata was being updated. Reconnect it to restore the registration.')
+      }
+      const existing = registry.projects[existingByIdIndex]
+      if (existing?.metadataUpdatedAt && existing.metadataUpdatedAt > project.updatedAt) return publicRecord(existing)
+      const conflictingRoot = registry.projects.find(
+        (candidate) => candidate.rootPath === record.rootPath && candidate.id !== record.id
+      )
 
-    await this.write(registry)
-    return structuredClone(record)
+      if (conflictingRoot) {
+        throw new WorkstackError('VALIDATION_ERROR', 'This project folder is already registered.')
+      }
+
+      if (existingByIdIndex === -1) {
+        registry.projects.push(record)
+      } else {
+        registry.projects[existingByIdIndex] = record
+      }
+
+      await this.write(registry)
+      return publicRecord(record)
+    })
   }
 
   async update(
     id: string,
     updates: Pick<ProjectRegistryRecord, 'name' | 'description'>
   ): Promise<ProjectRegistryRecord> {
-    const registry = await this.read()
-    const project = registry.projects.find((candidate) => candidate.id === id)
-    if (!project) {
-      throw new WorkstackError('PROJECT_NOT_FOUND', 'The selected project is not registered.')
-    }
+    return withProcessLock(`${this.filePath}.lock.sqlite`, 'registry', async () => {
+      const registry = await this.read()
+      const project = registry.projects.find((candidate) => candidate.id === id)
+      if (!project) {
+        throw new WorkstackError('PROJECT_NOT_FOUND', 'The selected project is not registered.')
+      }
 
-    const name = updates.name.trim()
-    if (!name) {
-      throw new WorkstackError('VALIDATION_ERROR', 'Project name is required.')
-    }
+      const name = updates.name.trim()
+      if (!name) {
+        throw new WorkstackError('VALIDATION_ERROR', 'Project name is required.')
+      }
 
-    project.name = name
-    project.description = updates.description.trim()
-    project.lastOpenedAt = this.clock.now().toISOString()
-    await this.write(registry)
-    return structuredClone(project)
+      project.name = name
+      project.description = updates.description.trim()
+      project.lastOpenedAt = this.clock.now().toISOString()
+      await this.write(registry)
+      return publicRecord(project)
+    })
   }
 
   async detach(id: string): Promise<boolean> {
@@ -91,15 +111,17 @@ export class ProjectRegistry {
   }
 
   async remove(id: string): Promise<boolean> {
-    const registry = await this.read()
-    const remainingProjects = registry.projects.filter((project) => project.id !== id)
-    if (remainingProjects.length === registry.projects.length) {
-      return false
-    }
+    return withProcessLock(`${this.filePath}.lock.sqlite`, 'registry', async () => {
+      const registry = await this.read()
+      const remainingProjects = registry.projects.filter((project) => project.id !== id)
+      if (remainingProjects.length === registry.projects.length) {
+        return false
+      }
 
-    registry.projects = remainingProjects
-    await this.write(registry)
-    return true
+      registry.projects = remainingProjects
+      await this.write(registry)
+      return true
+    })
   }
 
   private async read(): Promise<RegistryDocument> {
@@ -117,10 +139,12 @@ export class ProjectRegistry {
 
   private async write(registry: RegistryDocument): Promise<void> {
     await mkdir(path.dirname(this.filePath), { recursive: true })
-    const temporaryPath = `${this.filePath}.tmp`
-    await writeFile(temporaryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
-    await rename(temporaryPath, this.filePath)
+    atomicWriteText(this.filePath, `${JSON.stringify(registry, null, 2)}\n`)
   }
+}
+
+function publicRecord(record: z.infer<typeof projectRegistryRecordSchema>): ProjectRegistryRecord {
+  return { id: record.id, name: record.name, description: record.description, rootPath: record.rootPath, lastOpenedAt: record.lastOpenedAt }
 }
 
 function toRegistryRecord(project: ProjectMetadata, lastOpenedAt: string): ProjectRegistryRecord {

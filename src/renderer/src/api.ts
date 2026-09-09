@@ -1,3 +1,4 @@
+import { SEMANTIC_LIMITS } from '../../core/semantic-index-contracts'
 import type { BinaryAttachmentPayload, DesktopApi, CreateProjectInput } from '../../shared/desktop-api'
 import type { KnowledgeSearchResult, KnowledgeSourceInput, ProjectPullRequest } from '../../shared/desktop-api'
 import type {
@@ -31,6 +32,9 @@ import { DEFAULT_COPILOT_LAUNCH_PROMPT } from '../../core/types'
 import type { PlanningContext, PlanningMessage, PlanningProposal } from '../../core/types'
 
 interface BrowserState {
+  planningContexts?: Record<string, PlanningContext>
+  planningConvertedItems?: Record<string, string>
+  requestReceipts?: Record<string, { payload: string; result: WorkItem | Attachment }>
   projects: ProjectMetadata[]
   workItemsByProject: Record<string, WorkItem[]>
   claimsByWorkItem: Record<string, WorkClaim[]>
@@ -60,7 +64,9 @@ interface BrowserKnowledgeSource extends KnowledgeSource {
 const browserStorageKey = 'workstack-browser-state'
 
 export function getDesktopApi(): DesktopApi {
-  return window.workstack ?? browserDesktopApi
+  if (window.workstack) return window.workstack
+  if (import.meta.env.VITE_WORKSTACK_BROWSER_DEMO === 'true') return browserDesktopApi
+  throw new Error('Workstack could not load its desktop bridge. Restart the app or reinstall the current build. Your project data has not been changed.')
 }
 
 const browserDesktopApi: DesktopApi = {
@@ -68,14 +74,15 @@ const browserDesktopApi: DesktopApi = {
     appVersion: async () => '0.1.0'
   },
   ai: {
+    cancel: async () => false,
     settings: async () => ({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', apiMode: 'chat_completions', configured: false }),
     configure: async (input) => ({ baseUrl: input.baseUrl, model: input.model, apiMode: input.apiMode ?? 'chat_completions', configured: Boolean(input.apiKey) }),
     listModels: async (input) => input.baseUrl.includes('example.test')
       ? [{ id: 'test-model' }, { id: 'test-model-large' }]
       : [{ id: 'gpt-4o-mini' }],
     propose: async (prompt) => `Suggested planning notes for: ${prompt}`,
-    proposePlanning: async (projectId, sessionId, prompt) => {
-      const context = await browserDesktopApi.planning.context(projectId, sessionId, prompt)
+    proposePlanning: async (projectId, sessionId, prompt, contextId) => {
+      const context = (contextId ? loadState().planningContexts?.[contextId] : undefined) ?? await browserDesktopApi.planning.context(projectId, sessionId, prompt)
       return `Suggested planning notes for: ${prompt}\n\nUsing ${context.knowledge.length + context.completedWork.length + context.backlogOverlap.length} relevant project records.`
     }
   },
@@ -110,6 +117,13 @@ const browserDesktopApi: DesktopApi = {
       const state = loadState()
       const project = requireProject(state, projectId)
       applyProjectUpdate(project, updates)
+      saveState(state)
+      return toSummary(project, state.workItemsByProject[projectId] ?? [])
+    },
+    reconnect: async (projectId, rootPath) => {
+      const state = loadState()
+      const project = requireProject(state, projectId)
+      project.rootPath = rootPath
       saveState(state)
       return toSummary(project, state.workItemsByProject[projectId] ?? [])
     },
@@ -155,6 +169,20 @@ const browserDesktopApi: DesktopApi = {
     }
   },
   workItems: {
+    preflight: async (projectId) => ({ profile: 'advanced', supported: true, workspacePath: requireProject(loadState(), projectId).rootPath, capabilities: { readFiles: true, writeFiles: true, network: true, externalProcesses: true, scope: 'user' }, reason: 'Browser demonstration only. No agent will be launched.' }),
+    checkpoints: async () => [],
+    completionHistory: async (projectId, workItemId) => { const state = loadState(); requireWorkItem(state, projectId, workItemId); return state.completionsByWorkItem[workItemId] ? [state.completionsByWorkItem[workItemId]] : [] },
+    recover: async (projectId, workItemId, input) => {
+      if (!input.reason.trim()) throw new Error('Recovery requires a reason.')
+      const state = loadState()
+      const item = requireWorkItem(state, projectId, workItemId)
+      if (item.status === 'completed') throw new Error('Completed work cannot be recovered.')
+      item.status = 'backlog'
+      item.attentionReason = null
+      delete state.claimsByWorkItem[workItemId]
+      saveState(state)
+      return clone(item)
+    },
     list: async (projectId, filters = {}) => {
       const state = loadState()
       requireProject(state, projectId)
@@ -163,6 +191,12 @@ const browserDesktopApi: DesktopApi = {
     create: async (projectId, input) => {
       const state = loadState()
       const project = requireProject(state, projectId)
+      const receiptKey = input.requestId ? `work:${projectId}:${input.requestId}` : undefined
+      const receipt = receiptKey ? state.requestReceipts?.[receiptKey] : undefined
+      if (receipt) {
+        if (receipt.payload !== JSON.stringify(input)) throw new Error('This request ID was already used for a different work item.')
+        return clone(receipt.result as WorkItem)
+      }
       const items = state.workItemsByProject[projectId] ?? []
       const now = new Date().toISOString()
       const workItem: WorkItem = {
@@ -180,6 +214,10 @@ const browserDesktopApi: DesktopApi = {
         createdAt: now,
         updatedAt: now,
         completedAt: null
+      }
+      if (receiptKey) {
+        state.requestReceipts ??= {}
+        state.requestReceipts[receiptKey] = { payload: JSON.stringify(input), result: workItem }
       }
       items.push(workItem)
       state.workItemsByProject[projectId] = items
@@ -312,6 +350,14 @@ const browserDesktopApi: DesktopApi = {
       return clone(claim)
     }
   },
+  semantic: {
+    async status() { return { enabled: false, indexedPassages: 0, eligiblePassages: 0, truncated: false, busy: false, jobs: [], limits: SEMANTIC_LIMITS } },
+    async chooseModel() { throw new Error('Open Workstack desktop to select and use a local model file.') },
+    async disable() { throw new Error('Local semantic settings are available in Workstack desktop.') },
+    async reindex() { throw new Error('Local semantic indexing is available in Workstack desktop.') },
+    async cancel() { throw new Error('Local semantic indexing is available in Workstack desktop.') },
+    async retry() { throw new Error('Local semantic indexing is available in Workstack desktop.') }
+  },
   knowledge: {
     listSources: async (projectId) => {
       const state = loadState()
@@ -365,6 +411,79 @@ const browserDesktopApi: DesktopApi = {
       saveState(state)
       return clone(article)
     }
+  },
+  taskDependencies: {
+    get: async (projectId, workItemId) => {
+      requireProject(loadState(), projectId)
+      return { workItemId, readiness: { ready: true, blockers: [] }, prerequisites: [], related: [], declaredPaths: [], declaredComponents: [], activeOverlaps: [] }
+    },
+    update: async () => { throw new Error('Task dependency editing requires the Workstack desktop app.') }
+  },
+  sourceCatalog: {
+    previewRepository: async () => { throw new Error('Repository and GitHub source imports require the Workstack desktop app. The browser demonstration cannot read project files.') },
+    importSelection: async () => { throw new Error('Repository and GitHub source imports require the Workstack desktop app.') },
+    refresh: async () => { throw new Error('Refreshing project sources requires the Workstack desktop app.') },
+    list: async (projectId) => { requireProject(loadState(), projectId); return [] },
+    detail: async () => { throw new Error('Versioned source details require the Workstack desktop app.') },
+    setPolicy: async () => { throw new Error('Source refresh policies require the Workstack desktop app.') },
+    retry: async () => { throw new Error('Durable source intake requires the Workstack desktop app.') },
+    cancel: async () => { throw new Error('Durable source intake requires the Workstack desktop app.') },
+    search: async (projectId) => { requireProject(loadState(), projectId); return [] },
+    readRevision: async () => { throw new Error('Retained source evidence requires the Workstack desktop app.') },
+    readCitation: async () => { throw new Error('Immutable source citation reads require the Workstack desktop app.') }
+  },
+  knowledgeRecords: {
+    list: async (projectId) => { requireProject(loadState(), projectId); return [] },
+    get: async () => { throw new Error('Structured project knowledge requires the Workstack desktop app.') },
+    create: async () => { throw new Error('Structured project knowledge requires the Workstack desktop app.') },
+    update: async () => { throw new Error('Structured project knowledge requires the Workstack desktop app.') },
+    checks: async (projectId) => { requireProject(loadState(), projectId); return [] },
+    review: async () => { throw new Error('Knowledge reviews require the Workstack desktop app.') },
+    supersede: async () => { throw new Error('Knowledge supersession requires the Workstack desktop app.') },
+    history: async () => { throw new Error('Knowledge history requires the Workstack desktop app.') },
+    reviews: async () => { throw new Error('Knowledge review history requires the Workstack desktop app.') }
+  },
+  projectDirectory: {
+    list: async (projectId) => { requireProject(loadState(), projectId); return [] },
+    detail: async () => { throw new Error('Project directory details require the Workstack desktop app.') },
+    lookup: async (projectId, query) => { requireProject(loadState(), projectId); return { query, match: 'none', candidates: [] } },
+    create: async () => { throw new Error('Project directory editing requires the Workstack desktop app.') },
+    update: async () => { throw new Error('Project directory editing requires the Workstack desktop app.') },
+    merge: async () => { throw new Error('Project directory merging requires the Workstack desktop app.') },
+    split: async () => { throw new Error('Project directory corrections require the Workstack desktop app.') },
+    resolveMention: async () => { throw new Error('Mention resolution requires the Workstack desktop app.') }
+  },
+  contextPackets: {
+    policy: async () => { throw new Error('Context policy requires the Workstack desktop app.') },
+    updatePolicy: async () => { throw new Error('Context policy requires the Workstack desktop app.') },
+    preferences: async () => { throw new Error('Task context preferences require the Workstack desktop app.') },
+    updatePreferences: async () => { throw new Error('Task context preferences require the Workstack desktop app.') },
+    preview: async () => { throw new Error('Exact agent context requires the Workstack desktop app.') },
+    list: async () => [],
+    get: async () => { throw new Error('Saved agent context requires the Workstack desktop app.') },
+    readSection: async () => { throw new Error('Saved agent context requires the Workstack desktop app.') },
+    usage: async () => []
+  },
+  contextFeedback: {
+    create: async () => { throw new Error('Context feedback requires the Workstack desktop app.') },
+    list: async () => [],
+    triage: async () => { throw new Error('Context feedback review requires the Workstack desktop app.') },
+    history: async () => []
+  },
+  knowledgeDelivery: {
+    list: async (projectId) => { requireProject(loadState(), projectId); return [] },
+    retry: async (projectId, deliveryId) => {
+      requireProject(loadState(), projectId)
+      throw new Error(`Knowledge delivery ${deliveryId} was not found in this browser demonstration.`)
+    }
+  },
+  wikiRevisions: {
+    list: async (projectId) => { requireProject(loadState(), projectId); return [] },
+    review: async () => { throw new Error('Wiki revision review requires the Workstack desktop app.') },
+    publish: async () => { throw new Error('Wiki revision publication requires the Workstack desktop app.') },
+    reject: async () => { throw new Error('Wiki revision review requires the Workstack desktop app.') },
+    reconcile: async () => { throw new Error('Wiki revision reconciliation requires the Workstack desktop app.') },
+    restore: async () => { throw new Error('Wiki revision restoration requires the Workstack desktop app.') }
   },
   wikiAutomation: {
     listReports: async (projectId) => {
@@ -518,6 +637,7 @@ const browserDesktopApi: DesktopApi = {
     }
   },
   planning: {
+    listSessions: async (projectId) => { const state = loadState(); requireProject(state, projectId); return Object.values(state.planningByProject[projectId] ?? {}).filter((proposal) => !(state.workItemsByProject[projectId] ?? []).some((item) => item.id === state.planningConvertedItems?.[proposal.planningSessionId])).map(clone) },
     create: async (projectId) => {
       const state = loadState()
       requireProject(state, projectId)
@@ -547,12 +667,17 @@ const browserDesktopApi: DesktopApi = {
       const state = loadState()
       const proposal = requirePlanningProposal(state, projectId, sessionId)
       if (!proposal.title.trim()) throw new Error('A proposal title is required before adding it to the backlog.')
-      delete state.planningByProject[projectId][sessionId]
-      saveState(state)
+      const convertedId = state.planningConvertedItems?.[sessionId]
+      if (convertedId) return clone(requireWorkItem(state, projectId, convertedId))
       const item = await browserDesktopApi.workItems.create(projectId, {
+        requestId: sessionId,
         title: proposal.title, type: proposal.type, descriptionMarkdown: proposal.descriptionMarkdown,
         acceptanceCriteriaMarkdown: proposal.acceptanceCriteriaMarkdown, priority: proposal.priority, source: 'ai_plan'
       })
+      const latest = loadState()
+      latest.planningConvertedItems ??= {}
+      latest.planningConvertedItems[sessionId] = item.id
+      saveState(latest)
       return item
     },
     listMessages: async (projectId, sessionId) => {
@@ -571,7 +696,15 @@ const browserDesktopApi: DesktopApi = {
       saveState(state)
       return clone(message)
     },
-    context: async (projectId, sessionId, query) => browserPlanningContext(loadState(), projectId, sessionId, query),
+    context: async (projectId, sessionId, query) => {
+      const state = loadState()
+      const id = crypto.randomUUID()
+      const context = { ...browserPlanningContext(state, projectId, sessionId, query), id, query, assembledAt: new Date().toISOString(), messages: clone(state.planningMessagesBySession[sessionId] ?? []), omissions: [] }
+      state.planningContexts ??= {}
+      state.planningContexts[id] = context
+      saveState(state)
+      return clone(context)
+    },
     listAttachments: async (projectId, sessionId) => {
       const state = loadState()
       requirePlanningProposal(state, projectId, sessionId)
@@ -608,7 +741,7 @@ const browserDesktopApi: DesktopApi = {
       const state = loadState()
       const workItem = requireWorkItem(state, projectId, workItemId)
       const markdown = `![${attachment.originalFilename}](attachments/${attachment.storedRelativePath.split('/').at(-1)})`
-      workItem.descriptionMarkdown = workItem.descriptionMarkdown
+      if (!workItem.descriptionMarkdown.includes(markdown)) workItem.descriptionMarkdown = workItem.descriptionMarkdown
         ? `${workItem.descriptionMarkdown}\n\n${markdown}`
         : markdown
       workItem.updatedAt = new Date().toISOString()
@@ -759,6 +892,12 @@ async function createBrowserAttachment(
 ): Promise<Attachment> {
   const state = loadState()
   requireWorkItem(state, projectId, workItemId)
+  const receiptKey = input.requestId ? `attachment:${projectId}:${workItemId}:${input.requestId}` : undefined
+  const receipt = receiptKey ? state.requestReceipts?.[receiptKey] : undefined
+  if (receipt) {
+    if (receipt.payload !== JSON.stringify(input)) throw new Error('This request ID was already used for different attachment data.')
+    return clone(receipt.result as Attachment)
+  }
   if (input.data.byteLength === 0) {
     throw new Error('Attachment data cannot be empty.')
   }
@@ -779,6 +918,10 @@ async function createBrowserAttachment(
   const attachments = state.attachmentsByWorkItem[workItemId] ?? []
   attachments.push(attachment)
   state.attachmentsByWorkItem[workItemId] = attachments
+  if (receiptKey) {
+    state.requestReceipts ??= {}
+    state.requestReceipts[receiptKey] = { payload: JSON.stringify(input), result: toAttachment(attachment) }
+  }
   saveState(state)
   return toAttachment(attachment)
 }
@@ -918,7 +1061,7 @@ function browserRelevance(content: string, query: string): number {
 
 function browserCompareResults(left: KnowledgeRetrievalResult, right: KnowledgeRetrievalResult): number {
   if (right.relevance !== left.relevance) return right.relevance - left.relevance
-  const order: KnowledgeRetrievalSourceType[] = ['wiki_article', 'raw_source', 'completed_work', 'backlog']
+  const order: KnowledgeRetrievalSourceType[] = ['wiki_article', 'raw_source', 'completed_work', 'backlog', 'knowledge_record', 'project_entity']
   const typeOrder = order.indexOf(left.sourceType) - order.indexOf(right.sourceType)
   if (typeOrder !== 0) return typeOrder
   if (left.title !== right.title) return left.title < right.title ? -1 : 1
@@ -930,9 +1073,9 @@ function browserRetrievalGroups(results: KnowledgeRetrievalResult[]): ProjectKno
     wiki_article: 'Wiki articles',
     raw_source: 'Raw sources',
     completed_work: 'Completed work',
-    backlog: 'Backlog'
+    backlog: 'Backlog', knowledge_record: 'Decisions, requirements and risks', project_entity: 'Components and glossary'
   }
-  return (['wiki_article', 'raw_source', 'completed_work', 'backlog'] as const).map((sourceType) => ({
+  return (['wiki_article', 'raw_source', 'completed_work', 'backlog', 'knowledge_record', 'project_entity'] as const).map((sourceType) => ({
     sourceType,
     label: labels[sourceType],
     results: results.filter((result) => result.sourceType === sourceType)
