@@ -7,6 +7,7 @@ import { systemClock, type Clock } from './clock'
 import { WorkstackError } from './errors'
 import { KnowledgeJobsRepository, type KnowledgeIntakeJob } from './knowledge-jobs'
 import type { ProjectStore } from './project-store'
+import { SourceCatalogRepository } from './source-catalog'
 
 import { SEMANTIC_LIMITS, type SemanticModel, type SemanticStatus } from './semantic-index-contracts'
 export { SEMANTIC_LIMITS } from './semantic-index-contracts'
@@ -113,6 +114,7 @@ export class SemanticIndexRepository {
   }
 
   status(): SemanticStatus {
+    new SourceCatalogRepository(this.store, { clock: this.clock }).refreshDependencies()
     const model = this.model()
     const eligibleCount = this.store.database.prepare(`SELECT count(*) AS count FROM source_passages p JOIN source_catalog s ON s.id = p.source_id WHERE ${eligible}`).get(this.now()) as { count: number }
     return { enabled: !!model, model, indexedPassages: model ? this.currentVectors(model).length : 0, eligiblePassages: eligibleCount.count, truncated: eligibleCount.count > SEMANTIC_LIMITS.passages, busy: active?.projectId === this.store.project.id, jobs: this.jobs.list('semantic'), limits: SEMANTIC_LIMITS }
@@ -209,15 +211,20 @@ export class SemanticIndexRepository {
     const entries = this.currentVectors(model)
     if (!entries.length) return { hits: [], truncated: false, fallbackReason: 'The local semantic index has no current passages. Index selected sources first.' }
     const result = await runWorker(this.store.project.id, { operation: 'search', modelPath: model.path, expectedHash: model.hash, query, entries }, signal)
-    return { hits: result.hits!, truncated: this.status().truncated }
+    const current = new Set(this.currentVectors(model).map((entry) => entry.id))
+    return { hits: result.hits!.filter((hit) => current.has(hit.passageId)), truncated: this.status().truncated }
   }
 
   private currentVectors(model: SemanticModel): Array<{ id: string; vector: string }> {
-    return this.store.database.prepare(`SELECT p.id,v.vector_json AS vector FROM source_passages p JOIN source_catalog s ON s.id = p.source_id JOIN semantic_passage_vectors v ON v.passage_id = p.id
+    const catalog = new SourceCatalogRepository(this.store, { clock: this.clock })
+    return (this.store.database.prepare(`SELECT p.id,p.source_id,v.vector_json AS vector FROM source_passages p JOIN source_catalog s ON s.id = p.source_id JOIN semantic_passage_vectors v ON v.passage_id = p.id
       WHERE ${eligible} AND v.model_hash = ? AND v.model_id = ? AND v.model_version = ? AND v.dimensions = ? AND v.passage_hash = p.passage_hash AND v.input_hash = p.passage_hash AND v.source_id = p.source_id AND v.revision_id = p.revision_id AND length(v.vector_json) <= ? ORDER BY p.source_id,p.ordinal LIMIT ?`)
-      .all(this.now(), model.hash, model.modelId, model.version, model.dimensions, SEMANTIC_LIMITS.vectorCharacters, SEMANTIC_LIMITS.passages) as Array<{ id: string; vector: string }>
+      .all(this.now(), model.hash, model.modelId, model.version, model.dimensions, SEMANTIC_LIMITS.vectorCharacters, SEMANTIC_LIMITS.passages) as Array<{ id: string; source_id: string; vector: string }>).filter((row) => catalog.getSource(row.source_id).state === 'ready')
   }
-  private eligiblePassages(): PassageInput[] { return this.store.database.prepare(`SELECT p.id,p.source_id,p.revision_id,p.passage_hash,p.text FROM source_passages p JOIN source_catalog s ON s.id = p.source_id WHERE ${eligible} ORDER BY p.source_id,p.ordinal LIMIT ?`).all(this.now(), SEMANTIC_LIMITS.passages) as PassageInput[] }
+  private eligiblePassages(): PassageInput[] {
+    new SourceCatalogRepository(this.store, { clock: this.clock }).refreshDependencies()
+    return this.store.database.prepare(`SELECT p.id,p.source_id,p.revision_id,p.passage_hash,p.text FROM source_passages p JOIN source_catalog s ON s.id = p.source_id WHERE ${eligible} ORDER BY p.source_id,p.ordinal LIMIT ?`).all(this.now(), SEMANTIC_LIMITS.passages) as PassageInput[]
+  }
   private assertSemanticJob(id: string): void { if (!this.jobs.list('semantic').some((job) => job.id === id)) throw new WorkstackError('WORK_ITEM_NOT_FOUND', 'The semantic indexing job does not exist.') }
   private now(): string { return this.clock.now().toISOString() }
 }

@@ -64,6 +64,12 @@ Latency is measured around actual retrieval/packet calls. Reports contain p50/p9
 
 A final implementation run on 2026-09-09 at 12:08 local time used Apple M2 Max, macOS arm64, Node 22.23.2 and SQLite 3.53.4, with three timing samples per case/stage. All current-stage gates passed across 54 observations, 778 sources and 1,178 passages. Source-index construction took about 523 ms and 5.05 MB of SQLite storage. Passage retrieval p50/p95 was approximately 0.42/1.20 ms, unified lexical retrieval 1.38/2.55 ms, and packet assembly 228/361 ms. The report is retained locally at `context-evaluation-results/final.json` and identifies the uncommitted implementation based on `5543694`. These values describe the synthetic catalog, not a production repository benchmark; no local semantic model was supplied and no provider calls were made.
 
+## Follow-up measurement — 2026-09-09
+
+After the source-dependency and acceptance fixes, the separate evaluator run at 12:42 Shanghai time passed all current-stage gates with three timing samples per case/stage. It used the same Node 22.23.2, SQLite 3.53.4 and Apple M2 Max environment, on the uncommitted follow-up tree based on `1f840b2`. The exact report is `context-evaluation-results/followup-final.json`, generated at `2026-09-09T04:42:06.612Z`.
+
+The corpus still contains 778 sources and 1,178 passages. Source-index construction took 583 ms and 5,046,272 bytes of SQLite storage. Passage retrieval p50/p95 was 0.71/1.50 ms, unified lexical retrieval 1.61/3.03 ms, and packet assembly 230/264 ms. The 54 case/stage observations contain no current-stage invariant violations. Provider calls, tokens and cost remain zero; the optional semantic stage is unavailable. These timings were measured outside the parallel aggregate test suite and retain the synthetic-corpus and pending-human-review limits above.
+
 ## Token and model budgets
 
 Reported `tokens` use a conservative UTF-8 byte upper bound, identified by `tokenEstimator`; they are not measured tokens from a particular language-model tokenizer. Provider calls, provider tokens and provider dollar cost are zero. The source-index timer covers fixture source publication and the structured graph projections; storage is captured after checkpointing SQLite and before generated task packets. Optional semantic build time is reported separately.

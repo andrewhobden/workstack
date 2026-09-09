@@ -2700,11 +2700,13 @@ function AiProviderSettingsForm({ api }: { api: DesktopApi }): JSX.Element {
     if (!trimmedUrl.endsWith('/v1')) {
       setModels([])
       setModelError(undefined)
+      setLoadingModels(false)
       return
     }
     if (!apiKey && !hasSavedKey && !isLoopbackUrl(trimmedUrl)) {
       setModels([])
       setModelError(undefined)
+      setLoadingModels(false)
       return
     }
     let isCurrent = true

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -46,6 +46,38 @@ async function fixture(nested = false) {
 }
 
 describe('real Git context launch boundary', { timeout: 20000 }, () => {
+  it.each([{ together: false, nested: false }, { together: true, nested: false }, { together: true, nested: true }])('reconnects moved repositories and resumes retained dirty workspaces (%j)', async ({ together, nested }) => {
+    const { base, repositoryRoot, rootPath, store, project, projects, item, packets, options, git, commands } = await fixture(nested)
+    const launcher = new CopilotLauncher(options)
+    const started = await launcher.launch(project, item, 'Start the original task')
+    const original = packets.get(started.contextPacketId!)
+    const workspace = original.repository.workspace!
+    await writeFile(path.join(workspace.path, 'README.md'), 'Preserve these tracked edits.\n')
+    await writeFile(path.join(workspace.path, 'unfinished.txt'), 'Preserve this untracked work.\n')
+    store.close()
+    const movedRepository = path.join(base, together ? 'moved/repository' : 'renamed-repository')
+    await mkdir(path.dirname(movedRepository), { recursive: true })
+    await rename(repositoryRoot, movedRepository)
+    const movedWorkspace = together ? path.join(path.dirname(movedRepository), path.basename(workspace.path)) : workspace.path
+    if (together) await rename(workspace.path, movedWorkspace)
+    const movedRoot = path.join(movedRepository, path.relative(repositoryRoot, rootPath))
+    await projects.reconnectProject(project.id, movedRoot)
+    const reconnected = await projects.getProject(project.id)
+    const preview = await projects.previewContextPacket(project.id, item.id)
+    expect(preview.repository).toMatchObject({ rootPath: movedRepository, complete: true, workspace: { path: movedWorkspace, branch: workspace.branch } })
+    const restarted = await launcher.restart(reconnected, item, undefined, { packetId: preview.id })
+    expect(restarted.contextPacketId).toBe(preview.id)
+    expect((await launcher.launch(reconnected, item, 'Continue recovered work')).started).toBe(true)
+    expect(await readFile(path.join(movedWorkspace, 'README.md'), 'utf8')).toBe('Preserve these tracked edits.\n')
+    expect(await readFile(path.join(movedWorkspace, 'unfinished.txt'), 'utf8')).toBe('Preserve this untracked work.\n')
+    expect((await git(['rev-parse', '--show-toplevel'], movedWorkspace)).trim()).toBe(movedWorkspace)
+    const mcp = new WorkstackMcpTools(projects)
+    expect(await mcp.call('workstack_get_context_packet', { project: project.name, packet_id: original.id })).toMatchObject({ id: original.id, repository: original.repository, launchMarkdown: original.launchMarkdown })
+    for (const section of original.sections) expect(await mcp.call('workstack_read_context_section', { project: project.name, packet_id: original.id, category: section.category })).toMatchObject({ text: section.markdown })
+    expect(commands).toHaveLength(3)
+    expect(commands[2]).toContain(movedRoot)
+  })
+
   it('uses the same immutable preview through launch, MCP claim, checkpoint and restart', async () => {
     const { packets, project, item, commands, options, claims, projects } = await fixture()
     const launcher = new CopilotLauncher(options)

@@ -7,11 +7,11 @@ Playwright owns its preview server on `127.0.0.1:42817`. Set `WORKSTACK_TEST_POR
 ## Evidence layers
 
 - `tests/main/desktop-bridge.test.ts` imports the actual preload and calls actual registered IPC handlers using only a mocked Electron transport. Project storage and SQLite are real and temporary. Seven tests cover strict patch mapping, reopen persistence, planning conversion, attachment and creation receipt replay, immutable planning context and cancellation, restart ownership failures, retained source citations, reviewed wiki publication, typed guidance and directory corrections, exact task context approvals, and feedback history. Cancellation also exercises the default real Bash runner after the provider has returned: the desktop stops the owned shell process group, retains partial evidence, audits skipped calls and releases the request without creating the later proposal. The context test verifies stale approval rejection, bounded section reads, original packet persistence after preferences change, and project isolation. The desktop forces feedback authorship to `human`.
-- `tests/e2e/desktop-reliability.spec.ts` covers delayed/out-of-order project loads, live completion while editing, failed saves, repeated submission and partial attachment retry, dependency correction, completion delivery retry, cancellation of both planning and chat while retaining drafts and saved history, and full manual/generated Markdown readers with keyboard focus and return to search.
+- `tests/e2e/desktop-reliability.spec.ts` covers delayed/out-of-order project loads, live completion and new agent claims while preserving dirty edits, failed saves, repeated submission and partial attachment retry, dependency correction, completion delivery retry, cancellation of both planning and chat while retaining drafts and saved history, and full manual/generated Markdown readers with keyboard focus and return to search.
 - `tests/e2e/knowledge-catalog.spec.ts` covers scoped source import previews, excluded files, source freshness and retry/cancel controls, retained originals and exact historical citations, and stale wiki proposals before successful publication.
 - `tests/e2e/project-knowledge.spec.ts` covers structured knowledge findings, failed edits, explicit review and supersession, ambiguous component names, alias splitting and merging, and unified search opening the exact named record or directory identity. Search reports the actual retrieval mode and fallback reason.
 - `tests/e2e/task-context.spec.ts` covers capability-check failures and hard requirements blocking launch, recorded soft overrides, stale launch recovery, full section pagination, historical packets that cannot approve execution, policy remediation, and feedback/triage recovery tied to packet and source revisions. A saved preferences update followed by a failed rebuild cannot reactivate the old packet. Reading an exact citation preserves unsaved source choices; discarding a later draft restores the last successfully saved preferences. These tests use explicit desktop API fixtures and never start a real agent.
-- `tests/e2e/ai-provider-settings.spec.ts` verifies the browser demonstration reports that selecting a local semantic model requires the desktop app. The browser demonstration does not simulate a valid agent context packet; its launch UI stays disabled without one.
+- `tests/e2e/ai-provider-settings.spec.ts` verifies saved-key ownership across provider origin/base-path/API-mode edits, save/replacement/removal, and pending discovery with late replies. The browser demonstration reports that selecting a local semantic model requires the desktop app. The browser demonstration does not simulate a valid agent context packet; its launch UI stays disabled without one.
 - `scripts/desktop-smoke.mjs` uses real Electron, its real preload and main process. It creates and edits through the UI, exercises planning and attachments through the bridge, builds and explicitly reviews context, reads exact source evidence, and records/triages feedback. After restarting the application it checks the exact packet text, both historical versions, full retained source revision, citation span and feedback audit. The same executable then serves MCP stdio initialization, tool discovery and the packet/section/history/source-revision/source-citation/artifact readers, which must agree with the desktop and retained attachment bytes. The smoke excludes inherited development-renderer URLs, requires a built `file:` renderer and captures MCP stderr.
 
 Run the native smoke after building the current commit and rebuilding native dependencies for Electron:
@@ -32,7 +32,33 @@ WORKSTACK_SMOKE_EXECUTABLE="$PWD/dist/mac-arm64/Workstack.app/Contents/MacOS/Wor
 
 Native traces, logs, commit identity, dirty-worktree status, and artifact hash are saved under `test-results/desktop-smoke` (override with `WORKSTACK_SMOKE_OUTPUT`). A passing browser run is not a passing native or packaged run. Node unit tests and Electron require matching native module ABIs, so serialize native rebuilds with Node test execution.
 
-## Final combined working-tree evidence
+## Follow-up acceptance validation — 2026-09-09
+
+The final follow-up source tree based on `1f840b2` passed the complete documented `npm test` command on Node 22.23.2: 468 tests across 64 files, 100% core coverage (4,795 statements, 3,014 branches, 1,293 functions, 3,770 lines), separate 7-test contract and 35-test integration stages, and 45 Chromium journeys. The original thresholds, exclusions and visual tolerances are unchanged. The separate offline evaluator passed all current-stage invariants over 778 sources; the nine-case expectations still await maintainer review.
+
+The new browser cases verify live agent claim updates while task title/description edits remain unsaved, provider credential ownership during configuration changes, and pending model discovery whose obsolete responses arrive after the current request. They use controlled desktop API fixtures and do not launch live agents or contact providers. Real-Git relocation tests additionally preserve tracked/untracked work and retained context through reopen, production launch services and MCP reads.
+
+After all Node checks stopped, SQLite was rebuilt for Electron 41.10.7. The fresh desktop and unsigned arm64 package (electron-builder 26.15.3, publishing disabled) passed on the same follow-up source tree:
+
+| Artifact | Completed, Shanghai time | Evidence directory |
+| --- | --- | --- |
+| Built desktop, `out/main/index.js` | September 9, 12:42:45 | `test-results/native-acceptance-smoke-20260909/` |
+| Unsigned package, `Contents/Resources/app.asar` | September 9, 12:43:19 | `test-results/packaged-acceptance-smoke-20260909/` |
+
+Independently verified SHA-256 values:
+
+```text
+out/main/index.js
+95c3203fbe68ccd8577ccfbbc80f79dc8f91dab0525322b0366a59bc36d9f6b2
+app.asar
+81f40d96f0b51212d9241c9efe7c7dc974b162b106825acde8276e4e68233121
+```
+
+Both `result.json` records identify `1f840b2f7726643128f6b9be721de5c9ba8f4d42` plus the uncommitted follow-up changes, `passed: true`, `mcpContextVerified: true`, 35 tools, two packet versions, one retained citation and two feedback events. They verify the exact retained task/packet/source/section/citation/feedback/attachment evidence through application restart and the same executable's MCP readers. Each directory contains initial/restart traces, extracted final screenshot frames, desktop and runner logs; the native directory also retains the rebuild and Node restoration evidence, and the packaged directory retains its build log.
+
+The initial and restarted frames were inspected for both artifacts: the edited task and both saved tasks remain visible after restart without startup or rendering errors. All owned Electron/MCP/smoke processes stopped. At 12:43:56, SQLite was restored for Node 22.23.2 (ABI 127), and a real database open verified SQLite 3.53.4; see `node-abi-verification.json`. No runtime changes were made during these checks. The earlier artifact evidence below is preserved separately. This run does not certify signed/notarized distribution or live external agent/provider/network-source behavior.
+
+## Published baseline working-tree evidence (`1f840b2`)
 
 On September 9, the clean-install Node 22.23.2 gate passed 413 tests in 60 files, with 100% core coverage: 4,617 statements, 2,850 branches, 1,266 functions and 3,636 lines. The aggregate command also passed the separate 7 contract tests, 20 integration tests and 42 Chromium tests. The offline evaluator passed 54 case/stage results over 778 sources. These synthetic evaluation results retain their pending maintainer-review and semantic-quality limits described in `context-evaluation.md`.
 

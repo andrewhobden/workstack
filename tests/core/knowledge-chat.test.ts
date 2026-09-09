@@ -413,11 +413,41 @@ it('exposes pending calls and records bounded, redacted results and non-Error fa
   const bounded = await repository.recordToolCall(session.id, 'get_project', {}, () => ({ description: 'a'.repeat(7000), secret: 'hidden-value' }))
   expect(bounded.result).toMatchObject({ truncated: true, excerpt: expect.any(String) })
   expect(String(bounded.result?.excerpt)).toHaveLength(6000)
+  const longFailure = await repository.recordToolCall(session.id, 'get_project', {}, () => { throw new Error(`password=private-key ${'x'.repeat(7000)}`) })
+  expect(longFailure.errorMessage).toHaveLength(6000)
+  expect(longFailure.errorMessage).toMatch(/^password=\[REDACTED\]/)
+  const emptyFailure = await repository.recordToolCall(session.id, 'get_project', {}, () => { throw new Error('') })
+  expect(emptyFailure).toMatchObject({ status: 'failed', errorMessage: '', result: { error: '' } })
   expect(JSON.stringify(repository.listMessages(session.id))).not.toContain('private-password')
   expect(JSON.stringify(repository.listMessages(session.id))).not.toContain('private-key')
   expect(JSON.stringify(repository.listMessages(session.id))).not.toContain('hidden-value')
   expect(JSON.stringify(repository.listMessages(session.id))).not.toContain('private-token')
   store.close()
+})
+
+it.each(['error', 'string'] as const)('redacts a %s tool failure before storing diagnostics or replaying its native result', async (kind) => {
+  const rootPath = await mkdtemp(path.join(os.tmpdir(), 'workstack-chat-error-redaction-'))
+  cleanupPaths.push(rootPath)
+  const store = await ProjectStore.initialize({ rootPath, name: 'Private diagnostics' })
+  await store.updateMetadata({ settings: { knowledgeChatProfile: 'advanced' } })
+  const repository = new KnowledgeChatRepository(store)
+  const session = repository.createSession()
+  const raw = 'Failure: password=protected-value api_key=private-key Authorization: Bearer private-bearer'
+  const redacted = 'Failure: password=[REDACTED] api_key=[REDACTED] Authorization: [REDACTED]'
+  let request = 0
+  const provider: AgentChatProvider = { completeChat: async (input) => {
+    if (++request === 1) return { toolCalls: [{ id: 'failed-operation', name: 'run_bash', arguments: { command: 'fixture-command' } }] }
+    expect(input.messages.find((message) => message.role === 'tool')).toMatchObject({ toolCallId: 'failed-operation', content: JSON.stringify({ error: redacted }, null, 2) })
+    for (const secret of ['protected-value', 'private-key', 'private-bearer']) expect(JSON.stringify(input)).not.toContain(secret)
+    return { content: 'The redacted failure remains available for review.' }
+  } }
+  const turn = await new KnowledgeChatAgent(store, provider, { runBash: async () => { throw kind === 'error' ? new Error(raw) : raw } }).sendMessage(session.id, 'Inspect the project')
+  expect(turn.toolCalls).toMatchObject([{ status: 'failed', errorMessage: redacted, result: { error: redacted } }])
+  expect(store.database.prepare('SELECT error_message FROM knowledge_chat_tool_calls WHERE session_id = ?').get(session.id)).toEqual({ error_message: redacted })
+  store.close()
+  const reopened = await ProjectStore.open(rootPath)
+  try { expect(new KnowledgeChatRepository(reopened).listToolCalls(session.id)).toMatchObject([{ errorMessage: redacted, result: { error: redacted } }]) }
+  finally { reopened.close() }
 })
 
 it('runs an explicitly selected command in a real project directory and collects its output', async () => {

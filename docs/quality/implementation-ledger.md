@@ -49,7 +49,35 @@ All 44 open issues (43 implementation issues plus roadmap #49) remain in scope. 
 | [#48](https://github.com/andrewhobden/workstack/issues/48) | Measure task-context coverage and retrieval quality with a versioned evaluation set | Versioned 9-case corpus, baseline/passage/shared/graph/packet evaluation, optional explicitly supplied local-model runner, task/packet/source-linked feedback with audited triage. | Offline CLI PASS: 54 case/stage observations, 778 sources, 1,178 passages. Feedback/scoring/integration: 13 tests passed; included in latest 67-test set. Expected evidence remains pending human review; no real semantic model was evaluated. Issue acceptance is incomplete until maintainer corpus review. See context-evaluation.md. |
 | [#49](https://github.com/andrewhobden/workstack/issues/49) | Review roadmap: reliable agents and complete project context | Independent Workstack implementation covers the review backlog; this ledger records each requirement and its evidence. | The clean-install combined logic, contract, integration, browser and offline evaluation gates passed. Native/package and hosted CI evidence are recorded separately. #48 requires maintainer corpus review; no issue is closed merely because implementation exists. |
 
-## Final combined validation — 2026-09-09
+## Follow-up acceptance fixes — 2026-09-09
+
+The acceptance audit after publication of `1f840b2` added the following behavior and regression evidence. The prior published run is preserved below; its results do not certify these later changes.
+
+- **#23, moved task workspaces:** reconnect repairs registered Git worktrees and atomically updates their manifests before changing the project root. It preserves tracked and untracked work, refuses ambiguous or foreign registrations, and supports retry after partial manifest writes. Real-Git tests reopen the project, relaunch through the production context service and read original packets through MCP. No live Copilot session is involved.
+- **#26, chat diagnostics and replay:** failed tools retain bounded, redacted diagnostics. Both native and legacy saved tool results are redacted again before provider replay, preserving valid JSON and original audit records. Empty failure messages remain failures.
+- **#32, durable generation retries:** only timeouts and explicitly retryable provider/rate-limit failures retry automatically. Authentication, invalid content, cancellation and unknown failures require explicit recovery. Tests cover adapter deadlines and capped retries.
+- **#38, derived wiki freshness:** exact per-page citations survive inheritance, restore and legacy backfill. Source failures propagate through dependent wiki pages into lexical/semantic retrieval and task readiness. Unchanged successful checks can recover the chain without new accepted text; changed evidence stays stale until review. Cache tests cover rollback, other database connections, read-only consumers, deadlines, backward clocks and returned-object mutation.
+- **#38, selective recomputation:** durable, deduplicated jobs propose changes only to affected articles using current cited passages. Unrelated pages and citations remain intact. Paused, unavailable, unchanged or expired-only evidence spends no model calls. Each batch discloses omitted sources/passages, retains dependencies that could not fit, and requires explicit publication review. Articles beyond the 24,000-character refresh window require reviewed consolidation before generation.
+- **#15 and #19, desktop regressions:** live agent claims refresh status, agent, session and health while preserving dirty task drafts. Provider URL/base-path/API-mode changes cannot inherit saved credentials for discovery or saving. Delayed discovery responses cannot restore old models or leave a stale loading indicator after the draft changes.
+
+The final follow-up tree based on `1f840b2` passed the complete documented `npm test` command on Node 22.23.2, after the audit fixes above were finished:
+
+| Check | Follow-up result |
+| --- | --- |
+| Lint and TypeScript | Passed |
+| Non-browser tests | 468 passed across 64 files |
+| Core coverage, unchanged 100% thresholds | Statements 4,795/4,795; branches 3,014/3,014; functions 1,293/1,293; lines 3,770/3,770 |
+| Separate MCP contract stage | 7 passed across 2 files; included in the 468 above |
+| Separate integration stage | 35 passed across 10 files; included in the 468 above |
+| Chromium UX, visual and accessibility | 45 passed with existing visual tolerances |
+| Separate offline context evaluation | All current-stage gates passed; 54 observations, 778 sources, 1,178 passages; packet p50/p95 230/264 ms |
+| Fresh built Electron UI/MCP | Passed at 12:42:45; exact retained evidence and restart agreement |
+| Fresh unsigned arm64 package UI/MCP | Passed at 12:43:19; independent artifact hashes and trace review recorded |
+| Node SQLite restoration | Verified Node 22.23.2, ABI 127 and SQLite 3.53.4 after native/package checks |
+
+The local full-gate log is `/tmp/workstack-followup-final-test.log`. The separate evaluator report is `context-evaluation-results/followup-final.json`; its measurements and limits are recorded in [context evaluation](context-evaluation.md). Fresh native/package validation is recorded in [desktop validation](desktop-validation.md), separately from the earlier published artifacts. #48 still requires a real maintainer to review the nine-case expected-evidence table. No issue has been closed.
+
+## Published baseline validation — 2026-09-09 (`1f840b2`)
 
 The implementation working tree based on `5543694` passed a clean locked install and the complete documented `npm test` command on macOS arm64, Node 22.23.2 (ABI 127), and SQLite 3.53.4. The configured npm mirror was used because this machine could not reach the public npm audit endpoint; committed lockfile URLs remain public npm. Both the clean install and the explicit lockfile audit reported zero advisories.
 

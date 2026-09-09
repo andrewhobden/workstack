@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
 import type { DesktopApi } from '../../src/shared/desktop-api'
-import type { KnowledgeChatMessage, PlanningContext, PlanningMessage, PlanningProposal, ProjectMetadata, WorkItem } from '../../src/core/types'
+import type { KnowledgeChatMessage, PlanningContext, PlanningMessage, PlanningProposal, ProjectMetadata, WorkClaim, WorkItem } from '../../src/core/types'
 
 async function installFixture(page: Page, delayedProject = false): Promise<void> {
   await page.addInitScript(({ delayedProject }) => {
@@ -10,6 +10,7 @@ async function installFixture(page: Page, delayedProject = false): Promise<void>
     const newItem = (projectId: string, title = `${projectId} task`): WorkItem => ({ id: `${projectId}-item`, sequenceNumber: 1, displayId: 'P-1', title, type: 'feature', priority: 'normal', status: 'backlog', source: 'manual', descriptionMarkdown: 'Original description', acceptanceCriteriaMarkdown: '', createdBy: null, createdAt: now, updatedAt: now, completedAt: null })
     const state = {
       items: Object.fromEntries(projects.map((project) => [project.id, [newItem(project.id)]])),
+      claims: Object.fromEntries(projects.map((project) => [project.id, [] as WorkClaim[]])),
       createCalls: 0, attachmentCalls: [] as string[], failSave: true, failAttachment: true, delayCreate: false,
       releaseProject: () => {}, releaseCreate: () => {},
       completion: { workItemId: 'project-0-item', summaryMarkdown: 'Agent finished while detail was open.', sessionSummaryMarkdown: '', implementationNotesMarkdown: '', validationMarkdown: 'Tests passed', knownLimitationsMarkdown: '', filesChanged: [], componentsChanged: [], commitSha: null, branch: null, prUrl: null, completedByAgentId: 'agent', completedBySessionId: null, createdAt: now }
@@ -41,7 +42,7 @@ async function installFixture(page: Page, delayedProject = false): Promise<void>
         },
         checkpoints: async () => [], completionHistory: async () => []
       },
-      claims: { list: async () => [], getCompletion: async () => state.completion },
+      claims: { list: async (projectId: string) => structuredClone(state.claims[projectId]), getCompletion: async () => state.completion },
       knowledge: { listSources: async () => [], listWiki: async () => [] },
       attachments: { list: async () => [], pasteImage: async (_projectId: string, _itemId: string, input: { originalFilename: string }) => {
         state.attachmentCalls.push(input.originalFilename)
@@ -228,6 +229,40 @@ test('failed edits remain open and live completion refresh preserves a dirty dra
   await page.getByLabel('Work item title').fill('Saved after retry')
   await page.getByRole('button', { name: 'Save changes' }).click()
   await expect(page.getByRole('heading', { name: 'Saved after retry' })).toBeVisible()
+})
+
+test('a new agent claim refreshes open task details without overwriting a dirty draft', async ({ page }) => {
+  await installFixture(page)
+  await page.goto('/')
+  await openItem(page)
+  const details = page.getByLabel('Work item details')
+  await expect(details.getByText('Backlog', { exact: true })).toBeVisible()
+  await expect(details.getByText('Copilot', { exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await page.getByLabel('Work item title').fill('Keep my local draft during the claim')
+  await page.getByLabel('Work item description').fill('Unsaved implementation notes')
+  await page.evaluate(() => {
+    const fixture = (window as unknown as { reliabilityFixture: { items: Record<string, WorkItem[]>; claims: Record<string, WorkClaim[]> } }).reliabilityFixture
+    const now = new Date().toISOString()
+    fixture.items['project-0'][0] = { ...fixture.items['project-0'][0], status: 'in_progress', updatedAt: now }
+    fixture.claims['project-0'] = [{
+      id: 'arriving-claim', workItemId: 'project-0-item', agentId: 'copilot', agentDisplayName: 'Copilot', sessionId: 'arriving-session',
+      claimedAt: now, lastHeartbeatAt: now, leaseExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+      state: 'active', releaseReason: null, blockedReason: null, releasedAt: null, completedAt: null
+    }]
+  })
+  await expect(details.getByText('In Progress', { exact: true })).toBeVisible({ timeout: 8_000 })
+  await expect(details.getByText('Copilot', { exact: true })).toBeVisible()
+  await expect(details.getByText('arriving-session', { exact: true })).toBeVisible()
+  await expect(details.getByText('Healthy', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Work item title')).toHaveValue('Keep my local draft during the claim')
+  await expect(page.getByLabel('Work item description')).toHaveValue('Unsaved implementation notes')
+  await page.getByRole('button', { name: 'Cancel edit' }).click()
+  await expect(page.getByRole('heading', { name: 'project-0 task', exact: true })).toBeVisible()
+  await expect(page.getByRole('status', { name: 'Active claim for Copilot' })).toBeVisible()
+  await expect(page.getByText('Copilot · Session arriving-session', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Force release' })).toBeVisible()
+  await expect(page.getByLabel('Recovery reason')).toHaveCount(0)
 })
 
 test('repeated submission is locked and an attachment retry resumes the saved item', async ({ page }) => {

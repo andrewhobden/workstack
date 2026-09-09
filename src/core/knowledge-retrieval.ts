@@ -76,7 +76,10 @@ export class KnowledgeRetrievalService {
     const passageIds = this.store.database.prepare(`SELECT p.id FROM source_passage_search f JOIN source_passages p ON p.id = f.passage_id JOIN source_catalog s ON s.id = p.source_id
       WHERE source_passage_search MATCH ? AND ${eligible} ORDER BY bm25(source_passage_search,0,5,3,1),p.source_id,p.ordinal LIMIT 100`).all(expression, capturedAt) as Array<{ id: string }>
     const metadataIds = this.store.database.prepare(`SELECT p.id FROM source_catalog s JOIN source_passages p ON p.source_id = s.id WHERE (s.repository_path = ? OR s.id = ? OR s.canonical_uri = ?) AND ${eligible} ORDER BY p.ordinal LIMIT 30`).all(query, query, query, capturedAt) as Array<{ id: string }>
-    for (const id of new Set([...passageIds, ...metadataIds].map((row) => row.id))) candidates.push(this.passageCandidate(catalog.getPassage(id), query))
+    for (const id of new Set([...passageIds, ...metadataIds].map((row) => row.id))) {
+      const passage = catalog.getPassage(id)
+      if (passage.readiness === 'ready') candidates.push(this.passageCandidate(passage, query))
+    }
     // Catalog identity is authoritative even when paused, unavailable, or superseded.
     // Never use an old FTS projection as a fallback around that policy.
     const legacy = this.store.database.prepare(`SELECT k.source_id,CASE WHEN w.id IS NOT NULL THEN w.display_id || ' · ' || w.title ELSE k.title END AS title,substr(k.content,1,16000) AS content,s.kind,s.source_work_item_id,s.relative_or_external_location

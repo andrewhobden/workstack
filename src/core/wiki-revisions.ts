@@ -6,6 +6,7 @@ import type { ProjectStore } from './project-store'
 import { WorkstackError } from './errors'
 import { systemClock, type Clock } from './clock'
 import { SourceCatalogRepository, type SourceCitation } from './source-catalog'
+import { readWikiPageCitations, type WikiPageCitations } from './wiki-source-evidence'
 
 export interface WikiRevisionPage { slug: string; content: string; contentHash: string }
 export interface WikiRevision {
@@ -35,6 +36,7 @@ export class WikiRevisionRepository {
 
   currentId(): string | null { return (this.store.database.prepare('SELECT revision_id FROM wiki_publication WHERE id = 1').get() as { revision_id: string } | undefined)?.revision_id ?? null }
   currentPages(): WikiRevisionPage[] { return readPublishedWikiPages(this.store.database) ?? this.legacyPages() }
+  currentPageCitations(): WikiPageCitations { const id = this.currentId(); return id ? readWikiPageCitations(this.store.database, id) : {} }
 
   /** Capture any legacy articles once, before an asynchronous generator starts reading its base. */
   snapshot(): { revisionId: string | null; pages: WikiRevisionPage[] } {
@@ -57,8 +59,7 @@ export class WikiRevisionRepository {
       if (!/^generated-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value.slug) || !value.content.trim() || value.content.length > 200_000 || slugs.has(value.slug)) throw new WorkstackError('VALIDATION_ERROR', 'Generated pages need unique reserved slugs and nonempty content of at most 200,000 characters.')
       slugs.add(value.slug)
     }
-    const evidence = JSON.stringify(input.evidence ?? {})
-    if (evidence.length > 2_000_000) throw new WorkstackError('VALIDATION_ERROR', 'Wiki proposal evidence exceeds the review limit.')
+    if (JSON.stringify(input.evidence ?? {}).length > 2_000_000) throw new WorkstackError('VALIDATION_ERROR', 'Wiki proposal evidence exceeds the review limit.')
     return this.store.database.transaction(() => {
       const existing = this.findByRequestKey(input.requestKey)
       if (existing) return existing
@@ -68,6 +69,12 @@ export class WikiRevisionRepository {
       const pages = new Map(inherited.map((value) => [value.slug, value]))
       input.pages.forEach((value) => pages.set(value.slug, page(value.slug, value.content)))
       this.validateCitations(input.evidence ?? {})
+      const pageSourceCitations = base ? readWikiPageCitations(this.store.database, base) : {}
+      const supplied = input.evidence?.pageSourceCitations as WikiPageCitations | undefined
+      const proposalCitations = input.evidence?.sourceCitations as SourceCitation[] | undefined
+      for (const value of input.pages) pageSourceCitations[value.slug] = supplied?.[value.slug] ?? proposalCitations ?? pageSourceCitations[value.slug] ?? []
+      const evidence = JSON.stringify({ ...input.evidence, pageSourceCitations })
+      if (evidence.length > 2_000_000) throw new WorkstackError('VALIDATION_ERROR', 'Wiki proposal evidence exceeds the review limit.')
       validateLocalLinks([...pages.values()], this.store.paths.wikiPath)
       const id = randomUUID()
       this.store.database.prepare(`INSERT INTO wiki_revisions (id,request_key,title,base_revision_id,status,author,rationale,evidence_json,created_at)
@@ -112,6 +119,7 @@ export class WikiRevisionRepository {
       for (const old of priorPages) {
         if (!pages.some((value) => value.slug === old.slug) && this.store.database.prepare('SELECT id FROM source_catalog WHERE id = ?').get(`wiki:${old.slug}`)) catalog.recordFreshness(`wiki:${old.slug}`, { unavailable: true, deleted: true, reason: `Removed by published wiki revision ${id}.` })
       }
+      catalog.refreshDependencies()
       return this.review(id)
     }).immediate()
   }
@@ -158,7 +166,7 @@ export class WikiRevisionRepository {
     return this.store.database.transaction(() => {
       const source = this.review(id)
       if (!['published', 'superseded'].includes(source.revision.status)) throw new WorkstackError('INVALID_STATE_TRANSITION', 'Only a previously published revision can be restored.')
-      const staged = this.stage({ requestKey: `restore:${randomUUID()}`, title: `Restore ${source.revision.title}`, author: actor, rationale: reason, pages: source.pages, evidence: { restoredFrom: id } })
+      const staged = this.stage({ requestKey: `restore:${randomUUID()}`, title: `Restore ${source.revision.title}`, author: actor, rationale: reason, pages: source.pages, evidence: { ...source.revision.evidence, pageSourceCitations: readWikiPageCitations(this.store.database, id), restoredFrom: id } })
       const wanted = new Set(source.pages.map((value) => value.slug))
       for (const value of staged.pages) if (!wanted.has(value.slug)) this.store.database.prepare('DELETE FROM wiki_revision_pages WHERE revision_id = ? AND slug = ?').run(staged.revision.id, value.slug)
       return this.publish(staged.revision.id, actor, reason)
@@ -192,10 +200,17 @@ export class WikiRevisionRepository {
     this.store.database.prepare('INSERT INTO wiki_publication (id,revision_id) VALUES (1,?)').run(id)
   }
   private validateCitations(evidence: Record<string, unknown>): void {
-    if (evidence.sourceCitations === undefined) return
-    if (!Array.isArray(evidence.sourceCitations) || evidence.sourceCitations.length > 500) throw new WorkstackError('VALIDATION_ERROR', 'Wiki evidence must contain bounded source citations.')
+    const citations: unknown[] = []
+    if (evidence.sourceCitations !== undefined) citations.push(evidence.sourceCitations)
+    if (evidence.pageSourceCitations !== undefined) {
+      if (!evidence.pageSourceCitations || typeof evidence.pageSourceCitations !== 'object' || Array.isArray(evidence.pageSourceCitations)) throw new WorkstackError('VALIDATION_ERROR', 'Wiki evidence must map pages to bounded source citations.')
+      citations.push(...Object.values(evidence.pageSourceCitations))
+    }
     const catalog = new SourceCatalogRepository(this.store, { clock: this.clock })
-    for (const citation of evidence.sourceCitations) catalog.readCitation(citation as SourceCitation)
+    for (const group of citations) {
+      if (!Array.isArray(group) || group.length > 500) throw new WorkstackError('VALIDATION_ERROR', 'Wiki evidence must contain bounded source citations.')
+      for (const citation of group) catalog.readCitation(citation as SourceCitation)
+    }
   }
 }
 function page(slug: string, content: string): WikiRevisionPage { return { slug, content, contentHash: createHash('sha256').update(content).digest('hex') } }

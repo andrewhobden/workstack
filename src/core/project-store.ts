@@ -8,6 +8,7 @@ import { WorkstackError } from './errors'
 import { migrate } from './migrations'
 import { acquireProjectOperation, assertProjectAvailable, atomicWriteText, projectLifecyclePath, withProcessLock, type ProjectOperationLease } from './project-lifecycle'
 import { DEFAULT_COPILOT_LAUNCH_PROMPT, LEGACY_DEFAULT_COPILOT_LAUNCH_PROMPT } from './types'
+import { relocateTaskWorkspaces } from './workspace-relocation'
 import type {
   InitializeProjectInput,
   ProjectMetadata,
@@ -107,6 +108,7 @@ export class ProjectStore {
           assertDocumentIdentity(document, metadata)
           if (path.resolve(metadata.rootPath) !== paths.rootPath) {
             await requireOriginalProjectMoved(metadata)
+            relocateTaskWorkspaces(metadata.rootPath, paths.rootPath)
             metadata = { ...metadata, rootPath: paths.rootPath, updatedAt: nextUpdatedAt(metadata, clock) }
             database.prepare('UPDATE projects SET root_path = ?, updated_at = ? WHERE id = ?').run(metadata.rootPath, metadata.updatedAt, metadata.id)
           }
@@ -208,6 +210,7 @@ export class ProjectStore {
       const current = this.project
       if (path.resolve(current.rootPath) === this.paths.rootPath) return current
       await requireOriginalProjectMoved(current)
+      relocateTaskWorkspaces(current.rootPath, this.paths.rootPath)
       const next = { ...current, rootPath: this.paths.rootPath, updatedAt: nextUpdatedAt(current, systemClock) }
       this.database.prepare('UPDATE projects SET root_path = ?, updated_at = ? WHERE id = ?').run(next.rootPath, next.updatedAt, next.id)
       this.metadata = next

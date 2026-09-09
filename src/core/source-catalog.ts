@@ -2,12 +2,14 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync, realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { z } from 'zod'
+import type Database from 'better-sqlite3'
 import { systemClock, type Clock } from './clock'
 import { WorkstackError } from './errors'
 import { redactEvidence } from './evidence-policy'
 import { KnowledgeJobsRepository, type KnowledgeIntakeJob } from './knowledge-jobs'
 import { SOURCE_PASSAGE_LIMITS, hashSourceText, sourceSearchExpression, splitSourcePassages } from './source-passages'
 import type { ProjectStore } from './project-store'
+import { readWikiPageCitations } from './wiki-source-evidence'
 
 export type SourceKind = 'repo_file' | 'github_file' | 'github_issue' | 'github_pr' | 'manual' | 'work_completion' | 'wiki' | 'file'
 export type SourcePolicy = 'import_once' | 'tracked_content' | 'metadata_only' | 'paused'
@@ -69,6 +71,7 @@ interface PassageRow {
   id: string; source_id: string; revision_id: string; ordinal: number; heading_json: string; start_line: number; end_line: number
   start_offset: number; end_offset: number; text: string; passage_hash: string; structure_json: string; rank?: number
 }
+interface DependentRow { source_id: string; revision_id: string; artifact_kind: string; artifact_id: string; stale: number; reason: string | null; queued_at: string | null }
 
 const registerSchema = z.object({
   id: z.string().min(1).max(200).optional(), kind: z.enum(['repo_file', 'github_file', 'github_issue', 'github_pr', 'manual', 'work_completion', 'wiki', 'file']),
@@ -77,11 +80,16 @@ const registerSchema = z.object({
   refreshSeconds: z.number().int().min(60).max(30 * 86400).default(3600)
 })
 const MAX_SOURCE_CHARACTERS = 2_000_000
+const DERIVED_STALE_REASON = 'Wiki supporting evidence is not current: '
+interface FreshnessCache { stamp: string; checkedAt: string; nextExpiry?: string; sources?: Map<string, ProjectSource> }
+const freshnessCaches = new WeakMap<Database.Database, FreshnessCache>()
 
 export class SourceCatalogRepository {
   readonly jobs: KnowledgeJobsRepository
+  private effectiveSources?: Map<string, ProjectSource>
   constructor(private readonly store: ProjectStore, private readonly dependencies: { clock?: Clock; beforePublish?: () => void } = {}) {
     this.jobs = new KnowledgeJobsRepository(store, dependencies)
+    this.refreshDependencies()
   }
 
   registerSource(input: RegisterSourceInput): ProjectSource {
@@ -109,12 +117,15 @@ export class SourceCatalogRepository {
   }
 
   listSources(): ProjectSource[] {
-    return (this.store.database.prepare('SELECT * FROM source_catalog ORDER BY title COLLATE NOCASE,id').all() as SourceRow[]).map((row) => this.decodeSource(row))
+    this.refreshDependencies()
+    return this.effectiveSources ? [...this.effectiveSources.values()].map((source) => ({ ...source })) : (this.store.database.prepare('SELECT * FROM source_catalog ORDER BY title COLLATE NOCASE,id').all() as SourceRow[]).map((row) => this.decodeSource(row))
   }
   getSource(id: string): ProjectSource {
-    const row = this.store.database.prepare('SELECT * FROM source_catalog WHERE id = ?').get(id) as SourceRow | undefined
-    if (!row) throw new WorkstackError('WORK_ITEM_NOT_FOUND', 'The project source does not exist.')
-    return this.decodeSource(row)
+    this.refreshDependencies()
+    const row = this.effectiveSources ? undefined : this.store.database.prepare('SELECT * FROM source_catalog WHERE id = ?').get(id) as SourceRow | undefined
+    const source = this.effectiveSources?.get(id) ?? (row ? this.decodeSource(row) : undefined)
+    if (!source) throw new WorkstackError('WORK_ITEM_NOT_FOUND', 'The project source does not exist.')
+    return { ...source }
   }
   getDetail(id: string): SourceDetail {
     return { source: this.getSource(id), revisions: (this.store.database.prepare('SELECT * FROM source_revisions WHERE source_id = ? ORDER BY acquired_at DESC,id').all(id) as RevisionRow[]).map(decodeRevision), jobs: this.jobs.list('catalog').filter((job) => job.sourceId === id), attempts: (this.store.database.prepare('SELECT * FROM source_intake_events WHERE source_id = ? ORDER BY id DESC LIMIT 100').all(id) as Array<{ id: number; source_id: string; job_id: string | null; attempt: number; stage: string; outcome: string; message: string | null; created_at: string }>).map((row) => ({ id: row.id, sourceId: row.source_id, jobId: row.job_id ?? undefined, attempt: row.attempt, stage: row.stage, outcome: row.outcome, message: row.message ?? undefined, createdAt: row.created_at })) }
@@ -172,6 +183,7 @@ export class SourceCatalogRepository {
         this.recordFreshness(source.id, { unavailable: true, reason: input.limitations?.join(' ') || `Source conversion is ${outcome}.` })
       }
       this.event(source.id, undefined, 'publish', outcome, `${revision.id}: ${passages.length} passages`)
+      this.refreshDependencies()
       return decodeRevision(revision)
     }).immediate()
   }
@@ -219,6 +231,7 @@ export class SourceCatalogRepository {
       if (job.status === 'pending') {
         this.store.database.prepare("UPDATE source_catalog SET state = 'refresh_pending', updated_at = ? WHERE id = ?").run(this.now(), sourceId)
         this.event(sourceId, job, 'fetch', 'queued')
+        this.refreshDependencies()
       }
       return job
     }).immediate()
@@ -299,6 +312,7 @@ export class SourceCatalogRepository {
   }
 
   search(query: string, options: { limit?: number; maxChars?: number; workItemId?: string } = {}): SourcePassage[] {
+    this.refreshDependencies()
     const expression = sourceSearchExpression(query)
     if (!expression) return []
     const limit = z.number().int().min(1).max(SOURCE_PASSAGE_LIMITS.maxResults).parse(options.limit ?? 10)
@@ -317,6 +331,7 @@ export class SourceCatalogRepository {
       if (result.length >= limit) break
       if (hashes.has(row.passage_hash) || (perSource.get(row.source_id) ?? 0) >= 3 || row.text.length > remaining) continue
       const passage = this.decodePassage(row)
+      if (passage.readiness !== 'ready') continue
       result.push(passage)
       hashes.add(row.passage_hash)
       perSource.set(row.source_id, (perSource.get(row.source_id) ?? 0) + 1)
@@ -358,8 +373,82 @@ export class SourceCatalogRepository {
       .run(sourceId, revisionId, artifactKind, artifactId, stale ? 1 : 0, stale ? 'Referenced source revision is not current and ready.' : null, stale ? this.now() : null)
   }
   listInvalidations(): SourceInvalidation[] {
-    for (const source of this.listSources()) if (source.state !== 'ready') this.invalidate(source.id, source.staleReason ?? 'Source is not current and ready.')
+    this.refreshDependencies(true)
     return (this.store.database.prepare('SELECT * FROM source_dependents WHERE stale = 1 ORDER BY queued_at, artifact_kind, artifact_id').all() as Array<{ source_id: string; revision_id: string; artifact_kind: string; artifact_id: string; reason: string; queued_at: string }>).map((row) => ({ sourceId: row.source_id, revisionId: row.revision_id, artifactKind: row.artifact_kind, artifactId: row.artifact_id, reason: row.reason, queuedAt: row.queued_at }))
+  }
+
+  /** Reconcile the durable queue with exact evidence, including time-only expiry and transitive wiki dependencies. */
+  refreshDependencies(force = false): void {
+    this.store.database.transaction(() => {
+      const database = this.store.database
+      const now = this.now()
+      // The transactional version detects rollbacks; total_changes distinguishes later writes
+      // that reuse a rolled-back version, and data_version observes other connections.
+      const stamp = (): string => JSON.stringify([database.prepare('SELECT version,total_changes() AS changes FROM retrieval_corpus_state WHERE id = 1').get(), database.pragma('data_version', { simple: true })])
+      const cached = freshnessCaches.get(database)
+      if (!force && cached && cached.stamp === stamp() && now >= cached.checkedAt && (!cached.nextExpiry || now < cached.nextExpiry)) {
+        this.effectiveSources = cached.sources
+        return
+      }
+      const publication = database.prepare('SELECT revision_id FROM wiki_publication WHERE id = 1').get() as { revision_id: string } | undefined
+      if (!force && !publication) {
+        this.effectiveSources = undefined
+        freshnessCaches.set(database, { stamp: stamp(), checkedAt: now })
+        return
+      }
+      const rows = database.prepare('SELECT * FROM source_catalog ORDER BY title COLLATE NOCASE,id').all() as SourceRow[]
+      const sources = new Map(rows.map((row) => [row.id, this.decodeSource(row.state === 'stale' && row.stale_reason?.startsWith(DERIVED_STALE_REASON) ? { ...row, state: 'ready', stale_reason: null } : row)]))
+      const existing = database.prepare('SELECT * FROM source_dependents ORDER BY source_id,revision_id,artifact_kind,artifact_id').all() as DependentRow[]
+      const wanted = new Map<string, DependentRow>()
+      const key = (row: DependentRow): string => JSON.stringify([row.source_id, row.revision_id, row.artifact_kind, row.artifact_id])
+      if (publication) for (const [slug, citations] of Object.entries(readWikiPageCitations(database, publication.revision_id))) {
+        for (const citation of citations) if (sources.has(`wiki:${slug}`) && sources.has(citation.sourceId)) {
+          const row: DependentRow = { source_id: citation.sourceId, revision_id: citation.revisionId, artifact_kind: 'wiki_source', artifact_id: `wiki:${slug}`, stale: 0, reason: null, queued_at: null }
+          wanted.set(key(row), row)
+        }
+      }
+      const dependents = existing.filter((row) => row.artifact_kind !== 'wiki_source' || wanted.has(key(row)))
+      const known = new Set(dependents.map(key))
+      for (const [identity, row] of wanted) if (!known.has(identity)) {
+        dependents.push(row)
+        if (!database.readonly) database.prepare('INSERT INTO source_dependents(source_id,revision_id,artifact_kind,artifact_id) VALUES (?,?,?,?)').run(row.source_id, row.revision_id, row.artifact_kind, row.artifact_id)
+      }
+      if (!database.readonly) for (const row of existing) if (row.artifact_kind === 'wiki_source' && !wanted.has(key(row))) database.prepare('DELETE FROM source_dependents WHERE source_id = ? AND revision_id = ? AND artifact_kind = ? AND artifact_id = ?').run(row.source_id, row.revision_id, row.artifact_kind, row.artifact_id)
+      // Start from direct readiness, then spread only failures. This also lets an unchanged refresh recover a chain.
+      let changed: boolean
+      do {
+        changed = false
+        for (const row of dependents) {
+          if (row.artifact_kind !== 'wiki_source') continue
+          const source = sources.get(row.source_id)!
+          const target = sources.get(row.artifact_id)!
+          if (target.state === 'ready' && (source.state !== 'ready' || source.currentRevisionId !== row.revision_id)) {
+            target.state = 'stale'
+            target.staleReason = `${DERIVED_STALE_REASON}${source.title} (${source.id}).`
+            changed = true
+          }
+        }
+      } while (changed)
+      if (!database.readonly) {
+        for (const row of rows) {
+          const source = sources.get(row.id)!
+          if ((row.state === 'ready' || row.stale_reason?.startsWith(DERIVED_STALE_REASON)) && (source.staleReason?.startsWith(DERIVED_STALE_REASON) || row.stale_reason?.startsWith(DERIVED_STALE_REASON) && source.state === 'ready')) {
+            const reason = source.staleReason ?? null
+            if (row.state !== source.state || row.stale_reason !== reason) database.prepare('UPDATE source_catalog SET state = ?, stale_reason = ?, updated_at = ? WHERE id = ?').run(source.state, reason, now, source.id)
+          }
+        }
+        for (const row of dependents) {
+          const source = sources.get(row.source_id)!
+          const stale = source.state !== 'ready' || source.currentRevisionId !== row.revision_id
+          const reason = stale ? source.state !== 'ready' ? source.staleReason ?? 'Source is not current and ready.' : 'Source content changed.' : null
+          if (row.stale !== Number(stale) || row.reason !== reason) database.prepare('UPDATE source_dependents SET stale = ?, reason = ?, queued_at = ? WHERE source_id = ? AND revision_id = ? AND artifact_kind = ? AND artifact_id = ?')
+            .run(Number(stale), reason, stale ? row.queued_at ?? this.now() : null, row.source_id, row.revision_id, row.artifact_kind, row.artifact_id)
+        }
+      }
+      this.effectiveSources = sources
+      const nextExpiry = rows.map((row) => row.policy !== 'import_once' && row.policy !== 'paused' && row.next_refresh_at && row.next_refresh_at > now ? row.next_refresh_at : undefined).filter((expiry): expiry is string => expiry !== undefined).sort()[0]
+      freshnessCaches.set(database, { stamp: stamp(), checkedAt: now, nextExpiry, sources })
+    })()
   }
 
   migrateLegacySources(): number {

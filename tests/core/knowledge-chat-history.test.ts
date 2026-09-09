@@ -31,3 +31,25 @@ it('keeps short history exact and refuses an unmatched native tool request', () 
   expect(prepareChatHistory([message('user', 'Short question'), message('assistant', 'Short answer')])).toEqual([{ role: 'user', content: 'Short question' }, { role: 'assistant', content: 'Short answer' }])
   expect(() => prepareChatHistory([message('assistant', '', { toolCalls: [{ id: 'missing', name: 'get_project', arguments: {} }] })])).toThrow('unresolved tool request')
 })
+
+it('redacts retained native tool evidence at replay without rewriting history or corrupting JSON', () => {
+  const evidence = [
+    '{ "error": "password=old-private-value", "nested": { "secret": "stored-secret", "auth_token": "native-auth-token" }, "count": 2 }',
+    'Older unstructured failure: Authorization: Bearer old-token-value',
+    '{ "citation": "source://original/revisions/one", "ready": true }'
+  ]
+  const calls = evidence.map((_content, index) => ({ id: `saved-${index}`, name: 'get_project', arguments: {} }))
+  const history = [message('user', 'Continue the old session'), message('assistant', '', { toolCalls: calls }),
+    ...evidence.map((content, index) => message('tool', content, {}, calls[index].id)),
+    message('tool', '{"authorization":"Bearer legacy-token","auth-token":"legacy-auth-token"}', {}, 'orphan-tool')]
+  const before = structuredClone(history)
+  const replayed = prepareChatHistory(history)
+  const results = replayed.filter((entry) => entry.role === 'tool')
+  expect(results.map((entry) => entry.toolCallId)).toEqual(calls.map((call) => call.id))
+  expect(JSON.parse(results[0].content)).toEqual({ error: 'password=[REDACTED]', nested: { secret: '[REDACTED]', auth_token: '[REDACTED]' }, count: 2 })
+  expect(results[1].content).toBe('Older unstructured failure: Authorization: [REDACTED]')
+  expect(results[2].content).toBe(evidence[2])
+  expect(replayed.find((entry) => entry.content.startsWith('Legacy tool evidence (orphan-tool)'))?.content).toContain('{"authorization":"[REDACTED]","auth-token":"[REDACTED]"}')
+  expect(JSON.stringify(replayed)).not.toMatch(/old-private-value|stored-secret|old-token-value|native-auth-token|legacy-token|legacy-auth-token/)
+  expect(history).toEqual(before)
+})
