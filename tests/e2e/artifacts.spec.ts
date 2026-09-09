@@ -34,7 +34,7 @@ test('stores picker, drag-drop, and pasted image context durably @a11y @visual',
   })
   await expect(page.getByText('dropped-notes.txt', { exact: true })).toBeVisible()
 
-  await page.getByRole('button', { name: 'Edit' }).click()
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
   const description = page.getByLabel('Work item description')
   await description.evaluate((element, png) => {
     const data = new DataTransfer()

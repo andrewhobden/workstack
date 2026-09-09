@@ -1,14 +1,18 @@
 import { defineConfig } from '@playwright/test'
+import { testEndpoint } from './tests/support/test-server'
+
+const endpoint = testEndpoint()
 
 export default defineConfig({
   testDir: './tests/e2e',
+  globalSetup: './tests/support/playwright-global-setup.ts',
   outputDir: 'test-results',
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [['github'], ['html', { open: 'never' }]] : 'list',
   use: {
-    baseURL: 'http://127.0.0.1:4173',
+    baseURL: endpoint.baseURL,
     locale: 'en-US',
     timezoneId: 'UTC',
     colorScheme: 'light',
@@ -17,9 +21,9 @@ export default defineConfig({
     trace: 'retain-on-failure'
   },
   webServer: {
-    command: 'npm run web:preview -- --host 127.0.0.1 --port 4173',
-    url: 'http://127.0.0.1:4173',
-    reuseExistingServer: !process.env.CI
+    command: `npm run web:preview -- --host 127.0.0.1 --port ${endpoint.port} --strictPort`,
+    url: endpoint.baseURL,
+    reuseExistingServer: false
   },
   projects: [
     {

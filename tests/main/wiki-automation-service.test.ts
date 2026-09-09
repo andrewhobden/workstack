@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -5,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { KnowledgeRepository } from '../../src/core/knowledge'
 import { ProjectStore } from '../../src/core/project-store'
 import { WikiAutomationRepository } from '../../src/core/wiki-automation'
+import { WikiRevisionRepository } from '../../src/core/wiki-revisions'
 import { WikiAutomationService } from '../../src/main/wiki-automation-service'
 
 const cleanupPaths: string[] = []
@@ -17,6 +19,13 @@ describe('WikiAutomationService', () => {
   it('atomically deduplicates merged PRs and durably records their generation evidence', async () => {
     const rootPath = await mkdtemp(path.join(os.tmpdir(), 'workstack-wiki-service-'))
     cleanupPaths.push(rootPath)
+    execFileSync('git', ['init', '--quiet'], { cwd: rootPath })
+    execFileSync('git', ['config', 'user.name', 'Workstack Test'], { cwd: rootPath })
+    execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: rootPath })
+    await writeFile(path.join(rootPath, 'README.md'), '# Wiki automation evidence')
+    execFileSync('git', ['add', 'README.md'], { cwd: rootPath })
+    execFileSync('git', ['commit', '-m', 'Document wiki', '--quiet'], { cwd: rootPath })
+    const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: rootPath, encoding: 'utf8' }).trim()
     const store = await ProjectStore.initialize({ rootPath, name: 'Automation test' })
     store.close()
     const baselineStore = await ProjectStore.open(rootPath)
@@ -41,15 +50,10 @@ describe('WikiAutomationService', () => {
     })
     baselineRepository.completeJob(baselineJob.id)
     baselineStore.close()
-    const articles = new Map<string, string>()
     const projects = {
       getProject: async () => ({ id: 'project-id', name: 'Automation test', rootPath }),
       getCompletion: async () => ({ sessionSummaryMarkdown: 'The worker added the durable project wiki.' }),
-      listProjects: async () => [],
-      saveGeneratedWikiArticle: async (_projectId: string, slug: string, content: string) => {
-        articles.set(slug, content)
-        return { slug, content }
-      }
+      listProjects: async () => []
     }
     const provider = { propose: async (prompt: string) => `# Generated\n\n${prompt.includes('next coding agent') ? 'Agent brief.' : 'Evidence-based documentation.'}` }
     const service = new WikiAutomationService(projects as never, provider as never)
@@ -58,7 +62,7 @@ describe('WikiAutomationService', () => {
       workItemId: 'work-item-id',
       pullRequest: {
         headRefName: 'feature/wiki',
-        mergeCommit: { oid: 'missing-commit' },
+        mergeCommit: { oid: commit },
         mergedAt: '2026-08-14T00:00:00Z',
         number: 12,
         title: 'Document wiki automation',
@@ -76,27 +80,29 @@ describe('WikiAutomationService', () => {
     const reopened = await ProjectStore.open(rootPath)
     const repository = new WikiAutomationRepository(reopened)
     const jobs = repository.listJobs()
-    const currentJob = jobs.find((job) => job.requestedBy?.includes('missing-commit'))!
+    const currentJob = jobs.find((job) => job.requestedBy?.includes(commit))!
     const report = repository.getJobReport(currentJob.id)
     const evidence = repository.getMergeEvidence(currentJob.id)
+    const proposals = new WikiRevisionRepository(reopened)
+    const proposedPages = proposals.review(proposals.list()[0].id).pages
+    expect(new KnowledgeRepository(reopened).listWikiArticles().filter((article) => article.slug.startsWith('generated-'))).toEqual([])
     reopened.close()
     expect(jobs).toHaveLength(2)
-    expect(currentJob).toMatchObject({ status: 'completed', requestedBy: expect.stringContaining('missing-commit') })
+    expect(currentJob).toMatchObject({ status: 'completed', requestedBy: expect.stringContaining(commit) })
     expect(evidence).toMatchObject({
       pullRequestUrl: merged.pullRequest.url,
       pullRequestNumber: 12,
-      mergeCommitSha: 'missing-commit',
+      mergeCommitSha: commit,
       workItemId: 'work-item-id',
       sessionSummaryMarkdown: 'The worker added the durable project wiki.'
     })
     expect(report.artifacts).toHaveLength(5)
-    expect(report.artifacts[0].kind).toBe('dependency_graph')
-    expect(report.artifacts[0].metadata).toMatchObject({
+    expect(report.artifacts.find((artifact) => artifact.kind === 'dependency_graph')?.metadata).toMatchObject({
       baselineArtifactId: baselineArtifact.id,
       graph: expect.any(Object),
       delta: expect.objectContaining({ addedNodes: expect.any(Array), removedNodes: [{ path: 'src/removed.ts' }] })
     })
-    expect([...articles.keys()].sort()).toEqual([
+    expect(proposedPages.map((page) => page.slug).sort()).toEqual([
       'generated-12-change-log',
       'generated-agent-brief',
       'generated-architecture',
@@ -104,7 +110,7 @@ describe('WikiAutomationService', () => {
     ])
   })
 
-  it('retries failed and interrupted jobs before processing them', async () => {
+  it('recovers interrupted jobs and leaves permanent failures for targeted retry', async () => {
     const rootPath = await mkdtemp(path.join(os.tmpdir(), 'workstack-wiki-service-retry-'))
     cleanupPaths.push(rootPath)
     const store = await ProjectStore.initialize({ rootPath, name: 'Retry test' })
@@ -133,7 +139,7 @@ describe('WikiAutomationService', () => {
     expect(jobs).toHaveLength(2)
     expect(jobs).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: interrupted.id, status: 'completed', attemptCount: 2 }),
-      expect.objectContaining({ id: failed.id, status: 'completed', attemptCount: 2 })
+      expect.objectContaining({ id: failed.id, status: 'failed', attemptCount: 1 })
     ]))
   })
 
@@ -184,7 +190,7 @@ describe('WikiAutomationService', () => {
           })
         })
       }),
-      expect.objectContaining({ kind: 'wiki_article', relativePath: 'wiki/generated-codebase-map.md' })
+      expect.objectContaining({ kind: 'wiki_draft', relativePath: 'wiki/generated-codebase-map.md' })
     ]))
   })
 })

@@ -5,6 +5,8 @@ import { z } from 'zod'
 import { systemClock, type Clock } from './clock'
 import { WorkstackError } from './errors'
 import { ProjectStore } from './project-store'
+import { decodeDependencyGraphArtifact } from './dependency-graph-artifact'
+import { EvidenceGraphRepository } from './evidence-graph'
 import type {
   CreateWikiAutomationArtifactInput,
   CreateWikiAutomationHandoffInput,
@@ -261,15 +263,22 @@ export class WikiAutomationRepository {
   }
 
   retryJob(jobId: string): WikiAutomationJob {
-    return this.retryJobs("id = ? AND status IN ('failed', 'running')", [jobId])[0] ?? this.invalidRetry(jobId)
+    return this.immediate(() => {
+      const result = this.retryJobs("id = ? AND (status = 'failed' OR (status = 'running' AND (owner IS NULL OR lease_expires_at <= ?)))", [jobId, this.now()])[0] ?? this.invalidRetry(jobId)
+      this.store.database.prepare('UPDATE wiki_automation_jobs SET attempt_count = 0 WHERE id = ?').run(jobId)
+      return { ...result, attemptCount: 0 }
+    })
   }
 
   retryFailedJobs(): WikiAutomationJob[] {
-    return this.retryJobs("status = 'failed'", [])
+    return this.immediate(() => this.retryJobs("status = 'failed'", []).map((job) => {
+      this.store.database.prepare('UPDATE wiki_automation_jobs SET attempt_count = 0 WHERE id = ?').run(job.id)
+      return { ...job, attemptCount: 0 }
+    }))
   }
 
   retryInterruptedJobs(): WikiAutomationJob[] {
-    return this.retryJobs("status = 'running'", [])
+    return this.retryJobs("status = 'running' AND (owner IS NULL OR lease_expires_at <= ?)", [this.now()])
   }
 
   completeJob(jobId: string): WikiAutomationJob {
@@ -295,11 +304,14 @@ export class WikiAutomationRepository {
       metadata: parsed.metadata,
       createdAt: this.now()
     }
-    this.store.database.prepare(
+    this.store.database.transaction(() => {
+      this.store.database.prepare(
       `INSERT INTO wiki_automation_artifacts (
         id, job_id, kind, title, content_markdown, relative_path, metadata_json, created_at
       ) VALUES (@id, @jobId, @kind, @title, @contentMarkdown, @relativePath, @metadataJson, @createdAt)`
-    ).run({ ...artifact, metadataJson: JSON.stringify(artifact.metadata) })
+      ).run({ ...artifact, metadataJson: JSON.stringify(artifact.metadata) })
+      new EvidenceGraphRepository(this.store).projectArtifact(artifact, this.getJob(jobId).sourcePaths)
+    }).immediate()
     return artifact
   }
 
@@ -336,7 +348,7 @@ export class WikiAutomationRepository {
 
   getDependencyGraphSnapshot(artifact: WikiAutomationArtifact): LocalDependencyGraph | undefined {
     if (artifact.kind !== 'dependency_graph') return undefined
-    return parseDependencyGraph(artifact.metadata.graph) ?? parseDependencyGraphContent(artifact.contentMarkdown)
+    return decodeDependencyGraphArtifact(artifact.contentMarkdown, artifact.metadata)?.snapshot
   }
 
   buildLocalDependencyGraphDelta(
@@ -476,7 +488,7 @@ export class WikiAutomationRepository {
       const now = this.now()
       const result = this.store.database.prepare(
         `UPDATE wiki_automation_jobs
-         SET status = 'pending', error_message = NULL, updated_at = ?, started_at = NULL, completed_at = NULL
+         SET status = 'pending', error_message = NULL, updated_at = ?, started_at = NULL, completed_at = NULL, owner = NULL, lease_expires_at = NULL, next_attempt_at = NULL
          WHERE ${condition}`
       ).run(now, ...parameters)
       if (result.changes !== rows.length) throw new WorkstackError('INTERNAL_ERROR', 'Wiki automation retry was interrupted.')
@@ -522,7 +534,6 @@ export class WikiAutomationRepository {
 function listSourceFiles(root: string, maxFiles: number): string[] {
   const files: string[] = []
   const visit = (directory: string): void => {
-    if (files.length >= maxFiles) return
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
       if (files.length >= maxFiles) return
       const target = path.join(directory, entry.name)
@@ -591,24 +602,6 @@ function edgeKey(edge: LocalDependencyGraphEdge): string {
 
 function compareEdges(left: LocalDependencyGraphEdge, right: LocalDependencyGraphEdge): number {
   return left.from.localeCompare(right.from) || left.to.localeCompare(right.to)
-}
-
-function parseDependencyGraph(value: unknown): LocalDependencyGraph | undefined {
-  const parsed = z.object({
-    nodes: z.array(z.object({ path: z.string() })),
-    edges: z.array(z.object({ from: z.string(), to: z.string() })),
-    truncated: z.boolean()
-  }).safeParse(value)
-  return parsed.success ? parsed.data : undefined
-}
-
-function parseDependencyGraphContent(content: string): LocalDependencyGraph | undefined {
-  const json = content.match(/```json\s*\n([\s\S]*?)\n```/)?.[1] ?? content
-  try {
-    return parseDependencyGraph(JSON.parse(json))
-  } catch {
-    return undefined
-  }
 }
 
 function toJob(row: JobRow): WikiAutomationJob {

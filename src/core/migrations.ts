@@ -1,4 +1,12 @@
+import { contextFeedbackMigrations } from './context-feedback-migrations'
 import type Database from 'better-sqlite3'
+import { sourceCatalogMigrations } from './source-catalog-migrations'
+import { wikiRevisionMigrations } from './wiki-revision-migrations'
+import { taskDependencyMigrations } from './task-dependency-migrations'
+import { evidenceGraphMigrations } from './evidence-graph-migrations'
+import { structuredKnowledgeMigrations } from './structured-knowledge-migrations'
+import { contextPacketMigrations } from './context-packet-migrations'
+import { knowledgeRetrievalMigrations } from './knowledge-retrieval-migrations'
 
 const migrations = [
   {
@@ -337,6 +345,91 @@ const migrations = [
         ON wiki_automation_merge_evidence(merge_commit_sha);
     `
   }
+  , {
+    version: 8,
+    sql: `
+      ALTER TABLE work_items ADD COLUMN attention_reason TEXT;
+      ALTER TABLE work_items ADD COLUMN origin_planning_session_id TEXT;
+      ALTER TABLE work_items ADD COLUMN origin_planning_revision INTEGER;
+      ALTER TABLE work_items ADD COLUMN creation_request_id TEXT;
+      ALTER TABLE work_items ADD COLUMN creation_request_payload TEXT;
+      CREATE UNIQUE INDEX work_items_creation_request_idx ON work_items(creation_request_id) WHERE creation_request_id IS NOT NULL;
+      ALTER TABLE completion_records ADD COLUMN pr_state TEXT;
+      UPDATE completion_records SET pr_state = CASE WHEN work_item_id IN (SELECT id FROM work_items WHERE status = 'completed') THEN 'MERGED' ELSE 'OPEN' END WHERE pr_url IS NOT NULL;
+      CREATE TABLE work_item_sequences (id INTEGER PRIMARY KEY CHECK(id = 1), high_watermark INTEGER NOT NULL);
+      INSERT INTO work_item_sequences VALUES (1, (SELECT COALESCE(MAX(sequence_number), 0) FROM work_items));
+      CREATE TABLE completion_history (
+        id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+        completion_json TEXT NOT NULL, archived_at TEXT NOT NULL, reason TEXT NOT NULL
+      );
+      CREATE TABLE work_checkpoints (
+        id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+        claim_id TEXT, agent_id TEXT, session_id TEXT, created_at TEXT NOT NULL, payload_json TEXT NOT NULL
+      );
+      CREATE INDEX work_checkpoints_item_idx ON work_checkpoints(work_item_id, created_at DESC, id DESC);
+      CREATE TABLE planning_contexts (
+        id TEXT PRIMARY KEY, planning_session_id TEXT NOT NULL REFERENCES planning_sessions(id) ON DELETE CASCADE,
+        proposal_revision INTEGER NOT NULL, query TEXT NOT NULL, context_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      ALTER TABLE attachments ADD COLUMN request_id TEXT;
+      CREATE UNIQUE INDEX attachments_request_idx ON attachments(request_id) WHERE request_id IS NOT NULL;
+      ALTER TABLE knowledge_chat_tool_calls ADD COLUMN provider_call_id TEXT;
+      CREATE UNIQUE INDEX chat_provider_call_idx ON knowledge_chat_tool_calls(session_id, provider_call_id) WHERE provider_call_id IS NOT NULL;
+      CREATE TABLE knowledge_chat_turn_locks (
+        session_id TEXT PRIMARY KEY REFERENCES knowledge_chat_sessions(id) ON DELETE CASCADE,
+        owner TEXT NOT NULL, expires_at TEXT NOT NULL
+      );
+    `
+  }
+  , {
+    version: 9,
+    sql: `
+      CREATE TABLE knowledge_delivery_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE, work_item_id TEXT NOT NULL,
+        pr_url TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT, next_attempt_at TEXT, owner TEXT, lease_expires_at TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX knowledge_delivery_due_idx ON knowledge_delivery_outbox(status, next_attempt_at);
+      INSERT OR IGNORE INTO knowledge_delivery_outbox (event_key, work_item_id, pr_url, status, attempts, created_at, updated_at)
+        SELECT 'merge:' || c.work_item_id || ':' || c.pr_url, c.work_item_id, c.pr_url, 'pending', 0, c.created_at, c.created_at
+        FROM completion_records c JOIN work_items w ON w.id = c.work_item_id WHERE w.status = 'completed' AND c.pr_url IS NOT NULL;
+    `
+  }
+  , {
+    version: 10,
+    sql: `
+      ALTER TABLE knowledge_jobs ADD COLUMN processor TEXT NOT NULL DEFAULT 'legacy';
+      ALTER TABLE knowledge_jobs ADD COLUMN stage TEXT NOT NULL DEFAULT 'index';
+      ALTER TABLE knowledge_jobs ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}';
+      ALTER TABLE knowledge_jobs ADD COLUMN request_key TEXT;
+      ALTER TABLE knowledge_jobs ADD COLUMN owner TEXT;
+      ALTER TABLE knowledge_jobs ADD COLUMN lease_expires_at TEXT;
+      ALTER TABLE knowledge_jobs ADD COLUMN next_attempt_at TEXT;
+      CREATE UNIQUE INDEX knowledge_jobs_request_idx ON knowledge_jobs(request_key) WHERE request_key IS NOT NULL;
+      CREATE INDEX knowledge_jobs_due_idx ON knowledge_jobs(processor, status, next_attempt_at);
+    `
+  }
+  , ...sourceCatalogMigrations,
+  {
+    version: 12,
+    sql: `
+      DELETE FROM work_item_search;
+      INSERT INTO work_item_search (work_item_id,title,description_markdown,acceptance_criteria_markdown,completion_markdown)
+      SELECT w.id,w.title,w.description_markdown,w.acceptance_criteria_markdown,
+        COALESCE(c.summary_markdown,'') || char(10) || COALESCE(c.session_summary_markdown,'') || char(10) ||
+        COALESCE(c.implementation_notes_markdown,'') || char(10) || COALESCE(c.validation_markdown,'') || char(10) ||
+        COALESCE(c.known_limitations_markdown,'') || char(10) || COALESCE(c.files_changed_json,'') || char(10) || COALESCE(c.components_changed_json,'')
+      FROM work_items w LEFT JOIN completion_records c ON c.work_item_id = w.id;
+    `
+  },
+  ...wikiRevisionMigrations,
+  ...taskDependencyMigrations,
+  ...evidenceGraphMigrations,
+  ...structuredKnowledgeMigrations,
+  ...contextFeedbackMigrations,
+  ...contextPacketMigrations,
+  ...knowledgeRetrievalMigrations
 ] as const
 
 export function migrate(database: Database.Database): void {
@@ -347,20 +440,24 @@ export function migrate(database: Database.Database): void {
     );
   `)
 
-  const currentVersion = database
-    .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
-    .get() as { version: number }
-
-  for (const migration of migrations) {
-    if (migration.version <= currentVersion.version) {
-      continue
-    }
-
+  for (const migration of [...migrations].sort((left, right) => left.version - right.version)) {
     database.transaction(() => {
+      if (database.prepare('SELECT version FROM schema_migrations WHERE version = ?').get(migration.version)) return
       database.exec(migration.sql)
+      if (migration.version === 8) {
+        const events = database.prepare("SELECT payload_json FROM activity_events WHERE event_type IN ('work_item_created', 'work_item_deleted')").all() as Array<{ payload_json: string }>
+        for (const event of events) {
+          try {
+            const value = (JSON.parse(event.payload_json) as { displayId?: unknown }).displayId
+            const suffix = typeof value === 'string' ? /-(\d+)$/.exec(value)?.[1] : undefined
+            const sequence = Number(suffix)
+            if (Number.isSafeInteger(sequence) && sequence > 0) database.prepare('UPDATE work_item_sequences SET high_watermark = MAX(high_watermark, ?) WHERE id = 1').run(sequence)
+          } catch { /* Historical malformed events cannot allocate an identity. */ }
+        }
+      }
       database
         .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
         .run(migration.version, new Date().toISOString())
-    })()
+    }).immediate()
   }
 }

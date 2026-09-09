@@ -6,16 +6,133 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        id: checkout
+        uses: actions/checkout@v4
+      - name: Set up Node
+        id: setup_node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        id: dependencies
+        run: npm ci
+      - name: Prepare SQLite for Node checks
+        id: node_sqlite
+        run: npm rebuild better-sqlite3 --build-from-source
+      - name: Install Chromium
+        id: chromium
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install chromium
+      # Explicit status conditions let independent checks report after a failure.
+      # No continue-on-error: every failed stage still fails the quality job.
+      - name: Lint
+        id: lint
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: npm run lint
+      - name: Typecheck
+        id: typecheck
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: npm run typecheck
+      - name: Unit and boundary coverage
+        id: unit
+        if: ${{ !cancelled() && steps.node_sqlite.outcome == 'success' }}
+        run: npm run test:unit
+      - name: MCP contracts
+        id: contracts
+        if: ${{ !cancelled() && steps.node_sqlite.outcome == 'success' }}
+        run: npm run test:contract
+      - name: Persistence and service integration
+        id: integration
+        if: ${{ !cancelled() && steps.node_sqlite.outcome == 'success' }}
+        run: npm run test:integration
+      - name: Chromium renderer, visual and accessibility checks
+        id: browser
+        if: ${{ !cancelled() && steps.node_sqlite.outcome == 'success' && steps.chromium.outcome == 'success' }}
+        run: npm run test:e2e
+      # The shared native module changes ABI only after every Node stage has run.
+      # Native/package validation requires the complete preceding gate to pass.
+      - name: Prepare SQLite for Electron
+        id: electron_sqlite
+        if: ${{ success() }}
+        run: npm run rebuild:native
+      - name: Validate real Electron and MCP startup
+        id: native_smoke
+        if: ${{ success() && steps.electron_sqlite.outcome == 'success' }}
+        run: npm run test:desktop
+      - name: Build unsigned local app
+        id: package
+        if: ${{ success() && steps.native_smoke.outcome == 'success' }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run package:mac -- --publish never
+      - name: Validate packaged UI and MCP startup
+        id: packaged_smoke
+        if: ${{ success() && steps.package.outcome == 'success' }}
+        env:
+          WORKSTACK_SMOKE_OUTPUT: test-results/packaged-smoke
+        run: |
+          if [ "$(node -p 'process.arch')" = "arm64" ]; then
+            export WORKSTACK_SMOKE_EXECUTABLE="$GITHUB_WORKSPACE/dist/mac-arm64/Workstack.app/Contents/MacOS/Workstack"
+          else
+            export WORKSTACK_SMOKE_EXECUTABLE="$GITHUB_WORKSPACE/dist/mac/Workstack.app/Contents/MacOS/Workstack"
+          fi
+          node scripts/desktop-smoke.mjs
+      - name: Record per-stage outcomes
+        if: always()
+        env:
+          CI_STAGE_RESULTS: |
+            ## Workstack validation stages
+
+            | Stage | Outcome |
+            | --- | --- |
+            | Source checkout | ${{ steps.checkout.outcome }} |
+            | Node setup | ${{ steps.setup_node.outcome }} |
+            | Locked dependency installation | ${{ steps.dependencies.outcome }} |
+            | Node SQLite preparation | ${{ steps.node_sqlite.outcome }} |
+            | Chromium installation | ${{ steps.chromium.outcome }} |
+            | Lint | ${{ steps.lint.outcome }} |
+            | Typecheck | ${{ steps.typecheck.outcome }} |
+            | Unit and boundary coverage | ${{ steps.unit.outcome }} |
+            | MCP contracts | ${{ steps.contracts.outcome }} |
+            | Persistence and service integration | ${{ steps.integration.outcome }} |
+            | Chromium renderer, visual and accessibility | ${{ steps.browser.outcome }} |
+            | Electron SQLite preparation | ${{ steps.electron_sqlite.outcome }} |
+            | Native UI and MCP smoke | ${{ steps.native_smoke.outcome }} |
+            | Unsigned package build | ${{ steps.package.outcome }} |
+            | Packaged UI and MCP smoke | ${{ steps.packaged_smoke.outcome }} |
+        run: |
+          mkdir -p ci-diagnostics
+          printf '%s\n' "$CI_STAGE_RESULTS" | tee ci-diagnostics/stage-outcomes.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workstack-validation-${{ github.sha }}
+          path: |
+            ci-diagnostics/
+            context-evaluation-results/
+            test-results/
+            playwright-report/
+            coverage/
+          if-no-files-found: ignore
+          retention-days: 14
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '22'
           cache: npm
-      - run: npm ci
-      - run: PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install chromium
-      - run: npm test
+      - run: npm audit --audit-level=high

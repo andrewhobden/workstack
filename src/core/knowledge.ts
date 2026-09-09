@@ -1,10 +1,17 @@
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, renameSync } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { systemClock, type Clock } from './clock'
 import { WorkstackError } from './errors'
 import { ProjectStore } from './project-store'
+import { KnowledgeJobsRepository } from './knowledge-jobs'
+import { WikiRevisionRepository } from './wiki-revisions'
+import { KnowledgeRetrievalService } from './knowledge-retrieval'
+import { SourceCatalogRepository } from './source-catalog'
+import type { ProjectKnowledgeRetrieval } from './knowledge-retrieval-contracts'
+export { KNOWLEDGE_RETRIEVAL_SOURCE_TYPES } from './knowledge-retrieval-contracts'
+export type { KnowledgeRetrievalSourceType, KnowledgeRetrievalResult, KnowledgeRetrievalGroup, ProjectKnowledgeRetrieval } from './knowledge-retrieval-contracts'
 
 export interface KnowledgeSource {
   id: string
@@ -12,6 +19,7 @@ export interface KnowledgeSource {
   displayName: string
   relativeOrExternalLocation: string
   status: 'pending' | 'indexed' | 'failed'
+  errorMessage?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -23,33 +31,9 @@ export interface WikiArticle {
 
 const GENERATED_WIKI_SLUG_PREFIX = 'generated-'
 
-export const KNOWLEDGE_RETRIEVAL_SOURCE_TYPES = ['wiki_article', 'raw_source', 'completed_work', 'backlog'] as const
-
-export type KnowledgeRetrievalSourceType = (typeof KNOWLEDGE_RETRIEVAL_SOURCE_TYPES)[number]
-
-export interface KnowledgeRetrievalResult {
-  sourceId: string
-  sourceType: KnowledgeRetrievalSourceType
-  title: string
-  excerpt: string
-  location: string
-  relevance: number
-  workItemId?: string
-}
-
-export interface KnowledgeRetrievalGroup {
-  sourceType: KnowledgeRetrievalSourceType
-  label: string
-  results: KnowledgeRetrievalResult[]
-}
-
-export interface ProjectKnowledgeRetrieval {
-  query: string
-  results: KnowledgeRetrievalResult[]
-  groups: KnowledgeRetrievalGroup[]
-}
-
 interface KnowledgeSourceRow {
+  source_work_item_id?: string | null
+  error_message?: string | null
   id: string
   kind: KnowledgeSource['kind']
   display_name: string
@@ -83,6 +67,7 @@ export class KnowledgeRepository {
       displayName: parsed.displayName,
       relativeOrExternalLocation,
       status: 'indexed',
+      errorMessage: null,
       createdAt: now,
       updatedAt: now
     }
@@ -99,8 +84,11 @@ export class KnowledgeRepository {
       this.store.database
         .prepare('INSERT INTO knowledge_search (source_id, title, content) VALUES (?, ?, ?)')
         .run(id, source.displayName, parsed.content)
+      const catalog = new SourceCatalogRepository(this.store, this.dependencies)
+      catalog.registerSource({ id, kind: 'manual', title: source.displayName, canonicalUri: `workstack://manual/${id}`, repositoryPath: relativeOrExternalLocation })
+      catalog.publishRevision({ sourceId: id, original: parsed.content })
     }).immediate()
-    return source
+    return toKnowledgeSource(this.store.database.prepare('SELECT * FROM knowledge_sources WHERE id = ?').get(id) as KnowledgeSourceRow)
   }
 
   listSources(): KnowledgeSource[] {
@@ -110,43 +98,53 @@ export class KnowledgeRepository {
   }
 
   processNextJob(): KnowledgeSource | undefined {
-    const job = this.store.database
-      .prepare("SELECT id, source_id FROM knowledge_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1")
-      .get() as { id: string; source_id: string } | undefined
-    if (!job) return undefined
+    const jobs = new KnowledgeJobsRepository(this.store, { clock: this.dependencies.clock })
+    const claimed = jobs.claimNext('legacy')
+    if (!claimed) return undefined
+    const { job, owner } = claimed
     const now = (this.dependencies.clock ?? systemClock).now().toISOString()
     try {
-      const source = this.store.database.prepare('SELECT * FROM knowledge_sources WHERE id = ?').get(job.source_id) as KnowledgeSourceRow
-      const content = readFileSync(path.join(this.store.paths.workstackPath, source.relative_or_external_location), 'utf8')
-      this.store.database.transaction(() => {
+      return this.store.database.transaction(() => {
+        jobs.assertOwner(job.id, owner)
+        const source = this.store.database.prepare('SELECT * FROM knowledge_sources WHERE id = ?').get(job.sourceId) as KnowledgeSourceRow
+        const content = this.completionContent(source) ?? readFileSync(path.join(this.store.paths.workstackPath, source.relative_or_external_location), 'utf8')
         this.store.database.prepare('DELETE FROM knowledge_search WHERE source_id = ?').run(source.id)
         this.store.database.prepare('INSERT INTO knowledge_search (source_id, title, content) VALUES (?, ?, ?)').run(source.id, source.display_name, content)
+        this.appendCompletionKnowledge(source, content)
         this.store.database.prepare("UPDATE knowledge_sources SET status = 'indexed', error_message = NULL, updated_at = ? WHERE id = ?").run(now, source.id)
-        this.store.database.prepare("UPDATE knowledge_jobs SET status = 'completed', attempts = attempts + 1, error_message = NULL, updated_at = ? WHERE id = ?").run(now, job.id)
-      })()
-      this.appendCompletionKnowledge(source, content)
-      return { ...toKnowledgeSource(source), status: 'indexed', updatedAt: now }
+        jobs.complete(job.id, owner)
+        return { ...toKnowledgeSource(source), status: 'indexed' as const, errorMessage: null, updatedAt: now }
+      }).immediate()
     } catch (error) {
-      const message = String(error)
-      this.store.database.transaction(() => {
-        this.store.database.prepare("UPDATE knowledge_sources SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?").run(message, now, job.source_id)
-        this.store.database.prepare("UPDATE knowledge_jobs SET status = 'failed', attempts = attempts + 1, error_message = ?, updated_at = ? WHERE id = ?").run(message, now, job.id)
-      })()
-      return this.listSources().find((source) => source.id === job.source_id)
+      jobs.fail(job.id, owner, error)
+      this.store.database.prepare("UPDATE knowledge_sources SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?").run(String(error), now, job.sourceId)
+      return this.listSources().find((source) => source.id === job.sourceId)
     }
   }
 
+  private completionContent(source: KnowledgeSourceRow): string | undefined {
+    if (source.kind !== 'work_completion' || !source.source_work_item_id) return undefined
+    const row = this.store.database.prepare('SELECT * FROM completion_records WHERE work_item_id = ?').get(source.source_work_item_id) as Record<string, unknown> | undefined
+    if (!row) throw new WorkstackError('WORK_ITEM_NOT_FOUND', 'The completion evidence is missing; it cannot be indexed as empty content.')
+    return ['# Completion', row.summary_markdown, '## Worker handoff', row.session_summary_markdown, '## Implementation notes', row.implementation_notes_markdown,
+      '## Validation', row.validation_markdown, '## Known limitations', row.known_limitations_markdown, '## Files changed', row.files_changed_json,
+      '## Components changed', row.components_changed_json, '## Delivery', row.branch, row.commit_sha, row.pr_url].filter(Boolean).join('\n\n')
+  }
+
   retryFailedJobs(): number {
-    const now = (this.dependencies.clock ?? systemClock).now().toISOString()
-    return this.store.database.prepare("UPDATE knowledge_jobs SET status = 'pending', error_message = NULL, updated_at = ? WHERE status = 'failed'").run(now).changes
+    const jobs = new KnowledgeJobsRepository(this.store, { clock: this.dependencies.clock })
+    const failed = jobs.list('legacy').filter((job) => job.status === 'failed')
+    failed.forEach((job) => jobs.retry(job.id))
+    return failed.length
   }
 
   listWikiArticles(): WikiArticle[] {
     mkdirSync(this.store.paths.wikiPath, { recursive: true })
-    return readdirSync(this.store.paths.wikiPath)
-      .filter((filename) => filename.endsWith('.md'))
+    const manual = readdirSync(this.store.paths.wikiPath)
+      .filter((filename) => filename.endsWith('.md') && !filename.startsWith('generated-'))
       .sort()
       .map((filename) => ({ slug: filename.slice(0, -3), content: readFileSync(path.join(this.store.paths.wikiPath, filename), 'utf8') }))
+    return [...manual, ...new WikiRevisionRepository(this.store).currentPages().map(({ slug, content }) => ({ slug, content }))].sort((left, right) => left.slug.localeCompare(right.slug))
   }
 
   saveWikiArticle(slug: string, content: string): WikiArticle {
@@ -162,7 +160,10 @@ export class KnowledgeRepository {
     if (!isGeneratedWikiSlug(safeSlug)) {
       throw new WorkstackError('VALIDATION_ERROR', 'The generated wiki API only accepts reserved generated article slugs.')
     }
-    return this.writeWikiArticle(safeSlug, content)
+    const revisions = new WikiRevisionRepository(this.store, this.dependencies.clock ?? systemClock)
+    const staged = revisions.stage({ requestKey: `explicit-write:${randomUUID()}`, title: `Update ${safeSlug}`, pages: [{ slug: safeSlug, content }], author: 'explicit-generated-writer', rationale: 'Explicit generated-article write through the local compatibility API.' })
+    revisions.publish(staged.revision.id, 'explicit-generated-writer', 'Explicit write; automated generation uses the review queue.')
+    return { slug: safeSlug, content }
   }
 
   private writeWikiArticle(slug: string, content: string): WikiArticle {
@@ -176,150 +177,32 @@ export class KnowledgeRepository {
         `Wiki: ${slug}`,
         content
       )
+      const catalog = new SourceCatalogRepository(this.store, this.dependencies)
+      const title = `Wiki: ${content.match(/^#\s+(.+)$/m)?.[1]?.trim() || slug}`
+      catalog.registerSource({ id: `wiki:${slug}`, kind: 'wiki', title, canonicalUri: `workstack://wiki/${slug}`, repositoryPath: `knowledge/wiki/${slug}.md` })
+      this.store.database.prepare('UPDATE source_catalog SET title = ? WHERE id = ?').run(title, `wiki:${slug}`)
+      this.store.database.prepare('UPDATE knowledge_sources SET display_name = ? WHERE id = ?').run(title, `wiki:${slug}`)
+      catalog.publishRevision({ sourceId: `wiki:${slug}`, original: content, outcome: content.trim() ? 'complete' : 'unsupported', limitations: content.trim() ? [] : ['The wiki article is empty.'] })
     })()
     return article
   }
 
   search(query: string): Array<{ sourceId: string; title: string; excerpt: string; score: number }> {
-    const normalized = query.trim()
-    if (!normalized) {
-      return []
-    }
-    const rows = this.store.database
-      .prepare(
-        `SELECT source_id, title, content
-         FROM knowledge_search
-         WHERE knowledge_search MATCH ?
-         ORDER BY rank
-         LIMIT 20`
-      )
-      .all(normalized.split(/\s+/).map((term) => `"${term.replace(/"/g, '')}"`).join(' OR ')) as Array<{
-        source_id: string
-        title: string
-        content: string
-      }>
-    return rows.map((row, index) => ({
-      sourceId: row.source_id,
-      title: row.title,
-      excerpt: excerptFor(row.content, normalized),
-      score: 1 / (index + 1)
+    return new KnowledgeRetrievalService(this.store, this.dependencies.clock ?? systemClock).retrieveLexical(query, { limit: 20, sourceTypes: ['wiki_article', 'raw_source', 'completed_work'] }).results.map((result) => ({
+      sourceId: result.canonicalSourceId ?? result.sourceId, title: result.sourceType === 'wiki_article' ? `Wiki: ${result.sourceId.slice(5)}` : result.title, excerpt: result.excerpt, score: result.relevance
     }))
   }
 
   retrieve(query: string, limit = 40): ProjectKnowledgeRetrieval {
-    const normalized = query.trim()
-    if (!normalized) {
-      return { query: normalized, results: [], groups: retrievalGroups([]) }
-    }
-
-    const sourceById = new Map(this.listSources().map((source) => [source.id, source]))
-    const candidates: RetrievalCandidate[] = [
-      ...this.listWikiArticles().map((article) => ({
-        sourceId: `wiki:${article.slug}`,
-        sourceType: 'wiki_article' as const,
-        title: articleTitle(article),
-        excerpt: excerptFor(article.content, normalized),
-        location: `knowledge/wiki/${article.slug}.md`,
-        content: article.content
-      })),
-      ...(this.store.database
-        .prepare('SELECT source_id, title, content FROM knowledge_search')
-        .all() as Array<{ source_id: string; title: string; content: string }>)
-        .flatMap((row) => {
-          const source = sourceById.get(row.source_id)
-          if (!source || source.kind === 'work_completion') return []
-          return [{
-            sourceId: `raw:${source.id}`,
-            sourceType: 'raw_source' as const,
-            title: source.displayName,
-            excerpt: excerptFor(row.content, normalized),
-            location: source.relativeOrExternalLocation,
-            content: `${row.title}\n${row.content}`
-          }]
-        }),
-      ...(this.store.database
-        .prepare(
-          `SELECT wi.id, wi.display_id, wi.title, wi.description_markdown, wi.acceptance_criteria_markdown,
-                  cr.summary_markdown, cr.implementation_notes_markdown, cr.validation_markdown,
-                  cr.known_limitations_markdown, cr.files_changed_json, cr.components_changed_json
-           FROM work_items wi
-           LEFT JOIN completion_records cr ON cr.work_item_id = wi.id
-           WHERE wi.status = 'completed'`
-        )
-        .all() as CompletedWorkRow[])
-        .map((row) => {
-          const content = completedWorkContent(row)
-          return {
-            sourceId: `completed:${row.id}`,
-            sourceType: 'completed_work' as const,
-            title: `${row.display_id} · ${row.title}`,
-            excerpt: excerptFor(content, normalized),
-            location: `work-items/${row.id}/completion.md`,
-            workItemId: row.id,
-            content
-          }
-        }),
-      ...(this.store.database
-        .prepare(
-          `SELECT id, display_id, title, description_markdown, acceptance_criteria_markdown
-           FROM work_items WHERE status = 'backlog'`
-        )
-        .all() as BacklogWorkRow[])
-        .map((row) => {
-          const content = `${row.title}\n${row.description_markdown}\n${row.acceptance_criteria_markdown}`
-          return {
-            sourceId: `backlog:${row.id}`,
-            sourceType: 'backlog' as const,
-            title: `${row.display_id} · ${row.title}`,
-            excerpt: excerptFor(content, normalized),
-            location: `work-items/${row.id}/work-item.md`,
-            workItemId: row.id,
-            content
-          }
-        })
-    ]
-
-    const results = candidates
-      .map(({ content, ...candidate }) => ({ ...candidate, relevance: lexicalRelevance(`${candidate.title}\n${content}`, normalized) }))
-      .filter((result) => result.relevance > 0)
-      .sort(compareRetrievalResults)
-      .slice(0, limit)
-
-    return { query: normalized, results, groups: retrievalGroups(results) }
+    return new KnowledgeRetrievalService(this.store, this.dependencies.clock ?? systemClock).retrieveLexical(query, { limit })
   }
 
   private appendCompletionKnowledge(source: KnowledgeSourceRow, content: string): void {
     if (source.kind !== 'work_completion') return
     mkdirSync(this.store.paths.wikiPath, { recursive: true })
-    appendFileSync(path.join(this.store.paths.wikiPath, 'completed-work.md'), `\n\n## ${source.display_name}\n\n${content}\n`, 'utf8')
-    appendFileSync(path.join(this.store.paths.knowledgePath, 'log.md'), `\n- Indexed ${source.display_name} (${source.id}).\n`, 'utf8')
+    upsertProjection(path.join(this.store.paths.wikiPath, 'completed-work.md'), source.id, `## ${source.display_name}\n\n${content}\n`)
+    upsertProjection(path.join(this.store.paths.knowledgePath, 'log.md'), source.id, `- Indexed ${source.display_name} (${source.id}).\n`)
   }
-}
-
-interface CompletedWorkRow {
-  id: string
-  display_id: string
-  title: string
-  description_markdown: string
-  acceptance_criteria_markdown: string
-  summary_markdown: string | null
-  implementation_notes_markdown: string | null
-  validation_markdown: string | null
-  known_limitations_markdown: string | null
-  files_changed_json: string | null
-  components_changed_json: string | null
-}
-
-interface BacklogWorkRow {
-  id: string
-  display_id: string
-  title: string
-  description_markdown: string
-  acceptance_criteria_markdown: string
-}
-
-interface RetrievalCandidate extends Omit<KnowledgeRetrievalResult, 'relevance'> {
-  content: string
 }
 
 function toKnowledgeSource(row: KnowledgeSourceRow): KnowledgeSource {
@@ -328,7 +211,7 @@ function toKnowledgeSource(row: KnowledgeSourceRow): KnowledgeSource {
     kind: row.kind,
     displayName: row.display_name,
     relativeOrExternalLocation: row.relative_or_external_location,
-    status: row.status,
+    status: row.status, errorMessage: row.error_message ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   }
@@ -350,75 +233,16 @@ function isGeneratedWikiSlug(slug: string): boolean {
   return slug.startsWith(GENERATED_WIKI_SLUG_PREFIX)
 }
 
-function excerptFor(content: string, query: string): string {
-  const firstTerm = query.toLowerCase().split(/\s+/)[0]
-  const index = content.toLowerCase().indexOf(firstTerm)
-  const start = index < 0 ? 0 : Math.max(0, index - 40)
-  return content.slice(start, start + 220).trim()
-}
-
-function articleTitle(article: WikiArticle): string {
-  const heading = article.content.match(/^#\s+(.+)$/m)?.[1]?.trim()
-  return heading ? `Wiki: ${heading}` : `Wiki: ${article.slug}`
-}
-
-function completedWorkContent(row: CompletedWorkRow): string {
-  return [
-    row.title,
-    row.description_markdown,
-    row.acceptance_criteria_markdown,
-    row.summary_markdown ?? '',
-    row.implementation_notes_markdown ?? '',
-    row.validation_markdown ?? '',
-    row.known_limitations_markdown ?? '',
-    row.files_changed_json ?? '',
-    row.components_changed_json ?? ''
-  ].join('\n')
-}
-
-function lexicalRelevance(content: string, query: string): number {
-  const normalizedContent = content.toLowerCase()
-  const normalizedQuery = query.toLowerCase()
-  const terms = [...new Set(normalizedQuery.match(/[a-z0-9_-]+/g) ?? [])]
-  if (!terms.some((term) => normalizedContent.includes(term))) return 0
-
-  const phraseMatches = countOccurrences(normalizedContent, normalizedQuery)
-  const termMatches = terms.reduce((total, term) => total + countOccurrences(normalizedContent, term), 0)
-  const title = content.split('\n', 1)[0].toLowerCase()
-  const titleMatches = terms.reduce((total, term) => total + countOccurrences(title, term), 0)
-  return phraseMatches * 100 + titleMatches * 20 + termMatches
-}
-
-function countOccurrences(content: string, term: string): number {
-  let count = 0
-  let start = 0
-  while (true) {
-    const index = content.indexOf(term, start)
-    if (index === -1) return count
-    count += 1
-    start = index + term.length
-  }
-}
-
-function compareRetrievalResults(left: KnowledgeRetrievalResult, right: KnowledgeRetrievalResult): number {
-  if (right.relevance !== left.relevance) return right.relevance - left.relevance
-  const typeOrder = KNOWLEDGE_RETRIEVAL_SOURCE_TYPES.indexOf(left.sourceType) - KNOWLEDGE_RETRIEVAL_SOURCE_TYPES.indexOf(right.sourceType)
-  if (typeOrder !== 0) return typeOrder
-  const titleOrder = left.title.localeCompare(right.title, 'en-US')
-  if (titleOrder !== 0) return titleOrder
-  return left.sourceId.localeCompare(right.sourceId, 'en-US')
-}
-
-function retrievalGroups(results: KnowledgeRetrievalResult[]): KnowledgeRetrievalGroup[] {
-  const labels: Record<KnowledgeRetrievalSourceType, string> = {
-    wiki_article: 'Wiki articles',
-    raw_source: 'Raw sources',
-    completed_work: 'Completed work',
-    backlog: 'Backlog'
-  }
-  return KNOWLEDGE_RETRIEVAL_SOURCE_TYPES.map((sourceType) => ({
-    sourceType,
-    label: labels[sourceType],
-    results: results.filter((result) => result.sourceType === sourceType)
-  }))
+function upsertProjection(filename: string, sourceId: string, content: string): void {
+  const key = Buffer.from(sourceId).toString('hex')
+  const start = `<!-- workstack-source:${key}:start -->`
+  const end = `<!-- workstack-source:${key}:end -->`
+  const previous = existsSync(filename) ? readFileSync(filename, 'utf8') : ''
+  const begin = previous.indexOf(start)
+  const finish = previous.indexOf(end, begin)
+  const section = `${start}\n${content}\n${end}`
+  const next = begin >= 0 && finish >= begin ? `${previous.slice(0, begin)}${section}${previous.slice(finish + end.length)}` : `${previous}\n\n${section}\n`
+  const temporary = `${filename}.${randomUUID()}.tmp`
+  writeFileSync(temporary, next, 'utf8')
+  renameSync(temporary, filename)
 }

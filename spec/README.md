@@ -1,5 +1,7 @@
 # Workstack — Implementation Pack
 
+For the current executable setup and lifecycle contracts, start with the [repository README](../README.md), [installation guide](../docs/installation.md), and [agent setup guide](../docs/agent-setup.md). This pack retains the original design; implemented behavior and release evidence are tracked separately.
+
 Workstack is a local-first development coordination tool for humans and coding agents. It combines:
 
 - a native desktop application for defining and reviewing work;

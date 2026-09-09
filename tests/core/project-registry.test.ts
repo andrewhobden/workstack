@@ -44,6 +44,19 @@ function project(overrides: Partial<ProjectMetadata> = {}): ProjectMetadata {
 }
 
 describe('ProjectRegistry', () => {
+  it('keeps concurrent independent registrations and prevents stale projection resurrection', async () => {
+    const { registry, filePath } = await createRegistry()
+    const second = new ProjectRegistry(filePath)
+    const other = project({ id: 'cbdc9e0c-80b4-4d76-89fd-61e0922cfb8f', rootPath: '/tmp/other' })
+    await Promise.all([registry.register(project()), second.register(other)])
+    expect(await registry.list()).toHaveLength(2)
+    await registry.refresh(project({ name: 'Latest', updatedAt: '2026-08-12T00:00:00.000Z' }))
+    await second.refresh(project({ name: 'Stale' }))
+    expect((await registry.find(project().id))?.name).toBe('Latest')
+    await registry.detach(project().id)
+    await expect(second.refresh(project())).rejects.toMatchObject({ code: 'PROJECT_NOT_FOUND' })
+    expect(await registry.list()).toEqual([expect.objectContaining({ id: other.id })])
+  })
   it('starts empty, registers projects, and sorts them by the last-opened time', async () => {
     const { registry, clock } = await createRegistry()
     expect(await registry.list()).toEqual([])

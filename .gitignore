@@ -7,4 +7,7 @@ coverage/
 playwright-report/
 test-results/
 .workstack/
+.workstack-lifecycle.sqlite*
 *.log
+
+context-evaluation-results/

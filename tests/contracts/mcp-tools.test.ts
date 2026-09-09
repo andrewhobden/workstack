@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { MCP_TOOL_NAMES, WorkstackMcpTools } from '../../src/mcp/server'
 import { ProjectRegistry } from '../../src/core/project-registry'
 import { ProjectsService } from '../../src/core/projects-service'
+import { ProjectStore } from '../../src/core/project-store'
+import { WorkItemRepository } from '../../src/core/work-items'
 
 const cleanupPaths: string[] = []
 
@@ -26,6 +28,16 @@ describe('Workstack MCP tools', () => {
 
     expect(MCP_TOOL_NAMES).toEqual([
       'workstack_list_projects',
+      'workstack_preview_context_packet',
+      'workstack_get_context_packet',
+      'workstack_list_context_packets',
+      'workstack_read_context_section',
+      'workstack_read_context_artifact',
+      'workstack_list_project_sources',
+      'workstack_read_source_revision',
+      'workstack_read_source_citation',
+      'workstack_report_context_feedback',
+
       'workstack_search_knowledge',
       'workstack_list_backlog',
       'workstack_create_work_item',
@@ -34,6 +46,16 @@ describe('Workstack MCP tools', () => {
       'workstack_search_completed',
       'workstack_get_work_item',
       'workstack_get_work_item_handoff',
+      'workstack_get_task_coordination',
+      'workstack_update_task_coordination',
+      'workstack_query_evidence_graph',
+      'workstack_list_knowledge_records',
+      'workstack_get_knowledge_record',
+      'workstack_check_knowledge_records',
+      'workstack_lookup_project_directory',
+      'workstack_get_project_entity',
+      'workstack_save_checkpoint',
+      'workstack_list_checkpoints',
       'workstack_list_wiki_articles',
       'workstack_get_wiki_article',
       'workstack_claim_work_item',
@@ -74,6 +96,7 @@ describe('Workstack MCP tools', () => {
       content: 'The schema keeps durable local project state.'
     })
     await expect(tools.call('workstack_search_knowledge', { project_id: project.id, query: 'durable state' })).resolves.toEqual({
+      mode: 'lexical', fallback_reason: 'No local semantic model is enabled.', corpus_revision: expect.stringMatching(/^[a-f0-9]{64}$/), config_fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/), truncated: false,
       results: [
         expect.objectContaining({
           source_type: 'raw_source',
@@ -136,6 +159,87 @@ describe('Workstack MCP tools', () => {
       project_id: project.id,
       query: 'Contract test passed'
     })).resolves.toMatchObject({ work_items: [expect.objectContaining({ id: workItem.id })] })
+  })
+
+  it('resolves an old display ID through handoff and ownership tools and reports submission separately from merge', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'workstack-mcp-old-id-'))
+    cleanupPaths.push(directory)
+    const projects = new ProjectsService(new ProjectRegistry(path.join(directory, 'registry.json')))
+    const project = await projects.createProject({ rootPath: path.join(directory, 'project'), name: 'Old task fixture' })
+    const store = await ProjectStore.open(project.rootPath)
+    const repository = new WorkItemRepository(store)
+    const oldest = repository.create({ title: 'Oldest launchable item' })
+    for (let index = 0; index < 105; index++) repository.create({ title: `Newer item ${index}` })
+    store.close()
+    const tools = new WorkstackMcpTools(projects)
+    const reference = { project: project.name, work_item_id: oldest.displayId }
+    await expect(tools.call('workstack_get_work_item', reference)).resolves.toMatchObject({ work_item: { id: oldest.id } })
+    const claimed = await tools.call('workstack_claim_work_item', { ...reference, agent_id: 'copilot', session_id: 'old-item-session', requested_lease_seconds: 60 }) as { claim_token: string; recommended_heartbeat_seconds: number }
+    expect(claimed.recommended_heartbeat_seconds).toBeLessThan(60)
+    await expect(tools.call('workstack_heartbeat_work_item', { ...reference, claim_token: claimed.claim_token })).resolves.toHaveProperty('lease_expires_at')
+    await tools.call('workstack_save_checkpoint', { ...reference, claim_token: claimed.claim_token, progress_markdown: 'Partial parser implementation', files_changed: ['src/parser.ts'], validation_markdown: 'Parser tests pass', next_actions_markdown: 'Review edge cases' })
+    await tools.call('workstack_block_work_item', { ...reference, claim_token: claimed.claim_token, retain_claim: true, reason: 'Pending review' })
+    await expect(tools.call('workstack_get_work_item_handoff', { ...reference, work_item_id: oldest.id })).resolves.toMatchObject({
+      work_item: { id: oldest.id }, latest_checkpoint: { agentId: 'copilot', sessionId: 'old-item-session', progressMarkdown: 'Partial parser implementation' }, completion_history: []
+    })
+    await tools.call('workstack_release_work_item', { ...reference, claim_token: claimed.claim_token, reason: 'Pause' })
+    await expect(tools.call('workstack_list_checkpoints', reference)).resolves.toMatchObject({ checkpoints: [{ progressMarkdown: 'Partial parser implementation' }] })
+    await expect(tools.call('workstack_save_checkpoint', { ...reference, claim_token: claimed.claim_token, progress_markdown: 'Old writer' })).rejects.toMatchObject({ code: 'CLAIM_TOKEN_INVALID' })
+    const next = await tools.call('workstack_claim_work_item', { ...reference, agent_id: 'next' }) as { claim_token: string }
+    const prUrl = 'https://github.com/acme/workstack/pull/1001'
+    const result = await tools.call('workstack_complete_work_item', { ...reference, claim_token: next.claim_token, completion: { summary_markdown: 'Ready for delivery', pr_url: prUrl } })
+    expect(result).toMatchObject({ completed: false, submitted: true, submitted_at: expect.any(String), completed_at: null, delivery_state: 'awaiting_review' })
+    await projects.reconcilePullRequestWorkItem(project.id, oldest.id, prUrl, 'MERGED')
+    await expect(tools.call('workstack_get_work_item', reference)).resolves.toMatchObject({ work_item: { status: 'completed', deliveryState: 'merged', completedAt: expect.any(String) } })
+  })
+
+  it('keeps completion-only terms searchable through all metadata edits', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'workstack-mcp-search-edits-'))
+    cleanupPaths.push(directory)
+    const projects = new ProjectsService(new ProjectRegistry(path.join(directory, 'registry.json')))
+    const project = await projects.createProject({ rootPath: path.join(directory, 'project'), name: 'Search edits' })
+    const item = await projects.createWorkItem(project.id, { title: 'Original title' })
+    const tools = new WorkstackMcpTools(projects)
+    const claim = await tools.call('workstack_claim_work_item', { project: project.name, work_item_id: item.displayId, agent_id: 'worker' }) as { claim_token: string }
+    await tools.call('workstack_complete_work_item', { project: project.name, work_item_id: item.displayId, claim_token: claim.claim_token, completion: { summary_markdown: 'Unique completion evidence', validation_markdown: 'Test quorum intact' } })
+    for (const patch of [{ title: 'Changed title' }, { descriptionMarkdown: 'Changed description' }, { acceptanceCriteriaMarkdown: 'Changed criteria' }, { priority: 'high' as const }, { type: 'bug' as const }]) {
+      await projects.updateWorkItem(project.id, item.id, patch)
+      await expect(tools.call('workstack_search_completed', { project: project.name, query: 'quorum intact' })).resolves.toMatchObject({ work_items: [{ id: item.id }] })
+    }
+    for (const query of ['Changed title', 'Changed description', 'Changed criteria']) {
+      await expect(tools.call('workstack_search_completed', { project: project.name, query })).resolves.toMatchObject({ work_items: [{ id: item.id }] })
+    }
+  })
+
+  it('exposes readiness, prerequisite outcomes and advisory worker identities through coordination tools and handoff', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'workstack-mcp-dependencies-'))
+    cleanupPaths.push(directory)
+    const projects = new ProjectsService(new ProjectRegistry(path.join(directory, 'registry.json')))
+    const project = await projects.createProject({ rootPath: path.join(directory, 'project'), name: 'Dependencies' })
+    const task = await projects.createWorkItem(project.id, { title: 'Use API' })
+    const prerequisite = await projects.createWorkItem(project.id, { title: 'Build API' })
+    const overlapping = await projects.createWorkItem(project.id, { title: 'API documentation' })
+    const tools = new WorkstackMcpTools(projects)
+    await tools.call('workstack_update_task_coordination', {
+      project: project.name, work_item_id: task.displayId, depends_on: [prerequisite.displayId], related_to: [overlapping.id], declared_paths: ['src/api'], declared_components: ['api']
+    })
+    await expect(tools.call('workstack_list_backlog', { project: project.name })).resolves.toMatchObject({ work_items: expect.arrayContaining([
+      { id: task.id, displayId: task.displayId, type: 'feature', title: 'Use API', priority: 'normal', readiness: { ready: false, blockers: [{ workItemId: prerequisite.id, displayId: prerequisite.displayId, reason: 'Task is backlog.' }] } }
+    ]) })
+    await expect(tools.call('workstack_claim_work_item', { project: project.name, work_item_id: task.id, agent_id: 'consumer' })).rejects.toMatchObject({ code: 'WORK_ITEM_NOT_CLAIMABLE' })
+    const claim = await projects.claimWorkItem(project.id, prerequisite.id, { agentId: 'prerequisite-worker' })
+    await projects.completeWorkItem(project.id, prerequisite.id, claim.claimToken, { summaryMarkdown: 'API ready', commitSha: 'c'.repeat(40) })
+    await projects.updateTaskCoordination(project.id, overlapping.id, { declaredPaths: ['src/api/docs.ts'] })
+    await projects.claimWorkItem(project.id, overlapping.id, { agentId: 'documentation-worker', sessionId: 'docs-session' })
+    await expect(tools.call('workstack_get_task_coordination', { project: project.name, work_item_id: task.displayId })).resolves.toMatchObject({ coordination: {
+      readiness: { ready: true }, prerequisites: [{ outcome: { completion: { summaryMarkdown: 'API ready', commitSha: 'c'.repeat(40) } } }],
+      activeOverlaps: [{ workItemId: overlapping.id, agentId: 'documentation-worker', sessionId: 'docs-session', advisory: true }]
+    } })
+    await expect(tools.call('workstack_get_work_item_handoff', { project: project.name, work_item_id: task.id })).resolves.toMatchObject({ coordination: {
+      readiness: { ready: true }, related: [{ workItemId: overlapping.id }], activeOverlaps: [{ agentId: 'documentation-worker' }]
+    } })
+    await tools.call('workstack_update_task_coordination', { project: project.name, work_item_id: task.id, depends_on: [], related_to: [], declared_paths: [], declared_components: [] })
+    await expect(tools.call('workstack_get_task_coordination', { project: project.name, work_item_id: task.id })).resolves.toMatchObject({ coordination: { prerequisites: [], related: [], declaredPaths: [], declaredComponents: [], activeOverlaps: [] } })
   })
 
   it('returns stable validation and ownership errors to the MCP caller', async () => {

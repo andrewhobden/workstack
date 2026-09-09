@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { ProjectRegistry } from '../../src/core/project-registry'
 import { ProjectStore } from '../../src/core/project-store'
 import { ProjectsService } from '../../src/core/projects-service'
+import { WikiRevisionRepository } from '../../src/core/wiki-revisions'
 import { WikiAutomationRepository } from '../../src/core/wiki-automation'
 import { buildCopilotSessionContext } from '../../src/main/copilot-launcher'
 import { PullRequestService } from '../../src/main/pull-requests'
@@ -65,7 +66,7 @@ describe('merged pull request wiki automation', () => {
     const pullRequests = new PullRequestService(
       projects,
       {} as never,
-      async () => JSON.stringify([{
+      async (args) => args[0] === 'api' ? JSON.stringify([[]]) : JSON.stringify({
         author: { login: 'integration-agent' },
         headRefName: 'feature/merge-evidence',
         isDraft: false,
@@ -76,12 +77,15 @@ describe('merged pull request wiki automation', () => {
         title: 'Document merge evidence',
         updatedAt: '2026-08-14T00:00:01.000Z',
         url: pullRequestUrl
-      }]),
+      }),
       automation
     )
 
     await expect(pullRequests.list(project.id)).resolves.toEqual([])
     await (automation as unknown as { processProject(projectId: string): Promise<void> }).processProject(project.id)
+    const failedReports = await projects.listWikiAutomationReports(project.id)
+    expect(failedReports[0].job.status).toBe('failed')
+    await projects.retryWikiAutomationJob(project.id, failedReports[0].job.id)
     await (automation as unknown as { processProject(projectId: string): Promise<void> }).processProject(project.id)
     await expect(pullRequests.list(project.id)).resolves.toEqual([])
 
@@ -90,9 +94,13 @@ describe('merged pull request wiki automation', () => {
     const [job] = repository.listJobs()
     const evidence = repository.getMergeEvidence(job.id)
     const report = repository.getJobReport(job.id)
+    const revisions = new WikiRevisionRepository(store)
+    expect(revisions.list()[0].status).toBe('proposed')
+    expect((await projects.listWikiArticles(project.id)).some((article) => article.slug.startsWith('generated-'))).toBe(false)
+    revisions.publish(revisions.list()[0].id, 'Integration reviewer', 'Reviewed the canonical merge evidence')
     store.close()
 
-    expect(job).toMatchObject({ status: 'completed', attemptCount: 2, requestedBy: `merged-pull-request:${pullRequestUrl}:${mergeCommit}` })
+    expect(job).toMatchObject({ status: 'completed', attemptCount: 1, requestedBy: `merged-pull-request:${pullRequestUrl}:${mergeCommit}` })
     expect(evidence).toMatchObject({
       pullRequestUrl,
       pullRequestNumber: 42,
@@ -101,7 +109,7 @@ describe('merged pull request wiki automation', () => {
       sessionSummaryMarkdown: 'The merge adds durable evidence for the next coding agent.'
     })
     expect(evidence.diffMarkdown).toContain('src/merge-evidence.ts')
-    expect(report.artifacts.filter((artifact) => artifact.kind === 'wiki_article')).toHaveLength(4)
+    expect(report.artifacts.filter((artifact) => artifact.kind === 'wiki_draft')).toHaveLength(4)
 
     const mcp = new WorkstackMcpTools(projects)
     await expect(mcp.call('workstack_list_wiki_articles', { project: project.name })).resolves.toMatchObject({

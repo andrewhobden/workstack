@@ -134,10 +134,13 @@ describe('KnowledgeRepository', () => {
       ['wiki_article', expect.any(Number)],
       ['raw_source', expect.any(Number)],
       ['completed_work', expect.any(Number)],
-      ['backlog', expect.any(Number)]
+      ['backlog', expect.any(Number)],
+      ['knowledge_record', 0],
+      ['project_entity', 0]
     ])
     expect(knowledge.retrieve('atomic lease')).toEqual(retrieval)
     expect(knowledge.retrieve('missing').results).toEqual([])
+    expect(knowledge.search('null completion')[0].sourceId).toBe(`completed:${withoutCompletion.id}`)
     expect(knowledge.retrieve('null completion').results).toEqual(expect.arrayContaining([
       expect.objectContaining({ sourceId: `completed:${withoutCompletion.id}` })
     ]))

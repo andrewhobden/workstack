@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -237,3 +237,76 @@ function expectErrorCode(action: () => unknown, code: string): void {
 
   expect(received).toMatchObject({ code })
 }
+
+it('replays attachment receipts and rejects reuse with different content after reopening', async () => {
+  const rootPath = await mkdtemp(path.join(os.tmpdir(), 'workstack-attachment-retry-'))
+  cleanupPaths.push(rootPath)
+  const store = await ProjectStore.initialize({ rootPath, name: 'Receipts' })
+  const item = new WorkItemRepository(store).create({ title: 'With evidence' })
+  const input = { requestId: 'retry-upload-1', originalFilename: 'notes.txt', data: Buffer.from('original bytes') }
+  const attachment = new ArtifactStore(store).attachBytes(item.id, input)
+  store.close()
+  const reopened = await ProjectStore.open(rootPath)
+  const artifacts = new ArtifactStore(reopened)
+  expect(artifacts.attachBytes(item.id, input)).toEqual(attachment)
+  expect(artifacts.list(item.id)).toHaveLength(1)
+  expect(() => artifacts.attachBytes(item.id, { ...input, data: Buffer.from('replacement bytes') })).toThrow('different content')
+  expect(artifacts.read(item.id, attachment.id).toString()).toBe('original bytes')
+  reopened.close()
+})
+
+it('replays pasted images without duplicating Markdown and binds receipts to the complete upload identity', async () => {
+  const { itemId, store } = await createFixture()
+  const artifacts = new ArtifactStore(store)
+  const image = { requestId: 'paste-once', data: Buffer.from([137, 80, 78, 71]), originalFilename: 'screen.png' }
+  const attachment = artifacts.pasteImage(itemId, image)
+  expect(artifacts.pasteImage(itemId, image)).toEqual(attachment)
+  expect(artifacts.list(itemId)).toHaveLength(1)
+  expect(new WorkItemRepository(store).get(itemId).descriptionMarkdown.match(/!\[screen.png\]/g)).toHaveLength(1)
+
+  const planningSessionId = new PlanningRepository(store).createSession().planningSessionId
+  const input = { requestId: 'plan-once', originalFilename: 'evidence.txt', mimeType: 'text/plain', data: Buffer.from('Evidence') }
+  const planned = artifacts.attachPlanningBytes(planningSessionId, input)
+  expect(artifacts.attachPlanningBytes(planningSessionId, input)).toEqual(planned)
+  expect(() => artifacts.attachBytes(itemId, input)).toThrow('different content')
+  expect(() => artifacts.attachPlanningBytes(planningSessionId, { ...input, originalFilename: 'renamed.txt' })).toThrow('different content')
+  expect(() => artifacts.attachPlanningBytes(planningSessionId, { ...input, mimeType: 'application/octet-stream' })).toThrow('different content')
+  for (const requestId of ['   ', 'a'.repeat(201)]) {
+    expect(() => artifacts.attachBytes(itemId, { ...input, requestId })).toThrow('Invalid attachment request ID')
+  }
+  expect(artifacts.listPlanning(planningSessionId)).toEqual([planned])
+  store.close()
+})
+
+it('retains shared planning evidence until its final association is removed', async () => {
+  const { itemId, store } = await createFixture()
+  const artifacts = new ArtifactStore(store)
+  const { planningSessionId } = new PlanningRepository(store).createSession()
+  const original = artifacts.attachPlanningBytes(planningSessionId, { originalFilename: 'notes.txt', data: Buffer.from('Shared evidence') })
+  const [linked] = artifacts.linkPlanningToWorkItem(planningSessionId, itemId)
+  expect(artifacts.linkPlanningToWorkItem(planningSessionId, itemId)).toEqual([linked])
+  const storedPath = artifacts.resolvePath(itemId, linked.id)
+  artifacts.remove(itemId, linked.id)
+  expect(artifacts.list(itemId)).toEqual([])
+  expect(artifacts.readPlanning(planningSessionId, original.id).toString()).toBe('Shared evidence')
+  artifacts.removePlanning(planningSessionId, original.id)
+  await expect(stat(storedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  store.close()
+})
+
+it('removes a newly written artifact after a database failure and preserves existing bytes on a filename collision', async () => {
+  const { itemId, store } = await createFixture()
+  const artifacts = new ArtifactStore(store, () => '00000000-0000-4000-8000-000000000001')
+  const input = { requestId: 'recover-upload', originalFilename: 'evidence.txt', data: Buffer.from('Approved bytes') }
+  store.database.exec("CREATE TRIGGER reject_attachment BEFORE INSERT ON attachments BEGIN SELECT RAISE(ABORT, 'injected attachment failure'); END")
+  expect(() => artifacts.attachBytes(itemId, input)).toThrow('injected attachment failure')
+  expect(artifacts.list(itemId)).toEqual([])
+  expect(await readdir(path.join(store.paths.workItemsPath, itemId, 'attachments'))).toEqual([])
+  store.database.exec('DROP TRIGGER reject_attachment')
+  const recovered = artifacts.attachBytes(itemId, input)
+  expect(artifacts.attachBytes(itemId, input)).toEqual(recovered)
+  expect(() => artifacts.attachBytes(itemId, { ...input, requestId: 'other-request', data: Buffer.from('Replacement') })).toThrow('EEXIST')
+  expect(artifacts.read(itemId, recovered.id).toString()).toBe('Approved bytes')
+  expect(artifacts.list(itemId)).toEqual([recovered])
+  store.close()
+})
